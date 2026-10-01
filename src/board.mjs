@@ -45,8 +45,7 @@ const config = {
   pollIntervalMs: store.asInt(raw, "POLL_INTERVAL_MS", 5_000, 1_000, 600_000),
   idleGraceMs: store.asInt(raw, "IDLE_GRACE_MS", 15_000, 0, 3_600_000),
   resumeMode: store.asEnum(raw, "RESUME_MODE", ["opencode", "mirror"], "opencode"),
-  paneRatio: store.asFloat(raw, "MIRROR_PANE_RATIO", 0.25, 0.02, 0.9),
-  minPaneRows: store.asInt(raw, "MIN_PANE_ROWS", 3, 1, 40),
+  paneRatio: store.asFloat(raw, "MIRROR_PANE_RATIO", 0.5, 0.02, 0.98),
   paneDirection: store.asEnum(raw, "MIRROR_PANE_DIRECTION", ["down", "right"], "down"),
   sessionLimit: store.asInt(raw, "SESSION_LIST_LIMIT", 200, 10, 2_000),
   sessionPages: store.asInt(raw, "SESSION_PAGE_LIMIT", 8, 1, 50),
@@ -64,8 +63,8 @@ const SYNC_FLAG = path.join(STATE_DIR, "sync.request");
 const REAP_FLAG = path.join(STATE_DIR, "reap.request");
 const MIRROR_PREFIX = "oc_";
 
-/** 镜像空间不足时的退避时长。 */
-const SPACE_BACKOFF_MS = 60_000;
+/** 镜像 pane 名上限。侧边栏一行放不下更多，留点余量给状态符号和项目名。 */
+const MIRROR_LABEL_MAX = 40;
 
 function log(level, ...args) {
   if (LEVELS[level] < LEVELS[config.logLevel]) return;
@@ -124,13 +123,9 @@ const runtime = {
   inFlight: false,
   queued: false,
   sse: null,
-  /**
-   * 「镜像空间不足」的退避表。窗口太矮或镜像行太多时 pane split 会失败，
-   * 记一笔就能避免每轮都对着同一个矮窗口反复 split 刷警告。
-   * key = sessionID，值 = 退避到什么时候。
-   */
-  spaceBlocked: new Map(),
   timers: [],
+  /** 一轮重算里已经重平衡过没有。回收一批行时不必每个都重算一次布局。 */
+  balancedThisPass: false,
   shuttingDown: false,
 };
 
@@ -179,17 +174,11 @@ async function modeStartup() {
 
   log("info", `startup 钩子（配置目录 ${loaded.configDir || "无"}）`);
 
-  // 1) 重放 agent 视图投影 —— 官方文档推荐的「state dir 存声明式视图 + startup 重放」
-  if (config.installAgentView) {
-    runtime.state = state;
-    await applyAgentView(state, { reason: "startup" });
-  } else if (state.agentView) {
-    // 用户刚把开关关掉：把之前装上的投影清掉
-    runtime.state = state;
-    await clearAgentView(state, "startup: INSTALL_AGENT_VIEW 已关闭");
-    state.agentView = null;
-    persistState();
-  }
+  // 1) 按当前 config 校准已安装的投影。
+  //    这一段必须所有模式共用：投影是进程外的全局副作用，只在 startup 里处理的话，
+  //    用户把 INSTALL_AGENT_VIEW 关掉后就没有任何进程会去清它了（它会一直赖在 server 里）。
+  runtime.state = state;
+  await reconcileAgentView(state, { reason: "startup", force: true });
 
   // 2) 可选拉起常驻管理器
   if (config.autoStart) {
@@ -231,6 +220,11 @@ async function boardIsRunning() {
 
 async function modeAction(action) {
   if (!process.env.HERDR_PLUGIN_ID) return;
+
+  // action 也走一遍投影校准：这是用户手动触发时最可靠的「投影残留」自救入口。
+  runtime.state = await store.readState(STATE_DIR);
+  primeSeq(runtime.state.lastSeq);
+  await reconcileAgentView(runtime.state, { reason: `action:${action}` });
 
   if (action === "board") {
     const res = await herdr.pluginPaneOpen({
@@ -275,10 +269,14 @@ async function modeOnce() {
   // 自检模式：不抢常驻锁，免得调试时被正在运行的管理器挡掉
   runtime.state = await store.readState(STATE_DIR);
   primeSeq(runtime.state.lastSeq);
+  await reconcileAgentView(runtime.state, { reason: "once" });
   await reconcile("once");
   persistState();
   runtime.sse?.stop?.();
-  // 一次性模式不常驻：跑完就断开 SSE，否则 fetch 的连接会吊住进程
+  // 一次性模式不常驻：跑完就断开 SSE 并封住后续重算。
+  // 只 stop SSE 是不够的 —— session 一忙 SSE 就会持续触发 scheduleReconcile，
+  // 进程会一直重算下去、永远不退出（自检模式必须是「跑一轮就退出」）。
+  runtime.shuttingDown = true;
   runtime.client = null;
   return undefined;
 }
@@ -312,9 +310,7 @@ async function modePane() {
   );
 
   // Herdr 重启后 startup 钩子已经重放过视图，这里兜底再确认一次
-  if (config.installAgentView) {
-    await applyAgentView(runtime.state, { reason: "pane 启动" });
-  }
+  await reconcileAgentView(runtime.state, { reason: "pane 启动", force: true });
 
   log("info", `管理器已启动（pane=${process.env.HERDR_PANE_ID || "?"}，轮询 ${config.pollIntervalMs}ms）`);
   return undefined;
@@ -643,6 +639,7 @@ async function reconcile(reason) {
  */
 async function applySessionState({ client, roots, activeStates, polledPermissions, reason }) {
   const now = Date.now();
+  runtime.balancedThisPass = false;
 
   // 权限等待 = SSE 跟踪的 ∪ 轮询到的（轮询能覆盖 SSE 刚断的那段）
   const pending = new Map(runtime.pendingPermissions);
@@ -652,8 +649,10 @@ async function applySessionState({ client, roots, activeStates, polledPermission
   const infoById = new Map();
   for (const s of roots) infoById.set(s.id, s);
 
-  // 已经被其它来源（官方集成）上报的 session 必须让出去，否则会出现重复行
-  const claimed = await herdr.claimedSessionIds();
+  // 已经被其它来源（官方集成）上报的 session 必须让出去，否则会出现重复行。
+  // 这次 agent list 顺带给末尾的投影校准用。
+  const agents = await herdr.agentList();
+  const claimed = await herdr.claimedSessionIds(agents);
 
   // --- 1. 回收 -----------------------------------------------------------
   for (const [sessionID, rec] of Object.entries(runtime.state.panes)) {
@@ -768,16 +767,13 @@ async function applySessionState({ client, roots, activeStates, polledPermission
     }
 
     if (!rec.paneId) {
-      // 空间不足导致的跳过是有原因的，退避期内不要再试，避免每轮刷警告
-      const blockedUntil = runtime.spaceBlocked.get(info.id) || 0;
-      if (blockedUntil > now) continue;
-
+      // 不因为空间不足而放弃建行：切完立刻重平衡，实在还是 0 行也照样把行建出来。
       const created = await createMirrorPane(info);
       if (!created) {
-        runtime.spaceBlocked.set(info.id, Date.now() + SPACE_BACKOFF_MS);
+        // 只有 herdr 自己报错（pane_split_failed 等）才算失败，下一轮无条件重试。
+        log("warn", `镜像行 ${shortId(info.id)} 建不出来，下一轮重试`);
         continue;
       }
-      runtime.spaceBlocked.delete(info.id);
       rec.paneId = created;
       log("info", `新建镜像行 ${shortId(info.id)} → ${created} 「${info.title || "(无标题)"}」`);
     }
@@ -799,10 +795,18 @@ async function applySessionState({ client, roots, activeStates, polledPermission
   // --- 4. 写镜像 pane 的显示状态 ------------------------------------------
   await publishMirrorSnapshots();
 
+  // --- 5. 按「镜像行确实存在」校准投影 ---------------------------------------
+  // 这一步是防「no matching agents」事故的最后一道闸：镜像行归零时必须把
+  // 带筛选的投影降级成只排序，否则用户的官方行会被我们的筛选全部隐藏。
+  if (config.installAgentView || runtime.state.agentView) {
+    await reconcileAgentView(runtime.state, { reason: `重算(${reason})` });
+  }
+
   log(
     "debug",
     `重算(${reason}): 根 ${roots.length} / 活跃 ${activeStates.size} / 待权限 ${pending.size} / ` +
-      `让出 ${claimed.size} / 镜像行 ${Object.keys(runtime.state.panes).length} / SSE ${runtime.sseUp ? "up" : "down"}`,
+      `让出 ${claimed.size} / 镜像行 ${Object.keys(runtime.state.panes).length} / ` +
+      `herdr 镜像行 ${herdr.countMirrorRows(agents)} / SSE ${runtime.sseUp ? "up" : "down"}`,
   );
 }
 
@@ -958,7 +962,12 @@ function sameLabel(a, b) {
 }
 
 /**
- * 给一个 session 建镜像 pane：split → 等 shell 就绪 → 启动驻留进程。
+ * 给一个 session 建镜像 pane：split → **重平衡** → 校验可见行 → 启动驻留进程。
+ *
+ * 关键设计（替代旧的「锚点越来越小 + 高度守卫」）：
+ * `pane split` 之后立刻把整棵镜像子树的比例重算一遍，让所有镜像 pane 均分空间。
+ * 旧策略是反复用小 ratio 拆同一个锚点，锚点自己被逐次压缩，预算很快耗尽 ——
+ * 那不是 herdr 的限制，是切分策略错了。实测 44 行 area 下平衡 8 叶完全放得下。
  *
  * session id / 标题 / 目录全部通过 `pane split --env` 传，不进 shell 文本，
  * 所以不存在把用户数据拼进命令行的注入面。
@@ -978,22 +987,35 @@ async function createMirrorPane(info) {
     OC_MIRROR_SESSION_ID: info.id,
     OC_MIRROR_TITLE: store.truncate(store.sanitizeText(info.title || "", 60), 60),
     OC_MIRROR_DIRECTORY: store.truncate(info.directory || "", 200),
+    // 必须显式传：pane split 起的 shell 只继承 herdr server 的环境，
+    // 拿不到本插件进程的 HERDR_PLUGIN_STATE_DIR。少了它，镜像 pane 里的驻留进程
+    // 会退回去读 PLUGIN_ROOT/.state（空的），于是永远显示 "starting"。
+    HERDR_PLUGIN_STATE_DIR: STATE_DIR,
+    HERDR_PLUGIN_ROOT: PLUGIN_ROOT,
   };
 
-  // 高度守卫：split 是按比例瓜分锚点的高度，行数不够时新 pane 会拿到 0 行，
-  // Herdr 直接返回 pane_split_failed。先确认锚点还有富余。
-  const anchorRows = await herdr.paneViewportRows(anchorPane);
-  if (anchorRows !== null && anchorRows < config.minPaneRows * 2) {
-    log(
-      "warn",
-      `锚点 ${anchorPane} 只剩 ${anchorRows} 行，放不下新的镜像 pane（每行至少要 ${config.minPaneRows} 行）。` +
-        `请手动打开 Sessions 工作区把窗口拉高，或调小 MIRROR_PANE_RATIO。`,
-    );
+  let pane = null;
+  try {
+    pane = await herdr.paneSplit({
+      paneId: anchorPane,
+      direction: config.paneDirection,
+      ratio: config.paneRatio,
+      cwd,
+      env,
+    });
+  } catch (err) {
+    log("warn", `pane split 失败（${shortId(info.id)}）：${err?.message || err}`);
+    return null;
+  }
+  const paneId = str(pane?.pane_id);
+  if (!paneId) {
+    log("warn", `pane split 没返回 pane_id（${shortId(info.id)}）`);
     return null;
   }
 
-  const paneId = await splitMirrorPane(anchorPane, cwd, env);
-  if (!paneId) return null;
+  // 先重平衡再启驻留：新 pane 拿到 0 行时 shell 照样跑得起来，但没必要让它从 0 行开始。
+  await rebalanceMirrorTree(`新建 ${shortId(info.id)}`, [paneId]);
+  await ensurePaneVisible(paneId, `新建 ${shortId(info.id)}`);
 
   await startMirrorResident(paneId);
   return paneId;
@@ -1039,45 +1061,145 @@ async function startMirrorResident(paneId) {
   return false;
 }
 
-/**
- * 从锚点切出一个镜像 pane。
- *
- * 失败时换个更小的比例重试：镜像行多了以后锚点会越来越小，固定比例迟早会
- * 切不动（Herdr 返回 pane_split_failed）。逐级退让比直接放弃好。
- *
- * @returns {Promise<string|null>} pane id
- */
-async function splitMirrorPane(anchorPane, cwd, env) {
-  const ratios = [config.paneRatio, config.paneRatio * 0.5, 0.12, 0.05];
-  const tried = [];
+// ---------------------------------------------------------------------------
+// 平衡 BSP 树：让所有镜像 pane 均分空间
+// ---------------------------------------------------------------------------
 
-  for (let i = 0; i < ratios.length; i += 1) {
-    const ratio = ratios[i];
-    let pane = null;
-    try {
-      pane = await herdr.paneSplit({ paneId: anchorPane, direction: config.paneDirection, ratio, cwd, env });
-    } catch (err) {
-      tried.push(`${ratio.toFixed(2)}:${err?.message || err}`);
-      log("debug", `pane split(ratio=${ratio}) 失败: ${err?.message || err}`);
-      continue;
-    }
-    const paneId = str(pane?.pane_id);
-    if (paneId) {
-      if (i > 0) log("info", `锚点空间不足，改用 ratio=${ratio} 切出镜像 pane ${paneId}`);
-      return paneId;
-    }
-    tried.push(`${ratio.toFixed(2)}:无 pane_id`);
+/** 收集一棵子树里的所有叶子 pane id。 */
+function collectLeafPanes(node, acc = []) {
+  if (!node) return acc;
+  if (node.type === "pane") {
+    const id = str(node.pane_id);
+    if (id) acc.push(id);
+    return acc;
   }
+  collectLeafPanes(node.first, acc);
+  collectLeafPanes(node.second, acc);
+  return acc;
+}
 
-  // 只说一次具体失败原因，别刷屏
-  log("warn", `无法从锚点 ${anchorPane} 切出镜像 pane，已退避 ${SPACE_BACKOFF_MS / 1000}s。`);
-  log("debug", `  尝试记录: ${tried.join(" | ")}`);
+/** 比例已经到位就不重复下发 —— reconcile 每 5 秒跑一次，不能每轮都打十几次 socket。 */
+const RATIO_EPSILON = 1e-4;
+
+/**
+ * 算出需要调整哪些 split 节点。
+ *
+ * 规则只有一条：**ratio = first 子树的叶子数 / 该节点子树的总叶子数**。
+ * 这样每个叶子恰好拿到 1/N，对任意二叉树形状都成立 —— 不管镜像是怎么被
+ * 拆出来的一棵「锚点脊柱」，还是用户在面板里手动拖成了别的形状。
+ *
+ * 只处理「子树里全是我们的 pane」的节点：侧边栏之类的外来 pane 不参与，
+ * 它们的祖先 split 保持不动，免得把用户的侧边栏挤扁。
+ *
+ * @returns {Array<{path:boolean[],ratio:number}>}
+ */
+export function balanceSplitPlans(root, ownPaneIds) {
+  const own = ownPaneIds instanceof Set ? ownPaneIds : new Set(ownPaneIds || []);
+  const plans = [];
+
+  (function walk(node, path) {
+    if (!node || node.type !== "split") return;
+    const leaves = collectLeafPanes(node);
+    if (leaves.length >= 2 && leaves.every((id) => own.has(id))) {
+      const firstLeaves = collectLeafPanes(node.first).length;
+      const ratio = firstLeaves / leaves.length;
+      const current = Number(node.ratio);
+      if (!Number.isFinite(current) || Math.abs(current - ratio) > RATIO_EPSILON) {
+        plans.push({ path, ratio });
+      }
+    }
+    walk(node.first, path.concat(false));
+    walk(node.second, path.concat(true));
+  })(root, []);
+
+  return plans;
+}
+
+/** 我们自己占着的 pane：锚点 + state 里全部镜像 pane + 带 oc_mirror token 的残留。 */
+async function ourPaneIds(extra = []) {
+  const out = new Set();
+  const anchor = str(runtime.state.anchor?.paneId);
+  if (anchor) out.add(anchor);
+  for (const rec of Object.values(runtime.state.panes)) {
+    if (rec && str(rec.paneId)) out.add(str(rec.paneId));
+  }
+  for (const id of extra) if (id) out.add(id);
+
+  // state.json 丢了 / 崩过几轮时，靠 token 把还活着的镜像 pane 认回来，
+  // 否则它们会被当成「外来 pane」，整棵镜像子树就永远不会被重平衡。
+  const wsId = str(runtime.state.anchor?.workspaceId);
+  if (wsId) {
+    for (const pane of await herdr.paneList(wsId)) {
+      const id = str(pane?.pane_id);
+      if (id && pane?.tokens?.[herdr.MIRROR_TOKEN] === "1") out.add(id);
+    }
+  }
+  return out;
+}
+
+/**
+ * 重平衡镜像布局。
+ *
+ * 用 `layout.set_split_ratio` 而不是 `layout.apply` —— 官方文档明说 apply
+ * 会重建 tab、不保留 live PTY / scrollback / 进程，把已有镜像 pane 全杀掉重启。
+ *
+ * @returns {Promise<number>} 实际调整的节点数
+ */
+async function rebalanceMirrorTree(reason, extraPaneIds = []) {
+  const anchorPane = str(runtime.state.anchor?.paneId);
+  if (!anchorPane) return 0;
+
+  const pane = await herdr.paneGet(anchorPane);
+  const tabId = str(pane?.tab_id) || str(runtime.state.anchor?.tabId);
+  if (!tabId) return 0;
+
+  let layout = null;
+  try {
+    layout = await herdr.layoutExport(tabId);
+  } catch (err) {
+    log("debug", `layout.export 失败（${reason}）：${err?.message || err}`);
+    return 0;
+  }
+  if (!layout?.root) return 0;
+
+  const plans = balanceSplitPlans(layout.root, await ourPaneIds(extraPaneIds));
+  if (plans.length === 0) return 0;
+
+  let applied = 0;
+  for (const plan of plans) {
+    const res = await herdr.layoutSetSplitRatio({ tabId, path: plan.path, ratio: plan.ratio });
+    if (res.ok) applied += 1;
+    else log("debug", `set_split_ratio([${plan.path}]) 失败：${res.error}`);
+  }
+  if (applied > 0) log("debug", `重平衡镜像布局 ${applied} 个节点（${reason}）`);
+  return applied;
+}
+
+/**
+ * 零高度陷阱防御。
+ *
+ * herdr 对过小的 split **不报错**，会静默返回 `viewport_rows: 0` 的不可见 pane
+ * （实测连切 40 次全部返回成功，第 3 个之后全是 0 行）。所以「不报错」≠「建好了」。
+ *
+ * 这里读回真实行数，为 0 就再重平衡一次；仍然为 0 只记一条日志 ——
+ * **绝不因为 0 行就放弃这一行**，记下来下一轮继续。
+ *
+ * @returns {Promise<number|null>} 实际行数；herdr 没给就返回 null
+ */
+async function ensurePaneVisible(paneId, reason) {
+  let rows = await herdr.paneViewportRows(paneId);
+  if (rows === null || rows > 0) return rows;
+
+  await rebalanceMirrorTree(`${reason}: 首轮 0 行`, [paneId]);
+  rows = await herdr.paneViewportRows(paneId);
+  if (rows === null || rows > 0) return rows;
+
   log(
     "warn",
-    `  通常是 Sessions 工作区窗口太矮或镜像行太多。` +
-      `请把该工作区的窗口拉高，或调小 .env 里的 MIRROR_PANE_RATIO。`,
+    `镜像 pane ${paneId} 重平衡后仍拿不到可视行（${rows}）。这一行照样保留，下一轮会再平衡一次。` +
+      `若反复出现，多半是 ${config.mirrorLabel} 工作区所在标签页被缩得太矮。`,
   );
-  return null;
+  return rows;
 }
 
 /** 单引号包裹；内部单引号用 '\\'' 闭合转义。 */
@@ -1108,6 +1230,12 @@ async function teardownMirror(sessionID, rec, reason) {
 
   delete runtime.state.panes[sessionID];
   await store.removeFile(path.join(STATE_DIR, `mirror-${sessionID}.json`));
+  // 少了一个叶子，剩下的 pane 要重新均分，不然锚点会把空出来的空间全吃掉。
+  // 一轮里可能连续回收好几行，只重平衡一次就够。
+  if (!runtime.balancedThisPass) {
+    runtime.balancedThisPass = true;
+    await rebalanceMirrorTree(`回收 ${shortId(sessionID)}`);
+  }
   log("info", `回收镜像行 ${shortId(sessionID)}（${reason}）`);
 }
 
@@ -1128,7 +1256,9 @@ async function reapAll(reason) {
     /* state 目录还不存在，无所谓 */
   }
   if (orphans > 0) log("info", `清理了 ${orphans} 个残留的镜像显示快照`);
-  if (config.installAgentView) await clearAgentView(runtime.state, reason);
+  await rebalanceMirrorTree("reap");
+  // reap 之后镜像行必然为 0，交给 reconcileAgentView 决定是降级成只排序还是直接清掉
+  await reconcileAgentView(runtime.state, { reason, force: true });
   persistState();
 }
 
@@ -1157,6 +1287,20 @@ function resumeArgvFor(sessionID) {
   return ["opencode", "--session", sessionID];
 }
 
+/**
+ * 上报一个镜像行。**刻意拆成两步。**
+ *
+ * 官方文档：`resume_argv` 非法时失败码是 `invalid_resume_argv`，而且
+ * 「the report is not applied」—— 也就是说带一个坏 resume argv 会把
+ * `agent_session_id` 一起丢掉，session id 白报。所以：
+ *
+ *   步骤 1 `pane report-agent`：只带状态 + `--agent-session-id`，**不带** resume argv。
+ *          这一步失败就没有这一行。
+ *   步骤 2 `pane report-agent-session`：单独附上 resume argv。
+ *          这一步失败只丢「Herdr 重启后怎么恢复」，session id 不受影响。
+ *
+ * 两步都记日志，方便对着 herdr 侧边栏验证。
+ */
 async function reportMirror(sessionID, rec) {
   const fingerprint = fingerprintOf(rec);
   const paneId = rec.paneId;
@@ -1167,50 +1311,48 @@ async function reportMirror(sessionID, rec) {
 
   const firstReport = rec.reportedAt === 0 || rec.fingerprint === "";
   const stateChanged = firstReport || rec.state !== rec.lastState || rec.stateMessage !== rec.lastStateMessage;
+  const identityStale = firstReport || rec.lastResume !== config.resumeMode;
 
-  // 第一次上报必须带 resume argv —— Herdr 要求先持有 pane 才接受恢复命令，
-  // 否则返回 resume_not_accepted。
-  if (firstReport || rec.lastResume !== config.resumeMode) {
+  // --- 步骤 1：状态 + session 身份（不含 resume argv） ----------------------
+  if (firstReport || stateChanged || identityStale) {
     const res = await herdr.reportAgent({
       paneId,
       state: rec.state,
       seq: nextSeq(),
       sessionId: sessionID,
       message: rec.stateMessage,
+    });
+    if (!res.ok) {
+      log("warn", `上报[1/2] 失败（${shortId(sessionID)}）: ${res.error}`);
+      return;
+    }
+    log(
+      "info",
+      `上报[1/2] ${shortId(sessionID)} → ${rec.state}${rec.stateMessage ? `（${rec.stateMessage}）` : ""}` +
+        `${identityStale ? " +session id" : ""}`,
+    );
+  }
+
+  // --- 步骤 2：恢复命令（失败只影响恢复能力） -------------------------------
+  if (identityStale) {
+    // herdr 要求先持有 pane 才接受恢复命令，步骤 1 已经保证了这一点
+    const res = await herdr.reportAgentSession({
+      paneId,
+      seq: nextSeq(),
+      sessionId: sessionID,
       resumeArgv: resumeArgvFor(sessionID),
     });
-    if (!res.ok) {
-      log("warn", `report-agent 失败（${shortId(sessionID)}）: ${res.error}`);
-      return;
+    if (res.ok) {
+      rec.lastResume = config.resumeMode;
+      log("info", `上报[2/2] ${shortId(sessionID)} 恢复命令已挂上（${config.resumeMode}）`);
+    } else {
+      log("warn", `上报[2/2] 失败（${shortId(sessionID)}），只影响 Herdr 重启后的恢复，不影响这一行: ${res.error}`);
     }
-    rec.lastResume = config.resumeMode;
-    await writeMirrorMetadata(paneId, sessionID, rec);
-    rec.reportedAt = Date.now();
-    rec.lastState = rec.state;
-    rec.lastStateMessage = rec.stateMessage;
-    rec.fingerprint = fingerprint;
-    log("info", `上报 ${shortId(sessionID)} → ${rec.state}${rec.stateMessage ? `（${rec.stateMessage}）` : ""}`);
-    return;
   }
 
-  if (stateChanged) {
-    const res = await herdr.reportAgent({
-      paneId,
-      state: rec.state,
-      seq: nextSeq(),
-      sessionId: sessionID,
-      message: rec.stateMessage,
-    });
-    if (!res.ok) {
-      log("warn", `report-agent 失败（${shortId(sessionID)}）: ${res.error}`);
-      return;
-    }
-    log("info", `上报 ${shortId(sessionID)} → ${rec.state}${rec.stateMessage ? `（${rec.stateMessage}）` : ""}`);
-  }
-
-  if (fingerprint !== rec.fingerprint) {
-    // token / 标题变了（含会话切换后目录变了）
-    await writeMirrorMetadata(paneId, sessionID, rec);
+  // --- 展示层：token / 标题 / pane 名 ---------------------------------------
+  if (firstReport || fingerprint !== rec.fingerprint) {
+    await writeMirrorPresentation(paneId, sessionID, rec);
   }
 
   rec.reportedAt = Date.now();
@@ -1219,13 +1361,30 @@ async function reportMirror(sessionID, rec) {
   rec.fingerprint = fingerprint;
 }
 
+/** 状态 → 一个能在 40 字内说清「谁、在哪、在干嘛」的 pane 名。 */
+export function mirrorLabel(state, project, title) {
+  const mark =
+    state === "working" ? "●" : state === "blocked" ? "▲" : state === "idle" ? "○" : "·";
+  return store.sanitizeText([mark, project, title].filter(Boolean).join(" "), MIRROR_LABEL_MAX);
+}
+
 /**
- * 只影响展示的元数据。
+ * 只影响展示的元数据 + pane 名。
  *
- * token 名固定为 oc_mirror / oc_session / oc_title / oc_project，
- * 供 agent.view 投影筛选；值自己先截到 80 字符（Herdr 也会截，但超长标题会先挤爆整行）。
+ * 两件事分开的原因：
+ *   - `pane.report_metadata` 的 `title` 与 token 走的是「展示层」通道，一定能落地，
+ *     侧边栏行模板里可以用 `$oc_title` / `$oc_project` / `$oc_state` 渲染。
+ *   - `pane.rename` 改的是 pane 自己的 label。Agents 侧边栏那一行的默认文本来自
+ *     终端标题（OSC），镜像 pane 里跑的是 node 进程，不 rename 就会显示成
+ *     `'/usr/bin/node' '/ho…` 这种东西。
+ *
+ * 用户自己的 herdr-sidebar 会用 `hs_title` 覆盖侧边栏文本，那个插件的配置我们不动，
+ * README 里说明可以自行把 `$oc_title` 拼进行模板。
+ *
+ * token 名固定为 oc_mirror / oc_session / oc_title / oc_project / oc_state，
+ * 值自己先截到 80 字符（Herdr 也会截，但超长标题会先挤爆整行）。
  */
-async function writeMirrorMetadata(paneId, sessionID, rec) {
+async function writeMirrorPresentation(paneId, sessionID, rec) {
   const title = store.truncate(store.sanitizeText(rec.title || shortId(sessionID), 80));
   const project = store.truncate(
     store.sanitizeText(basename(rec.directory) || (rec.directory ? "" : "unknown")),
@@ -1237,13 +1396,20 @@ async function writeMirrorMetadata(paneId, sessionID, rec) {
     seq: nextSeq(),
     title,
     tokens: {
-      [`${MIRROR_PREFIX}mirror`]: "1",
-      [`${MIRROR_PREFIX}session`]: store.truncate(sessionID, 80),
+      [herdr.MIRROR_TOKEN]: "1",
+      [herdr.MIRROR_SESSION_TOKEN]: store.truncate(sessionID, 80),
       [`${MIRROR_PREFIX}title`]: title,
       [`${MIRROR_PREFIX}project`]: project,
+      [`${MIRROR_PREFIX}state`]: store.truncate(rec.state || "unknown", 32),
     },
   });
   if (!res.ok) log("debug", `report-metadata 失败: ${res.error}`);
+
+  const label = mirrorLabel(rec.state, project, title);
+  if (label) {
+    const renamed = await herdr.paneRename(paneId, label);
+    if (!renamed.ok) log("debug", `pane rename 失败（${paneId}）: ${renamed.error}`);
+  }
 }
 
 /** 把当前状态写到 STATE_DIR，供镜像 pane 里的驻留进程显示。 */
@@ -1299,17 +1465,33 @@ async function validateTrackedPanes() {
 
 // ---------------------------------------------------------------------------
 // agent.view 投影（全局副作用，必须显式开启）
+//
+// 安全底线（真实事故换来的）：**绝不只靠筛选隐藏官方行。**
+// 投影的 filter 是全局的，一旦装了 `{oc_mirror == 1}` 而镜像行数为 0，
+// 用户原本那 8 行官方 opencode agent 会全部被筛掉，侧边栏直接变成
+// `no matching agents` —— 插件把用户的视图清空了。
+// 所以装投影之前必须先数当前镜像行数，为 0 时退回 sort-only（只接管排序）。
 // ---------------------------------------------------------------------------
+
+/**
+ * 现在到底该不该带筛选。
+ *
+ * @param {object[]} agents 本轮拉到的 agent 列表（不传就现场拉一次）
+ * @returns {boolean}
+ */
+export function shouldFilterMirror(agents) {
+  // 配置只要不是 mirror，就永远不筛选。
+  if (config.agentViewScope !== "mirror") return false;
+  // 一个镜像行都没有时，带筛选 = 把用户的官方行全隐藏掉。绝对不装。
+  return herdr.countMirrorRows(agents) > 0;
+}
 
 /**
  * 构造投影参数。
  *
- * scope=mirror（默认，SPEC 6.3）：只显示本插件的镜像行。
- * scope=sort-only：不过滤，只接管排序（保留其它 agent）。
- *
- * 注意这个投影是全局的，会影响整个 Agents 侧边栏，所以默认不安装。
+ * @param {object[]} [agents] 用来判断「现在有没有镜像行」
  */
-export function buildAgentView() {
+export function buildAgentView(agents) {
   const params = {
     source: herdr.ownSource(),
     label: "opencode-sessions",
@@ -1318,25 +1500,63 @@ export function buildAgentView() {
       { field: "state_change_seq", order: "desc" },
     ],
   };
-  if (config.agentViewScope === "mirror") {
-    params.filter = { op: "eq", field: { token: `${MIRROR_PREFIX}mirror` }, value: "1" };
+  if (shouldFilterMirror(agents)) {
+    params.filter = { op: "eq", field: { token: herdr.MIRROR_TOKEN }, value: "1" };
   }
   return params;
 }
 
-async function applyAgentView(state, { reason } = {}) {
-  const params = buildAgentView();
+function sameAgentViewParams(a, b) {
+  if (!a || !b) return false;
+  return JSON.stringify(a) === JSON.stringify(b);
+}
+
+/**
+ * 按「当前 config + 当前镜像行数」校准已安装的投影。**所有模式共用的唯一入口。**
+ *
+ * 规则（幂等，不刷错误日志）：
+ *   - `INSTALL_AGENT_VIEW=false` 且 state 里记着自己装过 → 清掉并置空。
+ *     这是「用户删了 .env 但没人去清」的自救路径。
+ *   - 开关开着 → 算参数；参数没变就什么都不做，变了才重新下发。
+ *     参数会随「镜像行有没有」自动在 `mirror`（带筛选）与 `sort-only` 之间切换。
+ */
+async function reconcileAgentView(state, { reason, force = false } = {}) {
+  if (!state) return;
+
+  if (!config.installAgentView) {
+    if (!state.agentView) return; // 幂等：没装过就别碰
+    await clearAgentView(state, `INSTALL_AGENT_VIEW 已关闭（${reason || "?"}）`);
+    return;
+  }
+
+  const agents = await herdr.agentList();
+  const params = buildAgentView(agents);
+  const filtering = Boolean(params.filter);
+
+  if (!force && state.agentView && sameAgentViewParams(state.agentView.params, params)) return;
+
+  if (!filtering) {
+    log("info", `当前没有镜像行，Agents 视图投影降级为只排序（不筛选），原因 ${reason || "?"}`);
+  }
+  await applyAgentView(state, { reason, params });
+}
+
+async function applyAgentView(state, { reason, params } = {}) {
+  const effective = params || buildAgentView();
   try {
-    const result = await herdr.agentViewSet(params);
-    log("info", `已安装 Agents 视图投影（scope=${config.agentViewScope}，原因 ${reason || "?"}）`);
+    await herdr.agentViewSet(effective);
+    log(
+      "info",
+      `已安装 Agents 视图投影（${effective.filter ? "只显示镜像行" : "只排序，不筛选"}，原因 ${reason || "?"}）`,
+    );
     if (state) {
-      state.agentView = { params, installedAt: Date.now() };
+      state.agentView = { params: effective, installedAt: Date.now() };
       persistState();
     }
-    return result;
+    return true;
   } catch (err) {
     log("warn", `安装 Agents 视图投影失败: ${err?.message || err}`);
-    return null;
+    return false;
   }
 }
 

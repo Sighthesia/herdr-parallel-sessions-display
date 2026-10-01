@@ -74,6 +74,10 @@
 
 `herdr agent list --json` 中每个 agent 暴露只读 `agent_session: { source, agent, kind, value }`。收集所有活跃 agent 的 `agent_session.value`（即 session id），从候选集合中剔除，避免与用户真实 TUI 那一行重复。
 
+**实测补充（herdr 0.9.3）**：这个字段只在 herdr 存下原生 session 引用时才出现，而官方集成（`herdr:opencode`）会存、**第三方 source 不会** —— 实测 `plugin:` / `user:` / `custom:` source 无论带不带 `resume_argv`、带不带 `agent_session_id`、seq 多大，`agent.list` / `pane.list` 里的 `agent_session` 一律被省略。因此去重必须有第二条回退路径：读自己上报的 `oc_session` token。
+
+同时必须能区分「自己的镜像行」和「别人上报的行」，否则下一轮会把自己刚建好的行当成已有人上报而全部丢掉。判定顺序：`tokens.oc_mirror == "1"` → `agent_session.source === plugin:<id>`。
+
 ---
 
 ## 5. 状态映射
@@ -106,12 +110,19 @@
 
 统一放在专用工作区/标签页（默认标签名 `Sessions`），与管理面板同处一屏，不打开不占视野。
 
-每个镜像 pane 运行一个极轻的驻留进程（Node 定时器保活即可，不依赖外部命令），插件以自己的 `source` 为它上报：
+每个镜像 pane 运行一个极轻的驻留进程（Node 定时器保活即可，不依赖外部命令），插件以自己的 `source` 为它上报。上报**刻意拆成两步**：
 
-- `pane report-agent`：`--agent opencode`、`--state`、`--agent-session-id`、`--seq`、`-- <恢复命令>`
-  恢复命令为 `opencode --session <id>`，保证 Herdr 重启后仍能恢复该行
-- `pane report_metadata`：写入 `session_id` / `title` / `project` / `oc_mirror=1` 等 token 供筛选与渲染
-- session 停止运行 → `pane release-agent` + 关闭该镜像 pane，行随之消失
+1. `pane report-agent --state ... --agent-session-id <id>` —— 只带状态与 session id，**不带** resume argv
+2. `pane report-agent-session --agent-session-id <id> -- <恢复命令>` —— 单独附上恢复命令
+
+原因是官方文档写明 `invalid_resume_argv` 时「the report is not applied」：合成一步上报时，一个不合法的恢复命令会把 `agent_session_id` 一起丢掉，session id 白报。拆开后第 2 步失败只影响「Herdr 重启后怎么恢复」，不影响这一行本身。两步都记日志。
+
+恢复命令为 `opencode --session <id>`（`RESUME_MODE=mirror` 时改为只恢复驻留进程），保证 Herdr 重启后仍能恢复该行。session 停止运行 → `pane release-agent` + 关闭该镜像 pane + 重平衡剩余布局，行随之消失。
+
+同时上报两层展示信息：
+
+- `pane report_metadata`：`title` + `oc_mirror` / `oc_session` / `oc_title` / `oc_project` / `oc_state` token
+- `pane rename`：`状态符号 + 项目 + 标题`（≤40 字）。Agents 侧边栏一行的默认文本来自终端标题（OSC），镜像 pane 里跑的是 node 进程，不改名就会显示成 `'/usr/bin/node' '/ho…`
 
 `--seq` 必须跨进程重启单调递增，使用时间戳。
 
@@ -126,13 +137,30 @@
 - `mirror`（默认，符合原始 SPEC）——只显示镜像行
 - `sort-only`——不筛选，只安装排序，保留官方集成的行
 
-### 6.4 镜像空间约束
+#### 6.3.1 安全底线：绝不只靠筛选隐藏官方行
 
-一个 session 一个 pane 会垂直瓜分窗口高度，窗口过矮时 `pane split` 会直接失败。需要高度守卫 + 逐级退让 split ratio + 失败退避（避免每轮刷警告）。
+上面那条副作用是可以造成真实事故的：`mirror` 投影是全局筛选，一旦装上而镜像行为 0，用户原本那 8 行官方 opencode agent 会被**全部**筛掉，侧边栏变成 `no matching agents` —— 插件把用户自己的视图清空了。
+
+两条硬性规则：
+
+1. **装投影前先数镜像行数。** 为 0 时绝不允许安装带筛选的 `mirror` 投影，自动退回 `sort-only`（只接管排序）。收敛成一个函数 `shouldFilterMirror()`。镜像行从 0 变正、或从正变 0，投影都会跟着自动升降级。
+2. **投影必须有人清。** `INSTALL_AGENT_VIEW=false` 但 `state.agentView` 存在时，清掉投影并把 `state.agentView` 置 null。这段「按当前 config 校准已安装投影」的逻辑是**所有模式共用**的（`startup` / `pane` / `action` / `once` 都跑一次），幂等、不刷错误日志。只有 startup 处理是不够的：用户把开关关掉后没有任何进程会再去校准，投影会一直赖在运行中的 Herdr server 里。
+
+### 6.4 布局：平衡 BSP 树
+
+新增镜像 pane 后**重平衡整个镜像子树**，让所有镜像 pane 均分空间，而不是让锚点越来越小。
+
+- 用 `layout.set_split_ratio`，**不用** `layout.apply`。官方文档明说 apply 会重建 tab、不保留 live PTY / scrollback / 进程，会把已有镜像 pane 全杀掉重启。
+- 规则只有一条：**`ratio = first 子树的叶子数 / 该节点子树的总叶子数`**。每个叶子恰好拿到 1/N，对任意二叉树形状都成立。
+- 只调整「子树里全是镜像 pane」的节点：侧边栏之类的外来 pane 不参与，它们的祖先 split 保持不动。
+- 比例已到位就不重复下发（reconcile 每 5 秒跑一次，不能每轮打十几次 socket）。
+- **不因为空间不足拒绝建行。** 旧设计里「每行至少 N 行」的高度守卫和 ratio 逐级退让全部删除：反复用小 ratio 拆同一个锚点，锚点自己被逐次压缩、预算很快耗尽，那不是 herdr 的限制，是切分策略错了。实测 44 行 area 下平衡 8 叶完全放得下（`viewport_rows` 2/2/3/9/9/4/3，全 > 0）；超长会有滚动。
+
+**零高度陷阱**：herdr 对过小的 split 不报错，会静默返回 `viewport_rows: 0` 的不可见 pane（实测连切 40 次全部返回成功，第 3 个之后全是 0 行）。所以「不报错」≠「建好了」。新建 pane 后读回 `scroll.viewport_rows`，为 0 立即重平衡再读一次；仍为 0 只记一条日志 —— **但绝不因此放弃这一行**，记下来下一轮重试。
 
 ### 6.5 孤儿回收
 
-`state.json` 丢失或多次崩溃后，Herdr 里会留下永久残行。需要按 label 认领镜像工作区，并回收所有不在映射里的 pane。
+`state.json` 丢失或多次崩溃后，Herdr 里会留下永久残行。需要按 label 认领镜像工作区，并回收所有不在映射里的 pane。重平衡时这些残行靠 `oc_mirror` token 认回来，否则整棵镜像子树会被当成「含外来 pane」而永远得不到平衡。
 
 ---
 
@@ -191,12 +219,14 @@ README.md
 
 ## 10. 已知边界
 
-- **一个运行中 session 一行 = 一个镜像 pane**，有终端资源成本，集中放置后不查看时无感，但不是零成本。窗口高度不足时会失败并退让。
+- **一个运行中 session 一行 = 一个镜像 pane**，有终端资源成本，集中放置后不查看时无感，但不是零成本。行数很多时会需要滚动 —— 按产品决策这不构成拒绝建行的理由。
 - **镜像行只读**。要交互需点进用户真实 TUI 手动切换 session。
 - **状态准确性依赖 SSE 连接**。事件流断开会退化为轮询兜底，`blocked` 的权限判定精度下降；v1 无独立权限接口，断流期间该信号直接丢失。
 - **v1 协议路径没有真机验证**（本机只有 v2）。v2 路径已在 `opencode 2.0.21` + Basic Auth 场景下端到端验证。
-- **Windows 命名管道分支未验证**（无 Windows 环境），`agent.view.set` 的裸 socket 客户端在 Windows 上留了 TODO。
+- **Windows 命名管道分支未验证**（无 Windows 环境），`agent.view.set` / `layout.set_split_ratio` 的裸 socket 客户端在 Windows 上留了 TODO。
 - **不触碰官方集成文件**（`~/.config/opencode/plugins/herdr-agent-state.js` 等），避免与其抢同一 pane 的状态归属。
-- **`agent.view.set` 无 CLI 封装**，需自写裸 socket 客户端；`INSTALL_AGENT_VIEW` 默认关闭，未开启时不受此影响。
+- **`agent.view.set` 与 `layout.set_split_ratio` 无 CLI 封装**，需自写裸 socket 客户端；`INSTALL_AGENT_VIEW` 默认关闭，未开启时不受此影响。
+- **`agent_session` 落不了库**：herdr 0.9.3 只给官方集成存原生 session 引用，第三方 source 传了 `agent_session_id` 也会被省略（见 4.4）。去重因此走 `oc_session` token 回退；Herdr 重启后的原生 session 恢复在第三方 source 上不可用。
+- **侧边栏行文本可能被用户自己的插件覆盖**：镜像行上报了 `oc_title` / `oc_project` / `oc_state` token，也用 `pane.rename` 设了可读 label，但 `herdr-sidebar` 的 `hs_title` token 优先级更高。插件不去改用户的 sidebar 配置，需要的话由用户自行把 `$oc_title` 拼进 sidebar 行模板。
 - `RESUME_MODE=opencode` 的重启恢复未端到端验证（会真的拉起 opencode），`resume_argv` 的格式规则已按官方文档核对。
 - 面板命令的输出不会进入 `herdr plugin log list`，排障需走 `herdr pane read`。

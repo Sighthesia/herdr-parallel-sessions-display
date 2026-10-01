@@ -21,6 +21,15 @@ const DIRECTORY = process.env.OC_MIRROR_DIRECTORY || "";
 
 const ESC = String.fromCharCode(27);
 const CLEAR_SCREEN = `${ESC}[2J${ESC}[H`;
+/**
+ * OSC 2 —— 改终端标题。
+ *
+ * 为什么需要：Agents 侧边栏那一行的默认文本来自终端标题。镜像 pane 里跑的是 node
+ * 进程，OSC 标题就落成 `'/usr/bin/node' '/home/…` 这种没用的东西，用户自己的
+ * herdr-sidebar 还会用 `hs_title` 覆盖掉 pane 名。改自己的 OSC 标题是从源头修，
+ * 不用去动别人的插件配置。
+ */
+const SET_TITLE = (text) => `${ESC}]2;${text}${ESC}\\`;
 
 // 单实例：pane run 可能因为 shell 还没就绪而被重试多次，
 // 重复启动时后到的那个直接退出，避免一个 pane 里跑两个驻留。
@@ -73,9 +82,20 @@ function paint() {
   const body = `${lines.join("\n")}\n`;
   if (body === lastRender) return;
   lastRender = body;
+  // 标题与 board 侧 pane.rename 的规则保持一致：状态符号 + 项目 + 标题。
+  // 控制字符已经由 board 在写快照前清过，这里只做长度兜底。
+  const oscTitle = `${badge.split(" ")[0]} ${basename(dir)} ${title}`.replace(/\s+/g, " ").trim();
   // 清屏 + 归位再整块重画。状态行很短，重画成本可以忽略，
   // 比用光标上移做原地更新可靠得多。
-  out.write(CLEAR_SCREEN + body);
+  out.write(SET_TITLE(oscTitle.slice(0, 120)) + CLEAR_SCREEN + body);
+}
+
+/** 目录的 basename，用来在标题里点出是哪个项目。 */
+function basename(dir) {
+  const parts = String(dir || "")
+    .split(/[\\/]+/)
+    .filter(Boolean);
+  return parts[parts.length - 1] || "";
 }
 
 // --- 单实例锁 --------------------------------------------------------------

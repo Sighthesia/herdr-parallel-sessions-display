@@ -45,8 +45,30 @@ Herdr Agents 视图
   守护进程，所以常驻逻辑放在 `[[panes]]` 里。
 - **镜像 pane 里什么都不跑**，只保持前台进程存活（`setInterval` 保活）。这样官方集成
   不会在同一个 pane 上二次上报，重复行从源头就不可能发生。
-- **去重靠 `agent_session`**。每轮重算前读 Herdr 的 agent 列表，把已经被别的来源
+- **去重靠 session 身份**。每轮重算前读 Herdr 的 agent 列表，把已经被别的来源
   （主要是官方集成）上报过的 session id 收集起来，从候选集里剔除。
+
+### 镜像 pane 怎么排布
+
+新 pane 切出来之后，插件会立刻**重平衡整棵镜像子树**：对每个 split 节点把比例设成
+「first 子树的叶子数 ÷ 子树总叶子数」，于是所有镜像 pane 精确均分空间。
+
+用 `layout.set_split_ratio`（只改比例），**不用** `layout.apply` —— apply 会重建标签页、
+销毁所有活着的终端进程，把已有镜像 pane 全杀掉重启。
+
+镜像行再多也照建。窗口不够高时行会变矮、需要滚动，但插件不会因为「放不下」就拒绝建行。
+
+### 上报为什么拆成两步
+
+`resume_argv` 非法时 herdr 的失败码是 `invalid_resume_argv`，而且官方文档写明
+「the report is not applied」—— 也就是说带一个坏恢复命令，会把 `agent_session_id`
+一起丢掉，session id 白报。所以：
+
+1. `pane report-agent --state ... --agent-session-id <id>` —— 不带恢复命令，先把状态和
+   session 身份落库
+2. `pane report-agent-session --agent-session-id <id> -- <恢复命令>` —— 再单独挂恢复命令
+
+第 2 步失败只影响「Herdr 重启后怎么恢复」，这一行本身不受影响。两步都写日志。
 
 状态映射：
 
@@ -106,7 +128,7 @@ command = "opencode.session-mirror.board"
 | `IDLE_GRACE_MS` | `15000` | 转为非活跃后保留行的宽限时间 |
 | `AGENT_VIEW_SCOPE` | `mirror` | 投影范围：`mirror` 只显示镜像行 / `sort-only` 只排序 |
 | `RESUME_MODE` | `opencode` | Herdr 重启后的恢复命令，见下 |
-| `MIRROR_PANE_RATIO` | `0.25` | 镜像 pane 切分比例 |
+| `MIRROR_PANE_RATIO` | `0.5` | 初始切分比例，建完立刻被重平衡覆盖 |
 | `MIRROR_PANE_DIRECTION` | `down` | 排列方向 `down` / `right` |
 | `SESSION_LIST_LIMIT` | `200` | 每页拉多少条会话 |
 | `SESSION_PAGE_LIMIT` | `8` | 最多翻几页找活跃 session |
@@ -137,6 +159,33 @@ command = "opencode.session-mirror.board"
 - `AGENT_VIEW_SCOPE=sort-only`：不过滤，只按「需要关注优先 + 最近状态变更」排序
 
 而且它没有 CLI 封装，插件是自己写的一层裸 socket 客户端（newline-delimited JSON）。
+
+**一条安全底线：插件绝不会在「一条镜像行都没有」的时候安装带筛选的投影。**
+筛选是全局的，那种情况下会把官方集成的行全部隐藏掉，侧边栏直接变成
+`no matching agents`。所以镜像行为 0 时会自动降级成 `sort-only`，镜像行回来再自动升回去。
+
+而且这段校准逻辑在**每一种运行模式**（startup / pane / action / once）里都会跑一次，
+所以你把 `INSTALL_AGENT_VIEW` 关掉之后随便执行一个 action，投影就会被清掉 ——
+不会出现「配置早就关了，筛选还赖在运行中的 Herdr 里」的情况。
+
+### 让侧边栏行显示可读标题
+
+镜像行上报了这些 token，可以在你的侧边栏行模板里直接用：
+
+| token | 内容 | 例 |
+| --- | --- | --- |
+| `$oc_title` | session 标题 | `Tray hover二级菜单点击收起无退场效果` |
+| `$oc_project` | 项目名（会话目录的 basename） | `afloat` |
+| `$oc_state` | 状态 | `working` |
+| `$oc_session` | opencode session id | `ses_f37dc43f...` |
+| `$oc_mirror` | 镜像行标记，恒为 `1` | `1` |
+
+同时插件也会 `pane rename` 镜像 pane（`● afloat · Tray hover…`，40 字内），这个 label
+和终端标题是分开的两份数据。
+
+> 注意：如果你装了 `herdr-sidebar` 这类插件，它的 `hs_title` token 优先级更高，会盖掉
+> 终端标题。要让镜像行按 `$oc_title` 显示，在**你自己的** sidebar 行模板里加
+> `$oc_title` 即可 —— 插件不会去改你其它插件的配置。
 
 ## 兼容的 opencode 版本
 
@@ -180,8 +229,47 @@ session 为什么建行 / 不建行（是让给真实 TUI 了，还是它是子 
    ```
 
 3. server 是不是在非默认端口？直接写 `OPENCODE_SERVER_URL` 最省事。
-4. 日志里全是「让出 N 个」而 N 等于活跃 session 数？那说明所有 session 都被
-   真实 TUI 占着了 —— 这本身就是正确行为，不是 bug。
+4. 日志里全是「让出 N 个」而 N 等于活跃 session 数？见下面「镜像行比预期少」。
+
+**侧边栏突然空了 / 显示 `no matching agents`（最优先处理）：**
+
+这是插件的全局筛选投影把**官方的行也一起藏了**。先自救，再排查。
+
+```bash
+# 1) 先把投影清掉。只清「确实是本插件装的」那一份，不会动别人的视图。
+herdr plugin action invoke opencode.session-mirror.sync
+```
+
+> 上面这条 action 一启动就会做投影校准：`INSTALL_AGENT_VIEW=false` 而插件以为自己装过时，
+> 会立刻 `agent.view.clear` 并把记录置空。侧边栏应该立刻恢复正常。
+> 任何一种运行模式（startup / 看板面板 / action / once）都会做同一件事，
+> 所以「重新打开看板面板」同样有效。
+
+然后再排查为什么筛选会在没有镜像行的时候装上：
+
+```bash
+# 2) 看板面板里搜这两行日志
+#    「重平衡镜像布局」      —— 说明镜像 pane 确实在
+#    「镜像行 N」            —— N=0 且投影仍带 filter 就是异常
+herdr plugin pane open --plugin opencode.session-mirror --entrypoint board
+herdr pane read <看板pane_id> --lines 200
+```
+
+3. `.env` 里把 `INSTALL_AGENT_VIEW=false` 确认一遍，重启看板。
+4. 如果你**确实想要** `mirror` 范围：先让 opencode 那边至少有一个 session 在跑，
+   镜像行出现后插件会自动把投影升回带筛选的版本。
+
+**镜像行比预期少：**
+
+日志里搜「让出 N 个」。`N` 等于活跃 session 数时说明所有 session 都被用户真实 TUI
+占着了 —— 这是正确行为，不是 bug。
+
+**某一行还是没有名字（显示成 `'/usr/bin/node' …`）：**
+
+侧边栏那一行的默认文本来自终端标题（OSC），镜像 pane 里跑的是 node 进程。
+插件已经用 `pane rename` 给 pane 起了可读名字，也上报了 `$oc_title` / `$oc_project`
+token。如果你装了 `herdr-sidebar`，它的 `hs_title` 优先级更高 —— 在你自己的 sidebar
+行模板里加 `$oc_title` 就行（见上面「让侧边栏行显示可读标题」）。
 
 **镜像行状态一直不更新：**
 
@@ -214,10 +302,17 @@ herdr plugin action invoke opencode.session-mirror.reap
 ## 已知边界
 
 - **一个运行中 session 一行 = 一个镜像 pane**，有终端资源成本。集中在 `Sessions`
-  工作区里，不打开不占视野，但不是零成本。
+  工作区里，不打开不占视野，但不是零成本。行数很多时每行会变矮、需要滚动 ——
+  插件不会因为放不下就拒绝建行。
 - **镜像行只读**。要交互得切回真实 TUI 手动换 session。
 - **状态准确性依赖 SSE**。断流时退化为轮询，`blocked` 精度下降。
 - **不碰官方集成文件**（`~/.config/opencode/plugins/herdr-agent-state.js` 等），
   也不用 `herdr integration install/uninstall`。避免和官方集成抢同一个 pane 的状态归属。
+- **去重不靠 `agent_session`**。herdr 0.9.3 只给官方集成存原生 session 引用，
+  第三方 source 传了 `agent_session_id` 也会被省略（实测：`plugin:` / `user:` /
+  `custom:` source、带不带 `resume_argv`、seq 多大都一样）。所以去重走自己上报的
+  `oc_session` token，副作用是 Herdr 重启后的原生 session 恢复在镜像行上不可用。
+- **不接管第三方插件的显示层**。镜像行上报了 `$oc_title` / `$oc_project` / `$oc_state`
+  token 也设了 pane label，但 `herdr-sidebar` 的 `hs_title` 优先级更高，改它要你自己动手。
 - v2 下 `retry` 探测每个活跃 session 多一次 HTTP 请求，行多时可以在 `.env` 里
   关掉 `RETRY_DETECTION`。

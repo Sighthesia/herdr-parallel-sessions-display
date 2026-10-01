@@ -256,24 +256,62 @@ export async function agentList() {
 }
 
 /**
+ * 本插件的镜像行标记 token。
+ * agent.record 上带这个 token 的行就是我们自己的，不能当成「被别人占用的 session」。
+ */
+export const MIRROR_TOKEN = "oc_mirror";
+
+/** 镜像行用来公开 session id 的 token，`agent_session` 缺失时的去重回退来源。 */
+export const MIRROR_SESSION_TOKEN = "oc_session";
+
+/** 算一个 agent 是不是我们自己的镜像行。 */
+export function isMirrorRow(agent) {
+  const tokens = agent?.tokens;
+  if (tokens && typeof tokens === "object" && tokens[MIRROR_TOKEN] === "1") return true;
+  return agent?.agent_session?.source === ownSource();
+}
+
+/** 当前 Herdr 里活着的镜像行数量。 */
+export function countMirrorRows(agents) {
+  let n = 0;
+  for (const agent of agents || []) if (isMirrorRow(agent)) n += 1;
+  return n;
+}
+
+/**
  * 已被其它来源上报的原生 session id 集合 —— 用来避免和用户真实 TUI 那行重复。
  *
- * 关键：必须排除我们自己 source 的 agent，否则我们自己的镜像行会把自己挤掉。
+ * 两个来源：
+ *   1. `agent_session.value`（官方集成 `herdr:opencode` 一定会写）
+ *   2. `tokens.oc_session`（herdr 0.9.3 对第三方 source 不落 `agent_session`，
+ *      实测带 `agent_session_id` 的 report 也照样省略该字段，所以必须留这条回退）
+ *
  * `agent_session` 可能整个字段缺失（herdr 没存原生 session 引用），解析要容错。
  *
- * @param {object[]} [agents] 复用上次结果，省一次 CLI 调用
+ * @param {object[]} [agents] 复用本轮已拉到的结果，省一次 CLI 调用
  * @returns {Promise<Set<string>>}
  */
 export async function claimedSessionIds(agents) {
   const list = Array.isArray(agents) ? agents : await agentList();
   const mine = ownSource();
   const out = new Set();
+
   for (const agent of list) {
-    const as = agent?.agent_session;
-    if (!as || typeof as !== "object") continue;
-    if (as.source === mine) continue; // 我们自己的镜像行
-    const value = as.value;
-    if (typeof value === "string" && value.length > 0) out.add(value);
+    // 1) 原生 session 引用：只要不是我们自己 source 上报的，一律让出去。
+    //    这条优先级最高 —— 即便那个 pane 上同时挂着我们的 oc_mirror token
+    //    （理论上不会发生），也不能因此对用户可见的行再造一个重复行。
+    const session = agent?.agent_session;
+    const native = session?.value;
+    if (typeof native === "string" && native.length > 0 && session.source !== mine) {
+      out.add(native);
+      continue;
+    }
+
+    // 2) 回退：herdr 0.9.3 不给第三方 source 存原生引用，只能读我们自己上报的 token。
+    //    自己的镜像行直接跳过，否则下一轮会把刚建好的行当成「已有人上报」而全丢掉。
+    if (isMirrorRow(agent)) continue;
+    const token = agent?.tokens?.[MIRROR_SESSION_TOKEN];
+    if (typeof token === "string" && token.length > 0) out.add(token);
   }
   return out;
 }
@@ -317,10 +355,28 @@ export async function paneClose(paneId) {
 }
 
 /**
- * 上报 agent 生命周期状态。resumeArgv 只在建立会话 / 换 session 时传，避免每次状态变化都重发。
- * @param {{paneId:string,state:string,seq:number,sessionId?:string,message?:string,resumeArgv?:string[]}} input
+ * 给 pane 起一个可读名字。
+ *
+ * 背景：Agents 侧边栏那一行的默认文本来自终端标题（OSC 0/2），镜像 pane 里跑的是
+ * node 进程，于是整行会显示成 `'/usr/bin/node' '/ho…` 这种没用的东西。
+ * pane.rename 写的 label 是独立字段，不会和终端标题打架。
  */
-export async function reportAgent({ paneId, state, seq, sessionId, message, resumeArgv }) {
+export async function paneRename(paneId, label) {
+  const text = String(label || "").trim();
+  if (!paneId || !text) return { ok: false, error: "pane_rename 需要 pane id 和 label" };
+  return cli(["pane", "rename", paneId, text]);
+}
+
+/**
+ * 上报 agent 生命周期状态（第 1 步）。
+ *
+ * **刻意不接受 resume argv。** 官方文档：`resume_argv` 非法时失败码是
+ * `invalid_resume_argv` 且「the report is not applied」—— 带一个坏恢复命令
+ * 会把 `agent_session_id` 一起丢掉。恢复命令必须走 {@link reportAgentSession}。
+ *
+ * @param {{paneId:string,state:string,seq:number,sessionId?:string,message?:string}} input
+ */
+export async function reportAgent({ paneId, state, seq, sessionId, message }) {
   const args = [
     "pane",
     "report-agent",
@@ -336,14 +392,15 @@ export async function reportAgent({ paneId, state, seq, sessionId, message, resu
   ];
   if (sessionId) args.push("--agent-session-id", sessionId);
   if (message) args.push("--message", truncateMessage(message));
-  if (Array.isArray(resumeArgv) && resumeArgv.length > 0) {
-    args.push("--");
-    args.push(...resumeArgv);
-  }
   return cli(args);
 }
 
-/** 只换 session 身份 + 恢复命令，不动状态。 */
+/**
+ * 附上 session 身份与恢复命令（第 2 步）。
+ *
+ * 带 `resumeArgv` 时 herdr 要求上报方先通过 {@link reportAgent} 持有这个 pane，
+ * 否则返回 `resume_not_accepted`。
+ */
 export async function reportAgentSession({ paneId, seq, sessionId, resumeArgv }) {
   const args = [
     "pane",
@@ -417,4 +474,47 @@ export function agentViewSet(params) {
 
 export function agentViewClear(source) {
   return socketCall("agent.view.clear", source ? { source } : {});
+}
+
+// ---------------------------------------------------------------------------
+// layout —— 只有 socket API
+// ---------------------------------------------------------------------------
+
+/**
+ * 读出一个标签页的 BSP 布局树。
+ *
+ * 返回 `{workspace_id, tab_id, zoomed, focused_pane_id, root}`，
+ * `root` 是 `LayoutNode`：pane 节点 `{type:"pane", pane_id, label, cwd, command}`，
+ * split 节点 `{type:"split", direction, ratio, first, second}`。
+ *
+ * @returns {Promise<object|null>} layout 对象；拿不到返回 null
+ */
+export async function layoutExport(tabId) {
+  const params = tabId ? { tab_id: tabId } : {};
+  const r = await socketCall("layout.export", params);
+  return r && typeof r === "object" && r.layout ? r.layout : null;
+}
+
+/**
+ * 调整一个已有 split 节点的比例。
+ *
+ * `path` 是 BSP 树的索引路径：从标签页根开始，`false` 进 first、`true` 进 second，
+ * 空数组 = 标签页根。`ratio` 是 **first 子树**占父区域的比例，
+ * 与 `pane split --ratio` 同一语义。
+ *
+ * 官方文档明说 `layout.apply` 不保留 live PTY / scrollback / 进程，
+ * 所以重平衡必须走这里，绝不能用 apply。
+ *
+ * @returns {Promise<{ok:boolean,error?:string}>} 永不抛错
+ */
+export async function layoutSetSplitRatio({ tabId, path, ratio }) {
+  if (!Array.isArray(path) || !Number.isFinite(ratio)) {
+    return { ok: false, error: "layoutSetSplitRatio 需要 path 数组与有限 ratio" };
+  }
+  try {
+    await socketCall("layout.set_split_ratio", { tab_id: tabId, path, ratio });
+    return { ok: true, error: null };
+  } catch (err) {
+    return { ok: false, error: String(err?.message || err) };
+  }
 }

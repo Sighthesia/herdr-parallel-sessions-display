@@ -22,8 +22,7 @@ export const CONFIG_DEFAULTS = Object.freeze({
   // --- SPEC 第 7 节之外、为可运行性补的项（README 有完整表格）---
   AGENT_VIEW_SCOPE: "mirror", // mirror | sort-only
   RESUME_MODE: "opencode", // opencode | mirror
-  MIRROR_PANE_RATIO: "0.25",
-  MIN_PANE_ROWS: "3",
+  MIRROR_PANE_RATIO: "0.5",
   MIRROR_PANE_DIRECTION: "down",
   SESSION_LIST_LIMIT: "200",
   SESSION_PAGE_LIMIT: "8",

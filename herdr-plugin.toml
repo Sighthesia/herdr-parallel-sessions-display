@@ -1,0 +1,52 @@
+# Herdr 插件清单
+# 文档: https://herdr.dev/docs/plugins/
+# 注意: command 一律是 argv 数组，Herdr 不过 shell，所以没有变量展开。
+# 运行期工作目录是插件根目录 (HERDR_PLUGIN_ROOT)，脚本内部再用 import.meta.url 自定位，
+# 因此这里的相对路径是安全的。
+
+id = "opencode.session-mirror"
+name = "OpenCode Session Mirror"
+version = "0.1.0"
+min_herdr_version = "0.9.3"
+description = "把同一个 opencode server 内所有运行中的根 session 镜像成 Herdr Agents 视图里的独立行"
+platforms = ["linux", "macos"]
+
+# 一次性初始化钩子：Herdr 恢复会话后运行一次。
+# 只做两件事：重放 agent 视图投影、（可选）拉起常驻管理器。然后立刻退出。
+# 常驻逻辑不在这里 —— [[startup]] 不是受监管的守护进程。
+[[startup]]
+command = ["node", "src/board.mjs", "--mode", "startup"]
+
+# 打开常驻管理器面板（也是本插件唯一的常驻进程）。
+[[actions]]
+id = "board"
+title = "OpenCode Session 看板"
+contexts = ["workspace"]
+command = ["node", "src/board.mjs", "--mode", "action", "--action", "board"]
+
+# 立刻触发一次全量重算。
+[[actions]]
+id = "sync"
+title = "立即同步 OpenCode session"
+contexts = ["workspace"]
+command = ["node", "src/board.mjs", "--mode", "action", "--action", "sync"]
+
+# 回收所有镜像行与镜像 pane（session 还在跑时，下次同步会重新建回来）。
+[[actions]]
+id = "reap"
+title = "清理 OpenCode session 镜像行"
+contexts = ["workspace"]
+command = ["node", "src/board.mjs", "--mode", "action", "--action", "reap"]
+
+# 常驻管理器以独立标签页形式存在，不抢用户焦点、不遮挡正在看的 pane。
+[[panes]]
+id = "board"
+title = "OpenCode Sessions"
+placement = "tab"
+command = ["node", "src/board.mjs", "--mode", "pane"]
+
+[[keys.command]]
+key = "prefix+shift+o"
+type = "plugin_action"
+command = "opencode.session-mirror.board"
+description = "打开 OpenCode session 镜像看板"

@@ -21,6 +21,7 @@ export const CONFIG_DEFAULTS = Object.freeze({
   IDLE_GRACE_MS: "15000",
   // --- SPEC 第 7 节之外、为可运行性补的项（README 有完整表格）---
   AGENT_VIEW_SCOPE: "mirror", // mirror | sort-only
+  MIRROR_TAB_LABEL: "oc-sessions",
   RESUME_MODE: "opencode", // opencode | mirror
   MIRROR_PANE_RATIO: "0.5",
   MIRROR_PANE_DIRECTION: "down",
@@ -217,7 +218,20 @@ export function isValidSessionId(id) {
 // 状态持久化
 // ---------------------------------------------------------------------------
 
-export const STATE_VERSION = 1;
+export const STATE_VERSION = 2;
+
+/**
+ * 兜底用的 central 工作区（只有「某个目录在 Herdr 里找不到对应工作区」时才建）。
+ * 除它之外，每个目录都在**自己的工作区**里拥有一个镜像标签页（SPEC 6.6）。
+ */
+export function emptyCentral() {
+  return { workspaceId: "", tabId: "", anchorPaneId: "", label: "" };
+}
+
+/** 一个目录对应的镜像标签页记录。fallback=true 表示用的是 central 兜底工作区。 */
+export function emptyMirrorEntry() {
+  return { workspaceId: "", tabId: "", anchorPaneId: "", fallback: false };
+}
 
 /** @returns {object} 一个空的、字段齐全的状态对象 */
 export function emptyState() {
@@ -225,8 +239,11 @@ export function emptyState() {
     version: STATE_VERSION,
     updatedAt: 0,
     lastSeq: 0,
-    anchor: { workspaceId: null, tabId: null, paneId: null, label: null },
-    server: { baseUrl: null, flavor: null, version: null, lastOkAt: 0 },
+    // 目录（绝对路径） → 该目录的镜像标签页
+    mirrors: {},
+    // 兜底工作区，MIRROR_LABEL 那个 Sessions 空间
+    central: emptyCentral(),
+    server: { baseUrl: "", flavor: "", version: "", lastOkAt: 0 },
     panes: {},
     agentView: null,
   };
@@ -238,12 +255,28 @@ export function normalizeState(raw) {
   if (!raw || typeof raw !== "object") return base;
   if (Number.isFinite(raw.lastSeq)) base.lastSeq = raw.lastSeq;
   if (Number.isFinite(raw.updatedAt)) base.updatedAt = raw.updatedAt;
-  if (raw.anchor && typeof raw.anchor === "object") {
-    base.anchor = {
-      workspaceId: str(raw.anchor.workspaceId),
-      tabId: str(raw.anchor.tabId),
-      paneId: str(raw.anchor.paneId),
-      label: str(raw.anchor.label),
+
+  // v1 只有单个全局 anchor（所有镜像都堆在一个 Sessions 工作区里）。
+  // v2 起按目录索引，所以 anchor 直接丢弃：残留的镜像 pane 会被孤儿回收扫掉。
+  if (raw.mirrors && typeof raw.mirrors === "object") {
+    for (const [dir, entry] of Object.entries(raw.mirrors)) {
+      if (!entry || typeof entry !== "object") continue;
+      const key = str(dir);
+      if (!key) continue;
+      base.mirrors[key] = {
+        workspaceId: str(entry.workspaceId),
+        tabId: str(entry.tabId),
+        anchorPaneId: str(entry.anchorPaneId),
+        fallback: entry.fallback === true,
+      };
+    }
+  }
+  if (raw.central && typeof raw.central === "object") {
+    base.central = {
+      workspaceId: str(raw.central.workspaceId),
+      tabId: str(raw.central.tabId),
+      anchorPaneId: str(raw.central.anchorPaneId),
+      label: str(raw.central.label),
     };
   }
   if (raw.server && typeof raw.server === "object") {

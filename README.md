@@ -37,10 +37,15 @@ board.mjs（常驻管理器，以插件面板形式存在）
 Herdr Agents 视图
 ```
 
-四个关键设计：
+五个关键设计：
 
 - **状态直接来自 opencode server 的运行态**，不是读屏幕识别。所以比官方集成更准，
   而且权限等待这种最有价值的信号能拿到。
+- **镜像行落在它自己目录对应的工作区里**。Agents 侧边栏的分组 token 只有 `workspace`，
+  没有「按目录分组」这个选项，所以镜像 pane 必须落在用户为这个目录开的工作区里，
+  那一行才会归到对应的 `[n] <项目名>` 分组下。见下面「行出现在哪」。
+- **每个目录在自己的工作区里独占一个标签页**放镜像（固定名 `oc-sessions`）。
+  这样绝不往你正在用的工作标签页里插 pane，多 pane 布局不会被挤压、不会抖。
 - **管理器是面板而不是后台进程**。`[[startup]]` 只是一次性初始化钩子，不是受监管的
   守护进程，所以常驻逻辑放在 `[[panes]]` 里。
 - **镜像 pane 里什么都不跑**，只保持前台进程存活（`setInterval` 保活）。这样官方集成
@@ -48,15 +53,41 @@ Herdr Agents 视图
 - **去重靠 session 身份**。每轮重算前读 Herdr 的 agent 列表，把已经被别的来源
   （主要是官方集成）上报过的 session id 收集起来，从候选集里剔除。
 
+### 行出现在哪
+
+侧边栏长这样：
+
+```
+[1] afloat
+  ├ opencode  Tray hover二级菜单点击收起无退场效果…   ← 官方行（TUI 当前选中的）
+  └ opencode  旧分支全屏辉光效果迁移至通知卡片和bar   ← 镜像行（同目录另一个在跑的）
+[2] ReimuMoePCB_DAPLink
+  └ opencode  使用 DAPLink 识别 H750                ← 官方行
+```
+
+具体做法：从 session 的 `directory` 反查 herdr 的 pane（`cwd` / `foreground_cwd` 严格相等，
+再不行就看这个目录是不是在某个 pane 的目录之下），找到对应的 `workspace_id`，
+然后在那个工作区里开一个专属标签页 `oc-sessions` 放这个目录的镜像。
+**绝不靠目录名猜** —— 同一个项目名可以出现在任意路径下，猜错就把镜像行归到别人的分组里了。
+
+一个工作区都匹配不上时（例如 session 在 `/tmp/...` 下而你没开过这个目录），
+才退回 central `Sessions` 工作区，日志里会写明「该目录没有对应的工作区，已归入 Sessions 兜底工作区」。
+
 ### 镜像 pane 怎么排布
 
-新 pane 切出来之后，插件会立刻**重平衡整棵镜像子树**：对每个 split 节点把比例设成
-「first 子树的叶子数 ÷ 子树总叶子数」，于是所有镜像 pane 精确均分空间。
+新 pane 切出来之后，插件会立刻**重平衡这个标签页里的整棵镜像子树**：对每个 split 节点
+把比例设成「first 子树的叶子数 ÷ 子树总叶子数」，于是所有镜像 pane 精确均分空间。
 
 用 `layout.set_split_ratio`（只改比例），**不用** `layout.apply` —— apply 会重建标签页、
 销毁所有活着的终端进程，把已有镜像 pane 全杀掉重启。
 
 镜像行再多也照建。窗口不够高时行会变矮、需要滚动，但插件不会因为「放不下」就拒绝建行。
+
+### 用完怎么收
+
+- 某个目录下的 session 全停了 → 那个 `oc-sessions` 标签页**整页自动关掉**。
+- 没有目录再用兜底了 → `Sessions` 兜底工作区也关掉（Herdr 本身也会回收空工作区）。
+- 想立刻全清：`reap` action。
 
 ### 上报为什么拆成两步
 
@@ -121,7 +152,8 @@ command = "opencode.session-mirror.board"
 | `OPENCODE_SERVER_URL` | 空 | 显式指定地址，如 `http://127.0.0.1:4096`。留空则自动探测 |
 | `OPENCODE_SERVER_USERNAME` | `opencode` | Basic Auth 用户名 |
 | `OPENCODE_SERVER_PASSWORD` | 空 | Basic Auth 密码 |
-| `MIRROR_LABEL` | `Sessions` | 镜像所在工作区/标签名 |
+| `MIRROR_LABEL` | `Sessions` | **兜底**工作区名，仅当某目录匹配不上任何工作区时才会建 |
+| `MIRROR_TAB_LABEL` | `oc-sessions` | 每个目录在自己工作区里那个镜像标签页的名字 |
 | `AUTO_START` | `false` | Herdr 恢复后自动拉起管理器 |
 | `INSTALL_AGENT_VIEW` | `false` | 是否安装全局 Agents 视图投影 |
 | `POLL_INTERVAL_MS` | `5000` | 轮询兜底间隔 |
@@ -277,15 +309,32 @@ token。如果你装了 `herdr-sidebar`，它的 `hs_title` 优先级更高 —�
 `POLL_INTERVAL_MS` 轮询，权限等待的判定精度会下降但不会完全瞎。行会一直存在，
 只是 `blocked` 可能晚几秒才亮。
 
-**`Sessions` 工作区不见了 / 镜像 pane 残留：**
+**`Sessions` 兜底工作区不见了 / 镜像标签页残留：**
 
 ```bash
 herdr plugin pane open --plugin opencode.session-mirror --entrypoint board
 herdr plugin action invoke opencode.session-mirror.reap
 ```
 
-`reap` 会先 release 再关掉所有镜像 pane，映射也会清干净。工作区本身留着无害，
-下次需要时会自动复用。
+`reap` 会先 release 再关掉所有镜像 pane，把每个目录的镜像标签页整页关掉，
+兜底工作区也关掉，映射清干净。session 还在跑的话，下一轮会重新建回来。
+
+**行出现在了 `Sessions` 分组里，而不是项目分组里：**
+
+说明那个 session 的目录在你的 herdr 里**没有对应的工作区**（你没在那个目录开过
+workspace/tab）。看板日志里会有一行：
+
+```
+/tmp/xxx/yyy 没有对应的工作区，已归入 Sessions 兜底工作区
+```
+
+解决办法：在那个目录下用 herdr 开一个 workspace（`herdr workspace create --cwd <目录>`），
+下一轮镜像就会自动挪进那个工作区，成为正确分组下的镜像行。
+
+**同一目录的镜像行顺序会变：**
+
+镜像标签页内部的排列由平衡 BSP 树决定，等分空间。哪个 session 先跑就先建哪个，
+顺序不保证稳定 —— 分组是对的就行。
 
 **Herdr 重启后行没了：**
 
@@ -301,9 +350,13 @@ herdr plugin action invoke opencode.session-mirror.reap
 
 ## 已知边界
 
-- **一个运行中 session 一行 = 一个镜像 pane**，有终端资源成本。集中在 `Sessions`
-  工作区里，不打开不占视野，但不是零成本。行数很多时每行会变矮、需要滚动 ——
+- **一个运行中 session 一行 = 一个镜像 pane**，有终端资源成本。镜像集中在各目录自己的
+  `oc-sessions` 标签页里，不打开不占视野，但不是零成本。行数很多时每行会变矮、需要滚动 ——
   插件不会因为放不下就拒绝建行。
+- **每个目录会在它的工作区里多出一个标签页**，叫 `oc-sessions`（前缀由 Herdr 加）。
+  关掉它不影响镜像行以外的任何东西；镜像重建时会自己再开一个。
+- **镜像标签页里会被 `herdr-sidebar` 注入一个 Sidebar pane**（它给每个标签页都注入）。
+  那个 pane 没有 agent 行，既不参与镜像的布局平衡，也不会挡住标签页回收。
 - **镜像行只读**。要交互得切回真实 TUI 手动换 session。
 - **状态准确性依赖 SSE**。断流时退化为轮询，`blocked` 精度下降。
 - **不碰官方集成文件**（`~/.config/opencode/plugins/herdr-agent-state.js` 等），

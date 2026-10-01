@@ -38,7 +38,10 @@ const config = {
   serverUrl: store.asString(raw, "OPENCODE_SERVER_URL", ""),
   username: store.asString(raw, "OPENCODE_SERVER_USERNAME", "opencode"),
   password: store.asString(raw, "OPENCODE_SERVER_PASSWORD", ""),
+  // MIRROR_LABEL 现在只用来命名「兜底」工作区：目录在 Herdr 里找不到对应工作区时用它。
   mirrorLabel: store.asString(raw, "MIRROR_LABEL", "Sessions"),
+  // 每个目录在自己的工作区里独占一个同名标签页放镜像 pane。
+  mirrorTabLabel: store.asString(raw, "MIRROR_TAB_LABEL", "oc-sessions"),
   autoStart: store.asBool(raw, "AUTO_START", false),
   installAgentView: store.asBool(raw, "INSTALL_AGENT_VIEW", false),
   agentViewScope: store.asEnum(raw, "AGENT_VIEW_SCOPE", ["mirror", "sort-only"], "mirror"),
@@ -126,6 +129,8 @@ const runtime = {
   timers: [],
   /** 一轮重算里已经重平衡过没有。回收一批行时不必每个都重算一次布局。 */
   balancedThisPass: false,
+  /** pane 全量列表的索引（目录 → workspace 解析、认领标签页、孤儿回收都要用），带 TTL 缓存。 */
+  paneIndex: null,
   shuttingDown: false,
 };
 
@@ -655,6 +660,15 @@ async function applySessionState({ client, roots, activeStates, polledPermission
   const claimed = await herdr.claimedSessionIds(agents);
 
   // --- 1. 回收 -----------------------------------------------------------
+  // 1a. 孤儿：state.json 丢过 / 崩过几轮时残留的镜像行。先扫一遍，避免它们
+  //     一直挂在侧边栏上，也避免它们被当成「这个目录还有镜像」而让标签页关不掉。
+  {
+    const index = await paneIndex();
+    await sweepOrphanPanes("重算");
+    pruneDeadCentral(index);
+  }
+
+  // 1b. 正常回收：不再活跃且过了宽限期的行 → release + 关 pane（标签页空了会整页关掉）
   for (const [sessionID, rec] of Object.entries(runtime.state.panes)) {
     const active = activeStates.has(sessionID) || pending.has(sessionID);
     if (active) {
@@ -806,12 +820,9 @@ async function applySessionState({ client, roots, activeStates, polledPermission
     "debug",
     `重算(${reason}): 根 ${roots.length} / 活跃 ${activeStates.size} / 待权限 ${pending.size} / ` +
       `让出 ${claimed.size} / 镜像行 ${Object.keys(runtime.state.panes).length} / ` +
+      `镜像标签页 ${Object.keys(runtime.state.mirrors || {}).length} / ` +
       `herdr 镜像行 ${herdr.countMirrorRows(agents)} / SSE ${runtime.sseUp ? "up" : "down"}`,
   );
-}
-
-function hasRow(sessionID) {
-  return Object.prototype.hasOwnProperty.call(runtime.state.panes, sessionID);
 }
 
 /** 是不是「连接层」错误 —— 只有这类才值得丢掉 client 重新发现。 */
@@ -857,102 +868,501 @@ function persistState() {
 // 镜像 pane 生命周期
 // ---------------------------------------------------------------------------
 
-/** 找到或重建承载所有镜像 pane 的工作区 + 锚点 pane。 */
-async function ensureAnchor() {
-  const anchor = runtime.state.anchor;
+// ---------------------------------------------------------------------------
+// 目录 → (workspace_id, tab_id)：镜像标签页模型
+//
+// **为什么必须按目录解析工作区**：Agents 侧边栏的分组 token 只有 `workspace`
+// （`ui.sidebar.agents.rows` 默认是 `["state_icon","machine","workspace","tab"]`），
+// 没有任何「按目录分组」的选项。所以镜像行必须落在「用户为这个目录开的那个工作区」
+// 里，那一行才会归到对应的 `[n] <项目名>` 分组下。
+//
+// 模型：
+//   state.mirrors[<绝对目录>] = { workspaceId, tabId, anchorPaneId, fallback }
+//   state.central              = { workspaceId, tabId, anchorPaneId, label }
+//
+// 每个目录在自己的工作区里**独占一个标签页**（固定名 `oc-sessions`）放它的镜像 pane。
+// 独占标签页的意义：绝不往用户正在用的工作标签页里插 pane，多 pane 布局不会被挤压。
+// 标签页内部再用平衡 BSP 树摆该目录的多个镜像 pane。
+// 一个目录都匹配不上工作区时，才退回 central 那个 `Sessions` 工作区。
+// ---------------------------------------------------------------------------
 
-  // 已记录的锚点还有效就直接用
-  if (anchor.paneId) {
-    const pane = await herdr.paneGet(anchor.paneId);
-    if (pane) return anchor.paneId;
-    log("debug", `锚点 pane ${anchor.paneId} 已失效，重新找`);
-    anchor.paneId = null;
-    anchor.tabId = null;
-    anchor.workspaceId = null;
-  }
-
-  // 按 label 找回上次建的工作区
-  if (anchor.workspaceId) {
-    const workspaces = await herdr.workspaceList();
-    const found = workspaces.find((w) => sameLabel(w.label, anchor.label));
-    if (found) {
-      const pane = await firstPane(found.workspace_id);
-      if (pane) {
-        anchor.workspaceId = found.workspace_id;
-        anchor.paneId = pane;
-        log("info", `复用已有镜像工作区 ${found.workspace_id}「${found.label}」`);
-        return pane;
-      }
-    }
-    log("info", `镜像工作区 ${anchor.workspaceId} 已不存在，重新创建`);
-  }
-
-  // state.json 丢失/损坏，或历史上崩过几次没清干净时，Herdr 里会留下一堆
-  // 我们不认识的镜像 pane（甚至多个同名工作区）。认领其中一个当锚点，
-  // 把其余所有「不在 state 映射里」的 pane 当孤儿回收，
-  // 否则 Agents 视图会一直挂着上一轮的行。
-  const known = new Set(Object.values(runtime.state.panes).map((r) => r.paneId).filter(Boolean));
-  let adopted = 0;
-  let orphanCount = 0;
-
-  for (const ws of await herdr.workspaceList()) {
-    if (!sameLabel(ws.label, config.mirrorLabel)) continue;
-
-    for (const pane of await herdr.paneList(ws.workspace_id)) {
-      const paneId = str(pane.pane_id);
-      if (!paneId || known.has(paneId)) continue;
-
-      if (!anchor.paneId) {
-        // 第一个可用 pane 当锚点
-        anchor.workspaceId = ws.workspace_id;
-        anchor.paneId = paneId;
-        anchor.label = config.mirrorLabel;
-        adopted += 1;
-        continue;
-      }
-
-      // 其余一律当孤儿：先 release 再关，保证 Agents 视图里不残行
-      await herdr.releaseAgent({ paneId, seq: nextSeq() });
-      const closed = await herdr.paneClose(paneId);
-      if (closed.ok) orphanCount += 1;
-      log(closed.ok ? "info" : "warn", `回收孤儿镜像 pane ${paneId}${closed.ok ? "" : `: ${closed.error}`}`);
+/** 目录归一：file:// URL → 路径、砍掉结尾斜杠、空白。空/非法一律返回 ""。 */
+export function normalizeDir(value) {
+  let dir = typeof value === "string" ? value.trim() : "";
+  if (!dir) return "";
+  if (dir.startsWith("file://")) {
+    try {
+      dir = fileURLToPath(dir);
+    } catch {
+      return "";
     }
   }
+  dir = dir.replace(/[\\/]+$/, "");
+  return dir || "/";
+}
 
-  if (adopted > 0) log("info", `认领镜像工作区 ${anchor.workspaceId}，锚点 ${anchor.paneId}`);
-  if (orphanCount > 0) log("info", `共回收 ${orphanCount} 个孤儿镜像 pane`);
-  if (anchor.paneId) return anchor.paneId;
+/** `base` 是否是 `dir` 的真祖先目录（按路径分段比，避免 /a/bc 命中 /a/b）。 */
+function isAncestorDir(base, dir) {
+  if (!base || !dir || base === dir) return false;
+  return dir.startsWith(base.endsWith("/") ? base : `${base}/`);
+}
+
+// --- pane 全量索引 ---------------------------------------------------------
+
+/**
+ * pane 列表索引，带 TTL 缓存。
+ *
+ * 三件事都要用：① 目录 → workspace 解析；② 认领「上次留下的镜像标签页」；
+ * ③ 孤儿回收。都不是每轮都必要的事，所以缓存 15 秒，别每 5 秒拉一次全量。
+ */
+const PANE_INDEX_TTL_MS = 15_000;
+
+async function paneIndex({ force = false } = {}) {
+  const cached = runtime.paneIndex;
+  if (!force && cached && Date.now() - cached.at < PANE_INDEX_TTL_MS) return cached;
+
+  const panes = await herdr.paneList();
+  const workspaces = await herdr.workspaceList();
+  const paneCount = new Map();
+  const tabPanes = new Map();
+
+  for (const pane of panes) {
+    const wsId = str(pane?.workspace_id);
+    paneCount.set(wsId, (paneCount.get(wsId) || 0) + 1);
+    const tabId = str(pane?.tab_id);
+    if (!tabId) continue;
+    if (!tabPanes.has(tabId)) tabPanes.set(tabId, []);
+    tabPanes.get(tabId).push(pane);
+  }
+  // workspace list 自带的 pane_count 可以补上 pane list 漏掉的部分
+  for (const ws of workspaces) {
+    const id = str(ws?.workspace_id);
+    if (!id) continue;
+    paneCount.set(id, Math.max(paneCount.get(id) || 0, Number(ws.pane_count) || 0));
+  }
+
+  runtime.paneIndex = { at: Date.now(), panes, paneCount, tabPanes };
+  return runtime.paneIndex;
+}
+
+function invalidatePaneIndex() {
+  if (runtime.paneIndex) runtime.paneIndex.at = 0;
+}
+
+// --- 目录 → workspace ------------------------------------------------------
+
+/**
+ * 目录 → workspace_id。
+ *
+ * **绝不拿 basename 猜**：同一个项目名可以出现在任意路径下，猜错就会把镜像行
+ * 归到别人的分组里。三级判定，命中哪一级都会写进日志：
+ *
+ *   1. `cwd` 严格等于该目录 —— 用户就是在这个目录里开的 opencode，绝大多数命中这一级。
+ *   2. `foreground_cwd` 严格等于该目录 —— pane 的实际前台进程在这个目录里。
+ *   3. 该目录在某个 pane 目录的**之下**（取最深的那个）—— 用户在项目子目录里
+ *      开了 session、而那个子目录自己没有 pane 时的兜底。
+ *
+ * 同一级命中多个工作区时，挑「在这个目录里 pane 最多的那个」（见 {@link pickWorkspace}）。
+ *
+ * @returns {{workspaceId:string, tier:string}|null}
+ */
+export function resolveWorkspaceForDirectory(directory, index) {
+  const dir = normalizeDir(directory);
+  if (!dir) return null;
+
+  for (const field of ["cwd", "foreground_cwd"]) {
+    const byWorkspace = new Map();
+    for (const pane of index.panes) {
+      if (normalizeDir(pane?.[field]) !== dir) continue;
+      const id = str(pane?.workspace_id);
+      byWorkspace.set(id, (byWorkspace.get(id) || 0) + 1);
+    }
+    if (byWorkspace.size > 0) return { workspaceId: pickWorkspace(index, byWorkspace), tier: field };
+  }
+
+  // tier 3：先取「最深的那个 pane 目录」，再在同深度里挑工作区
+  let deepestDepth = 0;
+  const byWorkspace = new Map();
+  for (const pane of index.panes) {
+    for (const field of ["cwd", "foreground_cwd"]) {
+      const base = normalizeDir(pane?.[field]);
+      if (!isAncestorDir(base, dir)) continue;
+      const depth = base.split("/").length;
+      if (depth > deepestDepth) {
+        deepestDepth = depth;
+        byWorkspace.clear();
+      }
+      if (depth !== deepestDepth) continue;
+      const id = str(pane?.workspace_id);
+      byWorkspace.set(id, (byWorkspace.get(id) || 0) + 1);
+    }
+  }
+  if (deepestDepth > 0) return { workspaceId: pickWorkspace(index, byWorkspace), tier: "祖先目录" };
+
+  return null;
+}
+
+/**
+ * 多个候选工作区里挑一个。
+ *
+ * **首选「在这个目录里 pane 最多的那个工作区」**，而不是「pane 总数最多的」。
+ * 实测差别很要命：`herdr` 这个目录同时命中 `[4] AI8051U_AM32_ESC`（只有 1 个 pane 在
+ * 这个目录，是个 sidebar）和 `[7] herdr`（4 个 pane 都在这个目录，用户真在这儿干活）。
+ * 按总数挑会选错分组，按匹配数挑才对 —— 「这个目录里 pane 多」才说明用户真的在这干活。
+ * 匹配数一样再比 pane 总数，最后按 id 保证结果稳定可复现。
+ */
+function pickWorkspace(index, matchCountByWorkspace) {
+  let bestId = "";
+  let bestMatch = -1;
+  let bestTotal = -1;
+  for (const [id, matches] of matchCountByWorkspace) {
+    if (!id) continue;
+    const total = index.paneCount.get(id) || 0;
+    const better =
+      matches > bestMatch ||
+      (matches === bestMatch && total > bestTotal) ||
+      (matches === bestMatch && total === bestTotal && id < bestId);
+    if (!better) continue;
+    bestId = id;
+    bestMatch = matches;
+    bestTotal = total;
+  }
+  return bestId || null;
+}
+
+// --- 镜像标签页 ------------------------------------------------------------
+
+/**
+ * 拿到（或创建）这个目录的镜像标签页。
+ *
+ * @param {string} directory session 的工作目录；空则直接用 central
+ * @returns {Promise<{workspaceId:string,tabId:string,anchorPaneId:string,fallback:boolean}|null>}
+ */
+async function ensureMirrorTab(directory) {
+  const dir = normalizeDir(directory);
+  const existing = dir ? runtime.state.mirrors[dir] : null;
+
+  // 1) 已有条目：确认标签页和锚点还在
+  if (existing) {
+    if (existing.fallback) {
+      const central = await ensureCentral(dir);
+      if (central) return central;
+    } else {
+      if (await mirrorEntryAlive(existing)) return existing;
+      log("info", `${dir} 的镜像标签页 ${existing.tabId || "?"} 已消失，重新创建`);
+      delete runtime.state.mirrors[dir];
+    }
+  }
+
+  // 2) 目录 → workspace。force 刷新：新建标签页会改 pane 列表，缓存不能信。
+  const index = await paneIndex({ force: true });
+  const hit = dir ? resolveWorkspaceForDirectory(dir, index) : null;
+
+  if (hit?.workspaceId) {
+    const adopted = await adoptMirrorTab(index, hit.workspaceId);
+    if (adopted) {
+      runtime.state.mirrors[dir] = adopted;
+      log(
+        "info",
+        `${dir} → 工作区 ${hit.workspaceId}（${hit.tier} 命中），复用镜像标签页 ${adopted.tabId || "?"}`,
+      );
+      return adopted;
+    }
+    const created = await createMirrorTab(hit.workspaceId, dir);
+    if (created) {
+      runtime.state.mirrors[dir] = created;
+      log(
+        "info",
+        `${dir} → 工作区 ${hit.workspaceId}（${hit.tier} 命中），新建镜像标签页 ${created.tabId}`,
+      );
+      return created;
+    }
+    log("warn", `${dir} 已命中工作区 ${hit.workspaceId}，但镜像标签页建不出来，改归入 central`);
+  } else if (dir) {
+    // 用户没在这个目录开过 Herdr 工作区（比如 session 在 /tmp 下）——只有这一种情况
+    // 才退回 central，日志里说清楚，避免用户以为「分组怎么跑到 Sessions 去了」。
+    log("info", `${dir} 没有对应的工作区，已归入 ${config.mirrorLabel} 兜底工作区`);
+  }
+
+  // 3) 兜底
+  if (dir) runtime.state.mirrors[dir] = { ...store.emptyMirrorEntry(), fallback: true };
+  return await ensureCentral(dir);
+}
+
+async function mirrorEntryAlive(entry) {
+  const anchorPane = str(entry?.anchorPaneId);
+  if (!anchorPane) return false;
+  const pane = await herdr.paneGet(anchorPane);
+  if (!pane) return false;
+  return str(pane.tab_id) === str(entry.tabId);
+}
+
+/**
+ * 认领这个工作区里已经存在的镜像标签页。
+ *
+ * 优先「里面还有我们跟踪的镜像 pane」——最可靠，而且完全不看 label；
+ * 其次才按 label 认（state.json 丢了、标签页还在的情况）。用户的工作区标签
+ * 会被 sidebar 插件改写成 `[3] oc-sessions › xxx`，所以比对前要先归一化。
+ */
+async function adoptMirrorTab(index, workspaceId) {
+  const tracked = trackedMirrorPaneIds();
+  const candidates = [];
+
+  for (const tab of await herdr.tabList(workspaceId)) {
+    const tabId = str(tab?.tab_id);
+    if (!tabId) continue;
+    const panes = index.tabPanes.get(tabId) || [];
+    const trackedHere = panes.filter((p) => tracked.has(str(p?.pane_id)));
+    const labelHit = sameTabLabel(tab?.label, config.mirrorTabLabel);
+    if (trackedHere.length === 0 && !labelHit) continue;
+    // 分数：2 = 里面有我们跟踪的镜像 pane（一定是我们自己的标签页）
+    //      1 = 只有 label 对得上（可能是上一轮留下的空标签页）
+    candidates.push({ tabId, panes, trackedHere, score: trackedHere.length > 0 ? 2 : 1 });
+  }
+  if (candidates.length === 0) return null;
+
+  candidates.sort((a, b) => b.score - a.score || a.tabId.localeCompare(b.tabId));
+  const chosen = candidates[0];
+
+  return {
+    workspaceId,
+    tabId: chosen.tabId,
+    anchorPaneId: pickAdoptionAnchor(chosen.panes, chosen.trackedHere),
+    fallback: false,
+  };
+}
+
+/**
+ * 认领标签页时挑锚点 pane。
+ *
+ * **不能随便拿「第一个 pane」** —— pane 列表的顺序不保证是布局顺序，而 sidebar 插件
+ * 会给自己的每个标签页注入一个 `label: "Sidebar"` 的 pane。抢它当锚点的话，
+ * 之后 split 出来的镜像 pane 会跑到侧边栏那一列下面去（实测 w1J:t4 就是这样：
+ * 镜像 pane 被塞到了 Sidebar 底下，锚点却占着整列）。
+ *
+ * 优先级：① 自己留的锚点 shell（没 label、没有别人的 agent 行）；
+ * ② 跟踪中的镜像 pane；③ 实在挑不出来就用列表第一个。
+ */
+function pickAdoptionAnchor(panes, trackedHere = []) {
+  const list = Array.isArray(panes) ? panes : [];
+  const plain = list.filter((p) => !p?.label && !isForeignAgentPane(p) && !herdr.isMirrorPane(p));
+  const tracked = list.filter((p) => trackedHere.includes(p));
+  return str((plain[0] || tracked[0] || list[0])?.pane_id);
+}
+
+/** 在目标工作区里开一个专属镜像标签页。 */
+async function createMirrorTab(workspaceId, directory) {
+  const created = await herdr.tabCreate({
+    workspaceId,
+    label: config.mirrorTabLabel,
+    cwd: directory || undefined,
+  });
+  const tabId = str(created?.tab?.tab_id);
+  const paneId = str(created?.root_pane?.pane_id);
+  if (!tabId || !paneId) {
+    log("warn", `工作区 ${workspaceId} 里 tab create 没返回 tab/root_pane`);
+    return null;
+  }
+  invalidatePaneIndex();
+  return { workspaceId, tabId, anchorPaneId: paneId, fallback: false };
+}
+
+/**
+ * 兜底的 central 工作区（`MIRROR_LABEL`，默认 `Sessions`）。
+ * 只有「有目录匹配不上工作区」时才会被建起来，所以它平时根本不存在。
+ */
+async function ensureCentral(directory) {
+  const central = runtime.state.central;
+
+  if (central.workspaceId && (await mirrorEntryAlive(central))) {
+    return { ...central, fallback: true };
+  }
+
+  // 1) 记录里的工作区还在（标签页被回收了 / 是上一轮留下的）→ 就在它里面建一个镜像标签页
+  // 2) 按 label 找回上次的 central 工作区（Herdr 可能给 workspace label 加 `[n] ` 前缀）
+  //    两条路都失败才新建工作区，不然连着回收几次就会冒出一堆同名的 `Sessions`。
+  const workspaces = await herdr.workspaceList();
+  const known = workspaces.filter((w) => str(w?.workspace_id) === str(central.workspaceId));
+  const byLabel = workspaces.filter((w) => sameLabel(w.label, central.label || config.mirrorLabel));
+  const reusable = [...known, ...byLabel.filter((w) => !known.includes(w))];
+
+  for (const ws of reusable) {
+    const wsId = str(ws.workspace_id);
+    if (!wsId) continue;
+    const index = await paneIndex({ force: true });
+    const adopted = await adoptMirrorTab(index, wsId);
+    const entry = adopted || (await createMirrorTab(wsId, directory));
+    if (!entry) continue;
+
+    runtime.state.central = {
+      workspaceId: entry.workspaceId,
+      tabId: entry.tabId,
+      anchorPaneId: entry.anchorPaneId,
+      label: config.mirrorLabel,
+    };
+    log(
+      "info",
+      `复用 ${config.mirrorLabel} 工作区 ${wsId}，` +
+        `${adopted ? "认领" : "新建"}镜像标签页 ${entry.tabId}`,
+    );
+    return { ...runtime.state.central, fallback: true };
+  }
+
+  if (central.workspaceId) {
+    log("info", `${config.mirrorLabel} 兜底工作区 ${central.workspaceId} 已失效，重新创建`);
+  }
 
   const created = await herdr.workspaceCreate({
     label: config.mirrorLabel,
-    cwd: runtime.state.panes && firstDirectory(runtime.state) ? firstDirectory(runtime.state) : undefined,
+    cwd: directory || undefined,
   });
-  const workspaceId = str(created?.workspace?.workspace_id);
   const paneId = str(created?.root_pane?.pane_id);
-  if (!paneId) {
-    throw new Error(`workspace create 没返回 root_pane（herdr 输出异常）`);
-  }
+  if (!paneId) throw new Error("workspace create 没返回 root_pane（herdr 输出异常）");
 
-  anchor.workspaceId = workspaceId || null;
-  anchor.tabId = str(created?.tab?.tab_id) || null;
-  anchor.paneId = paneId;
-  anchor.label = config.mirrorLabel;
-  log("info", `已创建镜像工作区 ${workspaceId || "?"}「${config.mirrorLabel}」，锚点 ${paneId}`);
-  return paneId;
+  const tabId = str(created?.tab?.tab_id);
+  // workspace create 自带的标签页就是我们的镜像标签页，统一改个名字方便认领
+  if (tabId) await herdr.tabRename(tabId, config.mirrorTabLabel);
+
+  runtime.state.central = {
+    workspaceId: str(created?.workspace?.workspace_id),
+    tabId,
+    anchorPaneId: paneId,
+    label: config.mirrorLabel,
+  };
+  invalidatePaneIndex();
+  log(
+    "info",
+    `已创建 ${config.mirrorLabel} 兜底工作区 ${runtime.state.central.workspaceId || "?"}` +
+      `，镜像标签页 ${tabId || "?"}，锚点 ${paneId}`,
+  );
+  return { ...runtime.state.central, fallback: true };
 }
 
-function firstDirectory(state) {
-  for (const rec of Object.values(state.panes || {})) {
-    if (rec && rec.directory) return rec.directory;
+/** 找 state.mirrors 里记着这个标签页的目录（central 另有 state.central）。 */
+function findMirrorEntryByTab(tabId) {
+  for (const [dir, entry] of Object.entries(runtime.state.mirrors || {})) {
+    if (entry && str(entry.tabId) === str(tabId) && tabId) return { dir, entry };
   }
-  return "";
-}
-
-/** 找一个工作区里可以拿来 split 的 pane。 */
-async function firstPane(workspaceId) {
-  const panes = await herdr.paneList(workspaceId);
-  if (panes.length > 0) return str(panes[0].pane_id);
   return null;
+}
+
+/** 我们跟踪着的全部镜像 pane id（不含锚点 shell）。 */
+function trackedMirrorPaneIds() {
+  const out = new Set();
+  for (const rec of Object.values(runtime.state.panes || {})) {
+    if (rec && str(rec.paneId)) out.add(str(rec.paneId));
+  }
+  return out;
+}
+
+/**
+ * 这个 pane 上有没有**别的来源**（官方集成、user、custom…）上报的 agent 行。
+ *
+ * 两条硬安全阀都用它：① 镜像标签页里有别人的 agent 行就不许关；
+ * ② 重平衡时不许把别人的 pane 当成自己的（否则会去动 sidebar 那一列的比例）。
+ */
+function isForeignAgentPane(pane) {
+  const source = pane?.agent_session?.source;
+  return typeof source === "string" && source.length > 0 && source !== herdr.ownSource();
+}
+
+/**
+ * 这个标签页里已经没有镜像 pane 了 → 连标签页一起收掉。
+ *
+ * 回收完最后一个镜像 pane 之后标签页只剩一个锚点 shell，不关掉就会留下一个空标签。
+ * 硬安全阀：标签页里还有**别的 source 上报的 agent 行**时绝不关 —— 那种情况下
+ * 它已经不是「纯镜像标签页」了，可能是用户自己用上了这个标签页。
+ * sidebar 插件注入的 Sidebar pane 没有 agent 行，不会触发这个保护。
+ */
+async function maybeCloseMirrorTab(home, reason) {
+  const tabId = str(home?.tabId);
+  const workspaceId = str(home?.workspaceId);
+  if (!tabId) return false;
+
+  const tracked = trackedMirrorPaneIds();
+  const inTab = (await herdr.paneList(workspaceId)).filter((p) => str(p?.tab_id) === tabId);
+  const live = inTab.filter(
+    (p) => tracked.has(str(p?.pane_id)) || herdr.isMirrorPane(p),
+  );
+  if (live.length > 0) return false;
+
+  const foreign = inTab.filter((p) => isForeignAgentPane(p));
+  if (foreign.length > 0) {
+    log("warn", `标签页 ${tabId} 里还有 ${foreign.length} 个非镜像 agent 行，保留标签页不关`);
+    return false;
+  }
+
+  const closed = await herdr.tabClose(tabId);
+  if (!closed.ok) {
+    log("warn", `关闭镜像标签页 ${tabId} 失败，保留映射下轮重试: ${closed.error}`);
+    return false;
+  }
+
+  // central 的记录里 tabId 是空的（fallback 目录只存标记，真实 id 在 state.central），
+  // 所以 central 那条路径要把所有 fallback 目录的记录一起清掉。
+  const wasCentral = str(runtime.state.central.tabId) === tabId;
+  if (wasCentral) {
+    for (const [dir, entry] of Object.entries(runtime.state.mirrors || {})) {
+      if (entry?.fallback) delete runtime.state.mirrors[dir];
+    }
+  } else {
+    const found = findMirrorEntryByTab(tabId);
+    if (found) delete runtime.state.mirrors[found.dir];
+  }
+  invalidatePaneIndex();
+  log("info", `镜像标签页 ${tabId} 已无镜像 pane，整页关闭（${reason}）`);
+
+  // 注意顺序：先判要不要关 central 工作区，再由它自己决定怎么清记录
+  if (wasCentral) await maybeCloseCentral(reason);
+  return true;
+}
+
+/**
+ * 没有任何目录再用 central 兜底工作区 → 关掉它。
+ *
+ * 关不掉（比如里面还有别人的 agent 行）就只忘掉这个标签页，工作区留着下次复用 ——
+ * 反正 ensureCentral 会在同一个工作区里重新开镜像标签页，不会多出同名工作区。
+ */
+async function maybeCloseCentral(reason) {
+  const central = runtime.state.central;
+  if (!central.workspaceId) return false;
+  const inUse = Object.values(runtime.state.mirrors || {}).some((m) => m && m.fallback);
+  if (inUse) return false;
+
+  if (await closeCentralWorkspace(reason)) {
+    runtime.state.central = store.emptyCentral();
+    return true;
+  }
+  runtime.state.central = { ...central, tabId: "", anchorPaneId: "" };
+  return false;
+}
+
+/** 关掉 central 兜底工作区。里面还有别人的 agent 行时不关。 */
+async function closeCentralWorkspace(reason) {
+  const central = runtime.state.central;
+  const workspaceId = str(central?.workspaceId);
+  if (!workspaceId) return true;
+
+  if (central.tabId) await herdr.tabClose(central.tabId);
+
+  const panes = await herdr.paneList(workspaceId);
+  const foreign = panes.filter((p) => isForeignAgentPane(p));
+  if (foreign.length > 0) {
+    log("warn", `${config.mirrorLabel} 兜底工作区 ${workspaceId} 里还有 ${foreign.length} 个非镜像 agent，保留`);
+    return false;
+  }
+
+  const closed = await herdr.workspaceClose(workspaceId);
+  if (closed.ok) {
+    log("info", `${config.mirrorLabel} 兜底工作区 ${workspaceId} 已无目录使用，关闭（${reason}）`);
+  } else if (/not_found/.test(String(closed.error || ""))) {
+    // 标签页关掉之后 herdr 会自己把空工作区收走 —— 这正是我们想要的，记一条 info 就行
+    log("info", `${config.mirrorLabel} 兜底工作区 ${workspaceId} 已被 herdr 自动回收`);
+  } else {
+    log("warn", `关闭 ${config.mirrorLabel} 兜底工作区失败: ${closed.error}`);
+  }
+  invalidatePaneIndex();
+  return Boolean(closed.ok) || /not_found/.test(String(closed.error || ""));
 }
 
 /** herdr 会给 workspace label 加 `[n] ` 前缀，比对时要剥掉。 */
@@ -962,25 +1372,87 @@ function sameLabel(a, b) {
 }
 
 /**
- * 给一个 session 建镜像 pane：split → **重平衡** → 校验可见行 → 启动驻留进程。
+ * 标签页 label 的归一化比对。
+ * sidebar 插件会把标签页改写成 `[3] oc-sessions` 甚至 `[3] oc-sessions › xxx`，
+ * 所以先剥编号前缀、再只取 `›` 之前的部分。
+ */
+function sameTabLabel(a, b) {
+  const norm = (v) =>
+    String(v || "")
+      .replace(/^\[\d+\]\s*/, "")
+      .split(/\s*›\s*/)[0]
+      .trim();
+  return Boolean(a) && norm(a) === norm(b);
+}
+
+/**
+ * 造孤儿回收：把「带 oc_mirror token、但不在我们映射里」的 pane 全部 release + 关掉。
+ *
+ * state.json 丢失或崩过几轮时，Herdr 里会留下一堆上一轮的行，而且没有任何映射能认领
+ * 它们。靠 token 认最可靠 —— 标签页名可能被用户改，pane id 一定认不错。
+ */
+async function sweepOrphanPanes(reason, { force = false } = {}) {
+  const index = await paneIndex({ force });
+  const tracked = trackedMirrorPaneIds();
+  let closedCount = 0;
+
+  for (const pane of index.panes) {
+    const paneId = str(pane?.pane_id);
+    if (!paneId || tracked.has(paneId) || !herdr.isMirrorPane(pane)) continue;
+
+    await herdr.releaseAgent({ paneId, seq: nextSeq() });
+    const closed = await herdr.paneClose(paneId);
+    if (closed.ok) {
+      closedCount += 1;
+      log("info", `回收孤儿镜像 pane ${paneId}（${reason}）`);
+    } else {
+      log("warn", `回收孤儿镜像 pane ${paneId} 失败: ${closed.error}`);
+    }
+  }
+
+  if (closedCount > 0) invalidatePaneIndex();
+  return closedCount;
+}
+
+/**
+ * 清掉「central 兜底工作区已经没了」的记录。
+ *
+ * 需要这一步是因为 herdr 会**自动回收空工作区**：标签页关掉之后工作区自己就没了，
+ * 而我们的记录里还留着那个 workspace_id。不清掉的话，下次走 fallback 会先拿着一个
+ * 已消失的 id 去认领，白跑一趟（在 ensureCentral 里虽然会兜住，但记录本身是错的）。
+ */
+function pruneDeadCentral(index) {
+  const central = runtime.state.central;
+  if (!central.workspaceId || central.tabId) return;
+  const inUse = Object.values(runtime.state.mirrors || {}).some((m) => m && m.fallback);
+  if (inUse) return;
+  const alive = index.panes.some((p) => str(p?.workspace_id) === str(central.workspaceId));
+  if (!alive) {
+    log("info", `${config.mirrorLabel} 兜底工作区 ${central.workspaceId} 已不存在，清掉记录`);
+    runtime.state.central = store.emptyCentral();
+  }
+}
+
+/**
+ * 给一个 session 建镜像 pane：确认/新建它的镜像标签页 → split → **重平衡** → 校验可见行 → 启驻留。
  *
  * 关键设计（替代旧的「锚点越来越小 + 高度守卫」）：
- * `pane split` 之后立刻把整棵镜像子树的比例重算一遍，让所有镜像 pane 均分空间。
- * 旧策略是反复用小 ratio 拆同一个锚点，锚点自己被逐次压缩，预算很快耗尽 ——
+ * `pane split` 之后立刻把**这个标签页**里镜像子树的比例重算一遍，让所有镜像 pane
+ * 均分空间。旧策略是反复用小 ratio 拆同一个锚点，锚点自己被逐次压缩，预算很快耗尽 ——
  * 那不是 herdr 的限制，是切分策略错了。实测 44 行 area 下平衡 8 叶完全放得下。
  *
  * session id / 标题 / 目录全部通过 `pane split --env` 传，不进 shell 文本，
  * 所以不存在把用户数据拼进命令行的注入面。
  */
 async function createMirrorPane(info) {
-  let anchorPane;
+  let entry;
   try {
-    anchorPane = await ensureAnchor();
+    entry = await ensureMirrorTab(info.directory);
   } catch (err) {
-    log("warn", `准备镜像工作区失败：${err?.message || err}`);
+    log("warn", `准备镜像标签页失败：${err?.message || err}`);
     return null;
   }
-  if (!anchorPane) return null;
+  if (!entry || !entry.anchorPaneId) return null;
 
   const cwd = info.directory || undefined;
   const env = {
@@ -997,7 +1469,7 @@ async function createMirrorPane(info) {
   let pane = null;
   try {
     pane = await herdr.paneSplit({
-      paneId: anchorPane,
+      paneId: entry.anchorPaneId,
       direction: config.paneDirection,
       ratio: config.paneRatio,
       cwd,
@@ -1014,8 +1486,8 @@ async function createMirrorPane(info) {
   }
 
   // 先重平衡再启驻留：新 pane 拿到 0 行时 shell 照样跑得起来，但没必要让它从 0 行开始。
-  await rebalanceMirrorTree(`新建 ${shortId(info.id)}`, [paneId]);
-  await ensurePaneVisible(paneId, `新建 ${shortId(info.id)}`);
+  await rebalanceMirrorTab(entry, `新建 ${shortId(info.id)}`, [paneId]);
+  await ensurePaneVisible(entry, paneId, `新建 ${shortId(info.id)}`);
 
   await startMirrorResident(paneId);
   return paneId;
@@ -1115,43 +1587,55 @@ export function balanceSplitPlans(root, ownPaneIds) {
   return plans;
 }
 
-/** 我们自己占着的 pane：锚点 + state 里全部镜像 pane + 带 oc_mirror token 的残留。 */
-async function ourPaneIds(extra = []) {
+/**
+ * 这个标签页里我们自己占着的 pane：锚点 + 跟踪中的镜像 pane + 带 oc_mirror token 的残留。
+ *
+ * 只统计这个标签页的 pane —— 每个目录有自己的标签页，别的目录的镜像不参与这里的平衡。
+ * token 兜底是必需的：state.json 丢了 / 崩过几轮时，靠映射认不回来的镜像 pane
+ * 会被当成「外来 pane」，整棵镜像子树就永远得不到平衡。
+ */
+async function ourPaneIdsInTab(entry, extra = []) {
   const out = new Set();
-  const anchor = str(runtime.state.anchor?.paneId);
-  if (anchor) out.add(anchor);
-  for (const rec of Object.values(runtime.state.panes)) {
-    if (rec && str(rec.paneId)) out.add(str(rec.paneId));
-  }
   for (const id of extra) if (id) out.add(id);
 
-  // state.json 丢了 / 崩过几轮时，靠 token 把还活着的镜像 pane 认回来，
-  // 否则它们会被当成「外来 pane」，整棵镜像子树就永远不会被重平衡。
-  const wsId = str(runtime.state.anchor?.workspaceId);
-  if (wsId) {
-    for (const pane of await herdr.paneList(wsId)) {
-      const id = str(pane?.pane_id);
-      if (id && pane?.tokens?.[herdr.MIRROR_TOKEN] === "1") out.add(id);
-    }
+  const workspaceId = str(entry?.workspaceId);
+  const tabId = str(entry?.tabId);
+  if (!workspaceId || !tabId) {
+    const anchor = str(entry?.anchorPaneId);
+    if (anchor) out.add(anchor);
+    return out;
+  }
+
+  const tracked = trackedMirrorPaneIds();
+  const anchor = str(entry?.anchorPaneId);
+  for (const pane of await herdr.paneList(workspaceId)) {
+    if (str(pane?.tab_id) !== tabId) continue;
+    const id = str(pane?.pane_id);
+    if (!id) continue;
+    // 别人的 agent 行一律不碰：认领路径万一抢到了 sidebar 的 pane，
+    // 也不能因此去动 sidebar 那一列的比例
+    if (isForeignAgentPane(pane)) continue;
+    if (id === anchor || tracked.has(id) || herdr.isMirrorPane(pane)) out.add(id);
   }
   return out;
 }
 
 /**
- * 重平衡镜像布局。
+ * 重平衡**某个镜像标签页**里的镜像布局。
  *
  * 用 `layout.set_split_ratio` 而不是 `layout.apply` —— 官方文档明说 apply
  * 会重建 tab、不保留 live PTY / scrollback / 进程，把已有镜像 pane 全杀掉重启。
  *
+ * @param {{workspaceId:string,tabId:string,anchorPaneId:string}} entry 这个目录的镜像标签页
  * @returns {Promise<number>} 实际调整的节点数
  */
-async function rebalanceMirrorTree(reason, extraPaneIds = []) {
-  const anchorPane = str(runtime.state.anchor?.paneId);
-  if (!anchorPane) return 0;
+async function rebalanceMirrorTab(entry, reason, extraPaneIds = []) {
+  const tabId = str(entry?.tabId);
+  const anchorPane = str(entry?.anchorPaneId);
+  if (!tabId || !anchorPane) return 0;
 
-  const pane = await herdr.paneGet(anchorPane);
-  const tabId = str(pane?.tab_id) || str(runtime.state.anchor?.tabId);
-  if (!tabId) return 0;
+  // 锚点已经不在了（用户把它关了）→ 这次没什么可平衡的，等下次重建标签页
+  if (!(await herdr.paneGet(anchorPane))) return 0;
 
   let layout = null;
   try {
@@ -1162,7 +1646,7 @@ async function rebalanceMirrorTree(reason, extraPaneIds = []) {
   }
   if (!layout?.root) return 0;
 
-  const plans = balanceSplitPlans(layout.root, await ourPaneIds(extraPaneIds));
+  const plans = balanceSplitPlans(layout.root, await ourPaneIdsInTab(entry, extraPaneIds));
   if (plans.length === 0) return 0;
 
   let applied = 0;
@@ -1171,7 +1655,7 @@ async function rebalanceMirrorTree(reason, extraPaneIds = []) {
     if (res.ok) applied += 1;
     else log("debug", `set_split_ratio([${plan.path}]) 失败：${res.error}`);
   }
-  if (applied > 0) log("debug", `重平衡镜像布局 ${applied} 个节点（${reason}）`);
+  if (applied > 0) log("debug", `重平衡镜像布局 ${tabId} ${applied} 个节点（${reason}）`);
   return applied;
 }
 
@@ -1186,18 +1670,18 @@ async function rebalanceMirrorTree(reason, extraPaneIds = []) {
  *
  * @returns {Promise<number|null>} 实际行数；herdr 没给就返回 null
  */
-async function ensurePaneVisible(paneId, reason) {
+async function ensurePaneVisible(entry, paneId, reason) {
   let rows = await herdr.paneViewportRows(paneId);
   if (rows === null || rows > 0) return rows;
 
-  await rebalanceMirrorTree(`${reason}: 首轮 0 行`, [paneId]);
+  await rebalanceMirrorTab(entry, `${reason}: 首轮 0 行`, [paneId]);
   rows = await herdr.paneViewportRows(paneId);
   if (rows === null || rows > 0) return rows;
 
   log(
     "warn",
     `镜像 pane ${paneId} 重平衡后仍拿不到可视行（${rows}）。这一行照样保留，下一轮会再平衡一次。` +
-      `若反复出现，多半是 ${config.mirrorLabel} 工作区所在标签页被缩得太矮。`,
+      `若反复出现，多半是镜像标签页 ${str(entry?.tabId) || "?"} 被缩得太矮。`,
   );
   return rows;
 }
@@ -1219,6 +1703,11 @@ async function teardownMirror(sessionID, rec, reason) {
     return;
   }
 
+  // 关之前先记住它属于哪个工作区/标签页：这个标签页可能这一轮就被清空了，
+  // 得连标签页一起回收，否则用户的工作区里会留一个只剩锚点 shell 的空标签。
+  const pane = await herdr.paneGet(rec.paneId);
+  const home = { workspaceId: str(pane?.workspace_id), tabId: str(pane?.tab_id) };
+
   const released = await herdr.releaseAgent({ paneId: rec.paneId, seq: nextSeq() });
   if (!released.ok) log("debug", `release-agent 失败: ${released.error}`);
 
@@ -1230,20 +1719,67 @@ async function teardownMirror(sessionID, rec, reason) {
 
   delete runtime.state.panes[sessionID];
   await store.removeFile(path.join(STATE_DIR, `mirror-${sessionID}.json`));
+  invalidatePaneIndex();
+
   // 少了一个叶子，剩下的 pane 要重新均分，不然锚点会把空出来的空间全吃掉。
   // 一轮里可能连续回收好几行，只重平衡一次就够。
+  const entry = mirrorEntryForTab(home.tabId) || {
+    workspaceId: home.workspaceId,
+    tabId: home.tabId,
+    anchorPaneId: "",
+  };
   if (!runtime.balancedThisPass) {
     runtime.balancedThisPass = true;
-    await rebalanceMirrorTree(`回收 ${shortId(sessionID)}`);
+    await rebalanceMirrorTab(entry, `回收 ${shortId(sessionID)}`);
   }
+
+  // 标签页里已经没有镜像 pane 了 → 整页关掉（这个目录的镜像到此结束）
+  await maybeCloseMirrorTab(home, `回收 ${shortId(sessionID)}`);
   log("info", `回收镜像行 ${shortId(sessionID)}（${reason}）`);
+}
+
+/** 按标签页找出它的镜像记录（fallback 目录走 state.central）。 */
+function mirrorEntryForTab(tabId) {
+  if (!tabId) return null;
+  if (str(runtime.state.central.tabId) === str(tabId)) {
+    return { ...runtime.state.central, fallback: true };
+  }
+  const found = findMirrorEntryByTab(tabId);
+  return found ? found.entry : null;
 }
 
 /** 全部回收（reap action 用）。 */
 async function reapAll(reason) {
   for (const [sessionID, rec] of Object.entries(runtime.state.panes)) {
-    await teardownMirror(sessionID, rec, reason);
+    if (!rec.paneId) {
+      delete runtime.state.panes[sessionID];
+      continue;
+    }
+    await herdr.releaseAgent({ paneId: rec.paneId, seq: nextSeq() });
+    const closed = await herdr.paneClose(rec.paneId);
+    if (!closed.ok) log("warn", `关闭镜像 pane ${rec.paneId} 失败: ${closed.error}`);
+    delete runtime.state.panes[sessionID];
+    await store.removeFile(path.join(STATE_DIR, `mirror-${sessionID}.json`));
   }
+  invalidatePaneIndex();
+
+  // 每个目录的镜像标签页整个关掉（fallback 目录共用 central 那一个）
+  const tabIds = new Set();
+  for (const entry of Object.values(runtime.state.mirrors || {})) {
+    if (str(entry?.tabId)) tabIds.add(str(entry.tabId));
+  }
+  if (str(runtime.state.central.tabId)) tabIds.add(str(runtime.state.central.tabId));
+  for (const tabId of tabIds) {
+    const closed = await herdr.tabClose(tabId);
+    if (!closed.ok) log("warn", `关闭镜像标签页 ${tabId} 失败: ${closed.error}`);
+  }
+
+  // 映射之外的残留镜像 pane 也要收（state.json 丢过、崩过几轮的情况）
+  await sweepOrphanPanes(reason, { force: true });
+
+  await closeCentralWorkspace(reason);
+  runtime.state.mirrors = {};
+  runtime.state.central = store.emptyCentral();
   // 映射之外的孤儿快照也一起清掉（比如上一轮崩溃或手工删过 state.json）
   let orphans = 0;
   try {
@@ -1256,7 +1792,6 @@ async function reapAll(reason) {
     /* state 目录还不存在，无所谓 */
   }
   if (orphans > 0) log("info", `清理了 ${orphans} 个残留的镜像显示快照`);
-  await rebalanceMirrorTree("reap");
   // reap 之后镜像行必然为 0，交给 reconcileAgentView 决定是降级成只排序还是直接清掉
   await reconcileAgentView(runtime.state, { reason, force: true });
   persistState();
@@ -1436,7 +1971,11 @@ async function publishMirrorSnapshots() {
   }
 }
 
-/** 启动时核对上次残留的映射，pane 没了就清掉。 */
+/**
+ * 启动时核对上次残留的映射：pane / 镜像标签页没了就把记录清掉。
+ *
+ * 记录清掉不等于丢行 —— session 还在跑的话，下一轮会重新解析目录、重建标签页和 pane。
+ */
 async function validateTrackedPanes() {
   let dropped = 0;
   for (const [sessionID, rec] of Object.entries(runtime.state.panes)) {
@@ -1455,11 +1994,20 @@ async function validateTrackedPanes() {
     }
   }
   if (dropped > 0) log("info", `清理了 ${dropped} 条失效映射`);
-  if (runtime.state.anchor.paneId) {
-    const pane = await herdr.paneGet(runtime.state.anchor.paneId);
-    if (!pane) {
-      runtime.state.anchor = { workspaceId: null, tabId: null, paneId: null, label: null };
+
+  // 各目录的镜像标签页：锚点 pane 不在了就清掉该目录的记录（下次重建）
+  let lostTabs = 0;
+  for (const [dir, entry] of Object.entries(runtime.state.mirrors || {})) {
+    if (entry?.fallback || !(await mirrorEntryAlive(entry))) {
+      delete runtime.state.mirrors[dir];
+      lostTabs += 1;
     }
+  }
+  if (lostTabs > 0) log("info", `清理了 ${lostTabs} 个已消失的镜像标签页记录`);
+
+  if (runtime.state.central.workspaceId && !(await mirrorEntryAlive(runtime.state.central))) {
+    log("info", `${config.mirrorLabel} 兜底工作区 ${runtime.state.central.workspaceId} 已失效`);
+    runtime.state.central = store.emptyCentral();
   }
 }
 

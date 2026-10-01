@@ -213,6 +213,39 @@ export async function tabList(workspaceId) {
   return Array.isArray(r?.tabs) ? r.tabs : [];
 }
 
+/**
+ * 在指定工作区里开一个新标签页。
+ *
+ * **这是让镜像行按目录分组的关键**（SPEC 6.6）：Agents 侧边栏的分组 token 只有
+ * `workspace`，没有「按目录分组」这个选项，所以镜像 pane 必须落在「用户为这个目录
+ * 开的工作区」里，那一行才会归到那个分组下。镜像独占一个标签页，绝不往用户正在用的
+ * 工作标签页里插 pane，多 pane 布局因此不会被挤压。
+ *
+ * 返回 `{root_pane, tab, type:"tab_created"}`。
+ */
+export async function tabCreate({ workspaceId, cwd, label, env }) {
+  const args = ["tab", "create", "--no-focus"];
+  if (workspaceId) args.push("--workspace", workspaceId);
+  if (label) args.push("--label", label);
+  if (cwd) args.push("--cwd", cwd);
+  for (const [k, v] of Object.entries(env || {})) args.push("--env", `${k}=${v}`);
+  const res = await cli(args);
+  const r = resultOf(res);
+  return r && typeof r === "object" ? r : null;
+}
+
+/** 关掉整个标签页（连同里面的 pane）。收镜像标签页用。 */
+export async function tabClose(tabId) {
+  if (!tabId) return { ok: false, error: "tabClose 需要 tab id" };
+  return cli(["tab", "close", tabId]);
+}
+
+/** 标签页改名。central 工作区创建后把它的首个标签页也统一成镜像标签名。 */
+export async function tabRename(tabId, label) {
+  if (!tabId || !label) return { ok: false, error: "tabRename 需要 tab id 和 label" };
+  return cli(["tab", "rename", tabId, label]);
+}
+
 export async function paneList(workspaceId) {
   const args = ["pane", "list"];
   if (workspaceId) args.push("--workspace", workspaceId);
@@ -325,6 +358,20 @@ export async function workspaceCreate({ cwd, label }) {
   if (cwd) args.push("--cwd", cwd);
   if (label) args.push("--label", label);
   return resultOf(await cli(args));
+}
+
+/**
+ * 关掉整个工作区。只有「我们自己建的 central 兜底工作区」才会走到这里，
+ * 调用前必须确认里面没有别的 agent 行（board 里那层检查是硬性的）。
+ */
+export async function workspaceClose(workspaceId) {
+  if (!workspaceId) return { ok: false, error: "workspaceClose 需要 workspace id" };
+  return cli(["workspace", "close", workspaceId]);
+}
+
+/** 一个 pane 是不是我们自己的镜像 pane（靠上报的 oc_mirror token 认）。 */
+export function isMirrorPane(pane) {
+  return pane?.tokens?.[MIRROR_TOKEN] === "1";
 }
 
 export async function paneSplit({ paneId, direction = "down", ratio, cwd, env }) {

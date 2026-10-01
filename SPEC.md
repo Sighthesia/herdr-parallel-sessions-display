@@ -28,9 +28,30 @@
 
 ## 3. 方案概述
 
-为「未被任何 pane 打开」的运行中根 session 分配一个**专用镜像 pane**，集中在 `Sessions` 工作区/标签页内，不查看时无感。镜像 pane 内**不运行 opencode**（避免官方集成在该 pane 二次上报造成重复行），由插件通过 Herdr 官方开放接口替它上报状态与元数据。
+为「未被任何 pane 打开」的运行中根 session 分配一个**专用镜像 pane**，不查看时无感。镜像 pane 内**不运行 opencode**（避免官方集成在该 pane 二次上报造成重复行），由插件通过 Herdr 官方开放接口替它上报状态与元数据。
 
 状态来源是 OpenCode server 自身的运行态，而非屏幕识别——这比官方集成读屏幕更准。
+
+### 3.1 镜像 pane 落在哪里：**每个目录一个专属标签页，放在该目录自己的工作区里**
+
+目标形态（用户侧边栏）：
+
+```
+[1] afloat
+  ├ opencode  Tray hover二级菜单点击收起…      ← 官方行（TUI 当前选中的）
+  └ opencode  实现 Hover 菜单式…               ← 镜像行（同目录另一个在跑的）
+[2] ReimuMoePCB_DAPLink
+  └ opencode  使用 DAPLink 识别 H750          ← 官方行
+[5] Muthesia
+  ├ opencode  MIDI绘制乐理辅助功能             ← 官方行
+  └ opencode  …                               ← 镜像行
+```
+
+**为什么必须这么排**：Agents 侧边栏的分组 token **只有 `workspace`**（`ui.sidebar.agents.rows` 默认 `["state_icon","machine","workspace","tab"]`，无「按目录分组」选项）。行的分组完全由它所在 pane 的 `workspace_id` 决定，所以镜像 pane 必须落在「用户为这个目录开的工作区」里，那一行才会归到对应的 `[n] <项目名>` 分组下。全部堆进一个 `Sessions` 分组就达不到目的。
+
+**为什么用标签页而不是直接往用户的工作标签页里插 pane**：镜像独占一个标签页（固定名 `oc-sessions`，Herdr 自动加 `[N] ` 前缀），用户的多 pane 布局不会被挤压、不会抖。实测在 `w18` 建镜像标签页 `w18:tE` 后，用户原有的 `w18:t1 [1] lazer` 与 `w18:t7 [2] fish` 两个标签页的 pane 数完全不变。
+
+**一个目录都匹配不上工作区时**（例如 session 在 `/tmp/...` 下而用户没开过这个目录），才退回 central `Sessions` 工作区，并在日志里明说「该目录无对应工作区，已归入 Sessions」。此时该工作区被 Herdr 自动回收（空工作区不留），下次需要时再建。
 
 ---
 
@@ -106,9 +127,50 @@
 - `[[startup]]` 钩子负责在 Herdr 恢复会话后读取 `HERDR_PLUGIN_STATE_DIR` 里的映射并重建上报（与官方文档推荐的「保存声明式视图 + startup 重放」一致）
 - 面板可由用户手动打开；自动拉起为可配置开关
 
-### 6.2 镜像 pane
+### 6.2 镜像 pane 与锚点模型
 
-统一放在专用工作区/标签页（默认标签名 `Sessions`），与管理面板同处一屏，不打开不占视野。
+**锚点模型（`state.mirrors`，按目录索引）**：
+
+```js
+state.mirrors = {
+  "<绝对目录>": { workspaceId, tabId, anchorPaneId, fallback: false },
+  ...
+};
+state.central = { workspaceId, tabId, anchorPaneId, label };  // 兜底工作区
+```
+
+`ensureMirrorTab(directory)` = 「拿到或创建这个目录的镜像标签页」。每个镜像标签页内部再用 6.4 的平衡 BSP 树摆该目录的多个镜像 pane——**这段逻辑复用，不因分目录而重写**。
+
+`fallback: true` 的目录只存标记，真实 id 在 `state.central` 里（多个目录共用同一个兜底工作区与标签页）。
+
+### 6.2.1 目录 → workspace 的解析（精确匹配，绝不用 basename 猜）
+
+session 自带 `directory`。要找到对应的 herdr workspace，用 `herdr pane list` 的 `cwd` / `foreground_cwd` 反查，**三级判定**：
+
+| 级 | 判据 | 说明 |
+| --- | --- | --- |
+| 1 | `pane.cwd === directory` | 用户就是在这个目录里开的 opencode，绝大多数命中这一级 |
+| 2 | `pane.foreground_cwd === directory` | pane 的实际前台进程在这个目录里 |
+| 3 | 该目录在某个 pane 目录**之下**（取最深的那个） | 用户在项目子目录里开了 session，而那个子目录自己没有 pane |
+
+同级命中多个工作区时，选「**在这个目录里 pane 最多**」的那个，再比 pane 总数，最后按 id 保证结果稳定可复现。
+
+> **为什么不用 pane 总数当主判据**：实测 `.../Software/herdr` 同时命中 `w1C [4] AI8051U_AM32_ESC`（该工作区里只有 1 个 pane 在这个目录，是个 sidebar）和 `w1J [7] herdr`（4 个 pane 都在这个目录，用户真在这儿干活）。按总数挑会选错分组，按匹配数挑才对——「这个目录里 pane 多」才说明用户真的在这干活。
+
+**绝不拿 label 做匹配**：`herdr-sidebar` 会把用户的工作区 label 改写成 `[1] afloat` 这种带编号的形式，label 只是显示。label 只用于「找回 central 兜底工作区」这一处（且会剥掉 `[N] ` 前缀）。
+
+一个 workspace 都匹配不上 → 退回 central `Sessions` 工作区，日志写明「该目录无对应工作区，已归入 Sessions」。
+
+### 6.2.2 认领（state.json 丢失 / 崩溃残留之后）
+
+`state.json` 丢了但镜像标签页还在时，需要重新认领，避免建出重复标签页：
+
+1. **优先「里面有我们跟踪的镜像 pane」** ——最可靠，完全不看 label。
+2. 其次按 label 认（归一化时剥掉 `[N] ` 前缀、只取 `›` 之前的部分，因为 sidebar 插件会把标签页改写成 `[3] oc-sessions › …`）。
+
+**挑锚点 pane 不能拿「列表第一个」**：pane 列表顺序不保证是布局顺序，而 sidebar 插件会给每个标签页注入一个 `label: "Sidebar"` 的 pane。抢它当锚点会让之后 split 出来的镜像 pane 跑到侧边栏那一列下面（实测如此）。优先级：① 自己留的锚点 shell（无 label、无别人的 agent 行）→ ② 跟踪中的镜像 pane → ③ 列表第一个。
+
+标签页真不在了（记录指向已消失的 pane）→ 删掉该目录的记录，下一轮重新解析目录、重建标签页。
 
 每个镜像 pane 运行一个极轻的驻留进程（Node 定时器保活即可，不依赖外部命令），插件以自己的 `source` 为它上报。上报**刻意拆成两步**：
 
@@ -118,6 +180,8 @@
 原因是官方文档写明 `invalid_resume_argv` 时「the report is not applied」：合成一步上报时，一个不合法的恢复命令会把 `agent_session_id` 一起丢掉，session id 白报。拆开后第 2 步失败只影响「Herdr 重启后怎么恢复」，不影响这一行本身。两步都记日志。
 
 恢复命令为 `opencode --session <id>`（`RESUME_MODE=mirror` 时改为只恢复驻留进程），保证 Herdr 重启后仍能恢复该行。session 停止运行 → `pane release-agent` + 关闭该镜像 pane + 重平衡剩余布局，行随之消失。
+
+> **`pane split` 的 socket 参数是 `target_pane_id`**（没有 `pane_id`；传错会被静默忽略并拆当前焦点 pane）。CLI 侧用位置参数 `herdr pane split <pane_id>`，等价于 `target_pane_id`。
 
 同时上报两层展示信息：
 
@@ -146,21 +210,32 @@
 1. **装投影前先数镜像行数。** 为 0 时绝不允许安装带筛选的 `mirror` 投影，自动退回 `sort-only`（只接管排序）。收敛成一个函数 `shouldFilterMirror()`。镜像行从 0 变正、或从正变 0，投影都会跟着自动升降级。
 2. **投影必须有人清。** `INSTALL_AGENT_VIEW=false` 但 `state.agentView` 存在时，清掉投影并把 `state.agentView` 置 null。这段「按当前 config 校准已安装投影」的逻辑是**所有模式共用**的（`startup` / `pane` / `action` / `once` 都跑一次），幂等、不刷错误日志。只有 startup 处理是不够的：用户把开关关掉后没有任何进程会再去校准，投影会一直赖在运行中的 Herdr server 里。
 
-### 6.4 布局：平衡 BSP 树
+### 6.4 布局：平衡 BSP 树（按标签页，不是全局）
 
-新增镜像 pane 后**重平衡整个镜像子树**，让所有镜像 pane 均分空间，而不是让锚点越来越小。
+新增镜像 pane 后**重平衡这个镜像标签页里的镜像子树**，让该目录的所有镜像 pane 均分空间，而不是让锚点越来越小。不同目录的镜像在不同标签页/工作区，互不影响。
 
 - 用 `layout.set_split_ratio`，**不用** `layout.apply`。官方文档明说 apply 会重建 tab、不保留 live PTY / scrollback / 进程，会把已有镜像 pane 全杀掉重启。
 - 规则只有一条：**`ratio = first 子树的叶子数 / 该节点子树的总叶子数`**。每个叶子恰好拿到 1/N，对任意二叉树形状都成立。
-- 只调整「子树里全是镜像 pane」的节点：侧边栏之类的外来 pane 不参与，它们的祖先 split 保持不动。
+- 只调整「子树里全是镜像 pane」的节点：侧边栏之类的外来 pane 不参与，它们的祖先 split 保持不动。**别的来源（官方集成等）上报了 agent 行的 pane 一律不碰**——哪怕认领路径万一把它当成了锚点。
 - 比例已到位就不重复下发（reconcile 每 5 秒跑一次，不能每轮打十几次 socket）。
 - **不因为空间不足拒绝建行。** 旧设计里「每行至少 N 行」的高度守卫和 ratio 逐级退让全部删除：反复用小 ratio 拆同一个锚点，锚点自己被逐次压缩、预算很快耗尽，那不是 herdr 的限制，是切分策略错了。实测 44 行 area 下平衡 8 叶完全放得下（`viewport_rows` 2/2/3/9/9/4/3，全 > 0）；超长会有滚动。
 
 **零高度陷阱**：herdr 对过小的 split 不报错，会静默返回 `viewport_rows: 0` 的不可见 pane（实测连切 40 次全部返回成功，第 3 个之后全是 0 行）。所以「不报错」≠「建好了」。新建 pane 后读回 `scroll.viewport_rows`，为 0 立即重平衡再读一次；仍为 0 只记一条日志 —— **但绝不因此放弃这一行**，记下来下一轮重试。
 
-### 6.5 孤儿回收
+### 6.5 回收
 
-`state.json` 丢失或多次崩溃后，Herdr 里会留下永久残行。需要按 label 认领镜像工作区，并回收所有不在映射里的 pane。重平衡时这些残行靠 `oc_mirror` token 认回来，否则整棵镜像子树会被当成「含外来 pane」而永远得不到平衡。
+三层回收，全部由同一条重算路径驱动：
+
+1. **单个镜像行**：session 不再活跃且过了宽限期 → `release-agent` + 关 pane → 该标签页里的镜像 pane 重新均分。
+2. **整个镜像标签页**：标签页里已经没有镜像 pane（跟踪中的、或带 `oc_mirror` token 的）→ `herdr tab close` 整页关掉，同时删掉该目录的记录。
+   - **硬安全阀**：标签页里还有**别的 source 上报的 agent 行**时绝不关——那已经不是「纯镜像标签页」了。sidebar 插件注入的 Sidebar pane 没有 agent 行，不会触发这个保护。
+3. **central 兜底工作区**：没有任何目录还在用 fallback → 关掉。里面还有别人的 agent 行则只关标签页、保留工作区（下次会在同一个工作区里重开镜像标签页，而不是新建一个同名工作区）。
+
+**孤儿回收**：`state.json` 丢失或多次崩溃后，Herdr 里会留下永久残行。每轮重算先扫一遍——凡是带 `oc_mirror` token 却不在我们映射里的 pane，一律 `release-agent` + 关闭。靠 token 认最可靠：标签页名可能被用户改，pane id 一定认不错。重平衡时这些残行同样靠 token 认回来，否则整棵镜像子树会被当成「含外来 pane」而永远得不到平衡。
+
+另外要清掉「central 工作区已经不存在」的记录：Herdr 会**自动回收空工作区**（标签页关掉后工作区自己就没了），而记录里还留着那个 `workspace_id`，不清掉下次会拿着一个已消失的 id 去认领。
+
+`reap` action 走同一条路径的全量版：逐个关 pane → 关所有镜像标签页 → 扫孤儿 → 关 central 工作区 → 清记录与残留快照。session 还在跑时下一轮会重新建回来。
 
 ---
 
@@ -173,7 +248,8 @@
 | `OPENCODE_SERVER_URL` | 空 | 显式 server 地址，如 `http://127.0.0.1:4096` |
 | `OPENCODE_SERVER_USERNAME` | `opencode` | Basic Auth 用户名 |
 | `OPENCODE_SERVER_PASSWORD` | 空 | Basic Auth 密码 |
-| `MIRROR_LABEL` | `Sessions` | 镜像所在工作区/标签名 |
+| `MIRROR_LABEL` | `Sessions` | **兜底**工作区名，仅当某目录匹配不上任何工作区时才会建 |
+| `MIRROR_TAB_LABEL` | `oc-sessions` | 每个目录在自己工作区里那个镜像标签页的名字（Herdr 会自动加 `[N] ` 前缀） |
 | `AUTO_START` | `false` | Herdr 恢复后自动拉起管理器 |
 | `INSTALL_AGENT_VIEW` | `false` | 是否安装全局 Agents 视图投影 |
 | `POLL_INTERVAL_MS` | `5000` | 轮询兜底间隔 |
@@ -214,12 +290,17 @@ README.md
 5. 子 agent 不单列成行。
 6. Herdr server 重启后，镜像行能按保存的映射恢复。
 7. OpenCode server 不可达时，管理器不崩溃、不刷错误日志，退化为静默重试。
+8. **同一工作区里跑着多个 session 时，镜像行的 `workspace_id` 等于该目录对应工作区的 id**（落在正确的 `[n] <项目名>` 分组下，而不是全堆在 `Sessions`）。
+9. **镜像标签页的存在不改变用户原有标签页的 pane 数**（实测建镜像标签页前后，用户原有标签页的 `pane_count` 逐个不变）。
+10. **目录下所有镜像 session 都结束后，该目录的镜像标签页被整页关闭**，工作区回到镜像前的样子；没有目录再用兜底时，`Sessions` 兜底工作区也被关掉。
 
 ---
 
 ## 10. 已知边界
 
-- **一个运行中 session 一行 = 一个镜像 pane**，有终端资源成本，集中放置后不查看时无感，但不是零成本。行数很多时会需要滚动 —— 按产品决策这不构成拒绝建行的理由。
+- **一个运行中 session 一行 = 一个镜像 pane**，有终端资源成本。镜像集中在各目录自己的 `oc-sessions` 标签页里，不打开不占视野，但不是零成本。行数很多时会需要滚动 —— 按产品决策这不构成拒绝建行的理由。
+- **每个目录会在它的工作区里多出一个标签页**。标签页名叫 `oc-sessions`（前缀由 Herdr 加），一眼能认出不是工作标签页，关闭它不影响镜像行之外的任何东西。
+- **镜像标签页里会被 sidebar 插件注入一个 Sidebar pane**（它给每个标签页都注入）。这个 pane 不参与镜像的布局平衡，也没有任何 agent 行，所以不会挡住标签页回收。
 - **镜像行只读**。要交互需点进用户真实 TUI 手动切换 session。
 - **状态准确性依赖 SSE 连接**。事件流断开会退化为轮询兜底，`blocked` 的权限判定精度下降；v1 无独立权限接口，断流期间该信号直接丢失。
 - **v1 协议路径没有真机验证**（本机只有 v2）。v2 路径已在 `opencode 2.0.21` + Basic Auth 场景下端到端验证。
@@ -229,4 +310,5 @@ README.md
 - **`agent_session` 落不了库**：herdr 0.9.3 只给官方集成存原生 session 引用，第三方 source 传了 `agent_session_id` 也会被省略（见 4.4）。去重因此走 `oc_session` token 回退；Herdr 重启后的原生 session 恢复在第三方 source 上不可用。
 - **侧边栏行文本可能被用户自己的插件覆盖**：镜像行上报了 `oc_title` / `oc_project` / `oc_state` token，也用 `pane.rename` 设了可读 label，但 `herdr-sidebar` 的 `hs_title` token 优先级更高。插件不去改用户的 sidebar 配置，需要的话由用户自行把 `$oc_title` 拼进 sidebar 行模板。
 - `RESUME_MODE=opencode` 的重启恢复未端到端验证（会真的拉起 opencode），`resume_argv` 的格式规则已按官方文档核对。
+- **central 兜底工作区按 label 找回**。理论上会认错用户自己取名 `Sessions` 的工作区 —— 但这只发生在「有目录匹配不上任何工作区」的兜底路径上，且里面有别人的 agent 行时不会关掉它。
 - 面板命令的输出不会进入 `herdr plugin log list`，排障需走 `herdr pane read`。

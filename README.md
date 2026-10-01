@@ -162,6 +162,7 @@ command = "opencode.session-mirror.board"
 | `RESUME_MODE` | `opencode` | Herdr 重启后的恢复命令，见下 |
 | `MIRROR_PANE_RATIO` | `0.5` | 初始切分比例，建完立刻被重平衡覆盖 |
 | `MIRROR_PANE_DIRECTION` | `down` | 排列方向 `down` / `right` |
+| `REBALANCE_INTERVAL_MS` | `30000` | 常规重平衡巡检间隔。建行/回收时是即时的，这里只负责把别人（sidebar 插件、用户手动拖动）改乱的布局纠回来 |
 | `SESSION_LIST_LIMIT` | `200` | 每页拉多少条会话 |
 | `SESSION_PAGE_LIMIT` | `8` | 最多翻几页找活跃 session |
 | `RETRY_DETECTION` | `true` | 是否探测「正在重试」状态（v2 下每 session 多一次请求） |

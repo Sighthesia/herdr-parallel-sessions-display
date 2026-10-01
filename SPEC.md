@@ -216,11 +216,21 @@ session 自带 `directory`。要找到对应的 herdr workspace，用 `herdr pan
 
 - 用 `layout.set_split_ratio`，**不用** `layout.apply`。官方文档明说 apply 会重建 tab、不保留 live PTY / scrollback / 进程，会把已有镜像 pane 全杀掉重启。
 - 规则只有一条：**`ratio = first 子树的叶子数 / 该节点子树的总叶子数`**。每个叶子恰好拿到 1/N，对任意二叉树形状都成立。
-- 只调整「子树里全是镜像 pane」的节点：侧边栏之类的外来 pane 不参与，它们的祖先 split 保持不动。**别的来源（官方集成等）上报了 agent 行的 pane 一律不碰**——哪怕认领路径万一把它当成了锚点。
 - 比例已到位就不重复下发（reconcile 每 5 秒跑一次，不能每轮打十几次 socket）。
 - **不因为空间不足拒绝建行。** 旧设计里「每行至少 N 行」的高度守卫和 ratio 逐级退让全部删除：反复用小 ratio 拆同一个锚点，锚点自己被逐次压缩、预算很快耗尽，那不是 herdr 的限制，是切分策略错了。实测 44 行 area 下平衡 8 叶完全放得下（`viewport_rows` 2/2/3/9/9/4/3，全 > 0）；超长会有滚动。
 
+**外来 pane 的处理（两条规则，不是一视同仁）**：
+
+- **别的来源（官方集成等）上报了 agent 行的 pane 一律不碰**——哪怕认领路径万一把它当成了锚点。认领路径可能误抢用户的标签页，这时候绝不能去动用户侧边栏那一列的比例。
+- 但 sidebar 插件会给**每个**标签页注入一个 `label: "Sidebar"` 的 pane，它不报任何 agent 行。在**我们自己建的** `oc-sessions` 标签页里它就是纯废空间（里面全是常驻 shell，没有文件树也没有 git 变更可看），必须一起参与均分，否则根 split 永远被跳过、比例完全由 sidebar 插件摆布。
+- 判据是「**纯镜像标签页**」：这个标签页里除 Sidebar pane 之外，没有任何别的 source 上报过 agent 行。是 → 整棵子树（含 Sidebar pane）都进平衡池；否 → 只平衡自己那部分。
+- 实测：5 个 pane（4 镜像 + 1 Sidebar）时根 split 从 0.229 被纠正到 0.200，Sidebar 从 53.8% 降到 20%。
+
+**常规巡检**：建行/回收时的重平衡是即时的，但布局会被别人改（sidebar 插件重排整页、用户手动拖分割条）。`REBALANCE_INTERVAL_MS`（默认 30s）触发一次全量巡检把比例纠回来。比例已正确时 `balanceSplitPlans` 返回空数组，不会下发任何写操作，所以稳定状态下只有 `layout.export` + `pane list` 两次读。
+
 **零高度陷阱**：herdr 对过小的 split 不报错，会静默返回 `viewport_rows: 0` 的不可见 pane（实测连切 40 次全部返回成功，第 3 个之后全是 0 行）。所以「不报错」≠「建好了」。新建 pane 后读回 `scroll.viewport_rows`，为 0 立即重平衡再读一次；仍为 0 只记一条日志 —— **但绝不因此放弃这一行**，记下来下一轮重试。
+
+> **`pane list` 的 `viewport_rows` 对非焦点工作区是陈旧值。** 实测 `layout.set_split_ratio` 返回 `ok: true`、`layout.export` 也确认 ratio 已经写成 0.200，但 `pane list` 仍报旧的 42/9/9/9/9。**判断布局是否真的生效要看 `layout.export`，不要信 `pane list` 的行数。** 副作用：`ensurePaneVisible` 的零高度检测在非焦点工作区上会读到陈旧的正数而跳过重平衡——这个缺口由上面的常规巡检兜住。
 
 ### 6.5 回收
 
@@ -232,6 +242,15 @@ session 自带 `directory`。要找到对应的 herdr workspace，用 `herdr pan
 3. **central 兜底工作区**：没有任何目录还在用 fallback → 关掉。里面还有别人的 agent 行则只关标签页、保留工作区（下次会在同一个工作区里重开镜像标签页，而不是新建一个同名工作区）。
 
 **孤儿回收**：`state.json` 丢失或多次崩溃后，Herdr 里会留下永久残行。每轮重算先扫一遍——凡是带 `oc_mirror` token 却不在我们映射里的 pane，一律 `release-agent` + 关闭。靠 token 认最可靠：标签页名可能被用户改，pane id 一定认不错。重平衡时这些残行同样靠 token 认回来，否则整棵镜像子树会被当成「含外来 pane」而永远得不到平衡。
+
+**pane 凭空消失要能自愈**。镜像 pane 会在我们背后被关掉：用户手动关、Herdr 回收空工作区、sidebar 插件重排标签页时关掉自己不再需要的 pane。两条都要处理，缺一条这一行就永久消失：
+
+- **建行路径**：每轮开始时取一次活着的 pane 集合，`rec.paneId` 非空但不在集合里 → 清空并重建。否则 `rec.paneId` 非空会让建行逻辑以为「已经有 pane 了」，而上报一直 `pane_not_found`。
+- **回收路径**：`pane close` 报 `pane_not_found` = 目标已达成，**当成成功**处理并删掉映射。旧代码当成失败保留映射，于是每轮都去关同一个不存在的 pane、那一行再也回不来。
+
+实测：手动 `herdr pane close w1B:p1V` 后，下一轮日志 `pane w1B:p1V 已消失，重建` → `新建镜像行 ses_f13b9bcc → w1B:p1X`，同一 session、同一工作区分组。
+
+**已知的上游噪声**：客户端进程被强杀（`kill -9`、终端崩掉）后，opencode 服务端可能仍把该 session 留在 `/api/session/active` 里一两分钟。这期间镜像行会显示成「运行中」的幽灵行，服务端自己清掉 active 之后下一轮就会正常回收。属于等待窗口，不是永久错报。
 
 另外要清掉「central 工作区已经不存在」的记录：Herdr 会**自动回收空工作区**（标签页关掉后工作区自己就没了），而记录里还留着那个 `workspace_id`，不清掉下次会拿着一个已消失的 id 去认领。
 

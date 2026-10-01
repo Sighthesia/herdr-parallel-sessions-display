@@ -50,6 +50,7 @@ const config = {
   resumeMode: store.asEnum(raw, "RESUME_MODE", ["opencode", "mirror"], "opencode"),
   paneRatio: store.asFloat(raw, "MIRROR_PANE_RATIO", 0.5, 0.02, 0.98),
   paneDirection: store.asEnum(raw, "MIRROR_PANE_DIRECTION", ["down", "right"], "down"),
+  rebalanceIntervalMs: store.asInt(raw, "REBALANCE_INTERVAL_MS", 30_000, 5_000, 600_000),
   sessionLimit: store.asInt(raw, "SESSION_LIST_LIMIT", 200, 10, 2_000),
   sessionPages: store.asInt(raw, "SESSION_PAGE_LIMIT", 8, 1, 50),
   retryDetection: store.asBool(raw, "RETRY_DETECTION", true),
@@ -129,6 +130,8 @@ const runtime = {
   timers: [],
   /** 一轮重算里已经重平衡过没有。回收一批行时不必每个都重算一次布局。 */
   balancedThisPass: false,
+  /** 上次常规重平衡的时间戳，用来节流 `maybeRebalanceAll`。 */
+  lastRebalanceAt: 0,
   /** pane 全量列表的索引（目录 → workspace 解析、认领标签页、孤儿回收都要用），带 TTL 缓存。 */
   paneIndex: null,
   shuttingDown: false,
@@ -742,6 +745,10 @@ async function applySessionState({ client, roots, activeStates, polledPermission
   const retryBudget = config.retryDetection ? config.retryCheckLimit : 0;
   let retryUsed = 0;
 
+  // 本轮开始时活着的 pane，用来发现「记着的 pane 已经被外部关掉」。
+  // 边建边补，所以同一轮里先建出来的 pane 不会把自己当成失效。
+  const alive = new Set(((await paneIndex({ force: true })).panes || []).map((p) => str(p?.pane_id)));
+
   for (const info of wanted) {
     if (runtime.shuttingDown) return;
     if (!store.isValidSessionId(info.id)) {
@@ -780,6 +787,16 @@ async function applySessionState({ client, roots, activeStates, polledPermission
       runtime.state.panes[info.id] = rec;
     }
 
+    // 自愈：记着的 pane 可能已经不在了（用户手动关、herdr 回收空工作区、
+    // sidebar 插件重排标签页）。复用死 pane 的话这一行就永久消失 —— 上报会一直
+    // 报 pane_not_found，而 rec.paneId 非空又让建行逻辑以为「已经有 pane 了」。
+    if (rec.paneId && !alive.has(rec.paneId)) {
+      log("info", `镜像行 ${shortId(info.id)} 的 pane ${rec.paneId} 已消失，重建`);
+      rec.paneId = "";
+      rec.fingerprint = "";
+      rec.lastState = "";
+    }
+
     if (!rec.paneId) {
       // 不因为空间不足而放弃建行：切完立刻重平衡，实在还是 0 行也照样把行建出来。
       const created = await createMirrorPane(info);
@@ -789,6 +806,7 @@ async function applySessionState({ client, roots, activeStates, polledPermission
         continue;
       }
       rec.paneId = created;
+      alive.add(created);
       log("info", `新建镜像行 ${shortId(info.id)} → ${created} 「${info.title || "(无标题)"}」`);
     }
 
@@ -809,6 +827,12 @@ async function applySessionState({ client, roots, activeStates, polledPermission
   // --- 4. 写镜像 pane 的显示状态 ------------------------------------------
   await publishMirrorSnapshots();
 
+  // --- 4b. 常规重平衡（节流） ----------------------------------------------
+  // 建行/回收时已经重平衡过，但布局会被别人改：sidebar 插件会往每个标签页注入
+  // 自己的 Sidebar pane 并且重排整页，用户也可能手动拖。不定期纠正的话，镜像
+  // pane 会被挤到只剩零星几行（实测 Sidebar 42 行 vs 每个 session pane 9 行）。
+  await maybeRebalanceAll();
+
   // --- 5. 按「镜像行确实存在」校准投影 ---------------------------------------
   // 这一步是防「no matching agents」事故的最后一道闸：镜像行归零时必须把
   // 带筛选的投影降级成只排序，否则用户的官方行会被我们的筛选全部隐藏。
@@ -825,8 +849,50 @@ async function applySessionState({ client, roots, activeStates, polledPermission
   );
 }
 
-/** 是不是「连接层」错误 —— 只有这类才值得丢掉 client 重新发现。 */
-function isTransportError(err) {
+/**
+ * 定期把所有镜像标签页重平衡一遍。
+ *
+ * 节流到 `rebalanceIntervalMs`（默认 30s）一次：`balanceSplitPlans` 内部有
+ * `RATIO_EPSILON` 判断，比例已经对得上时不会下发任何 `set_split_ratio`，所以
+ * 稳态下这里只有 `layout.export` + `pane list` 两次读，没有写。
+ *
+ * 有行被建/被回收的那一轮由 `runtime.balancedThisPass` 单独管，那边是即时的，
+ * 不受这里的节流影响。
+ */
+async function maybeRebalanceAll() {
+  const now = Date.now();
+  if (now - runtime.lastRebalanceAt < config.rebalanceIntervalMs) return;
+  runtime.lastRebalanceAt = now;
+
+  const entries = [...Object.values(runtime.state.mirrors || {})];
+  const central = runtime.state.central;
+  if (central?.tabId) entries.push({ ...central, fallback: true });
+
+  for (const entry of entries) {
+    if (runtime.shuttingDown) return;
+    try {
+      await rebalanceMirrorTab(entry, "常规巡检");
+    } catch (err) {
+      log("debug", `常规重平衡失败（${str(entry?.tabId) || "?"}）：${err?.message || err}`);
+    }
+  }
+}
+
+/**
+ * Herdr 报的「这个 pane 不存在」。
+ *
+ * pane 可能在我们背后消失：用户手动关掉、herdr 回收空工作区、sidebar 插件重排
+ * 标签页时关掉自己不再需要的 pane。碰到这种错误必须当成「目标已达成」，
+ * 不能当成失败 —— 否则映射会永远卡在一个死 pane 上（实测每轮重试关闭、
+ * 侧边栏里那一行再也回不来）。
+ */
+function isPaneNotFound(error) {
+  const code = error?.error?.code ?? error?.code;
+  const msg = String(error?.error?.message ?? error?.message ?? "");
+  return code === "pane_not_found" || /pane .* not found/i.test(msg);
+}
+
+/** 是不是「连接层」错误 —— 只有这类才值得丢掉 client 重新发现。 */function isTransportError(err) {
   if (err instanceof OpenCodeError) {
     if (err.status === 0) return true;
     return err.status === 502 || err.status === 503 || err.status === 504;
@@ -1085,6 +1151,10 @@ async function ensureMirrorTab(directory) {
   }
 
   // 3) 兜底
+  // 这里存的是一条**「本目录走 central」的备忘**，不是镜像标签页本身：字段全空，
+  // 真正的 tab/锚点在 state.central 里。留它是为了下一轮直接在 1) 命中 fallback
+  // 分支直接跳到 ensureCentral，省掉一次全量工作区解析。代价是用户之后为这个目录
+  // 开了工作区也不会改判 —— 那时它仍然只是归到 Sessions 分组，行照样在，不影响正确性。
   if (dir) runtime.state.mirrors[dir] = { ...store.emptyMirrorEntry(), fallback: true };
   return await ensureCentral(dir);
 }
@@ -1254,6 +1324,14 @@ function trackedMirrorPaneIds() {
   }
   return out;
 }
+
+/**
+ * sidebar 插件往每个标签页注入的 pane 的 label。
+ *
+ * 纯镜像标签页里它是唯一的「外来」pane，且不报任何 agent 行，所以判定
+ * 「这个标签页归我们管」时可以把它算进平衡池。
+ */
+const SIDEBAR_PANE_LABEL = "Sidebar";
 
 /**
  * 这个 pane 上有没有**别的来源**（官方集成、user、custom…）上报的 agent 行。
@@ -1608,13 +1686,24 @@ async function ourPaneIdsInTab(entry, extra = []) {
 
   const tracked = trackedMirrorPaneIds();
   const anchor = str(entry?.anchorPaneId);
-  for (const pane of await herdr.paneList(workspaceId)) {
-    if (str(pane?.tab_id) !== tabId) continue;
+  const panes = (await herdr.paneList(workspaceId)).filter((p) => str(p?.tab_id) === tabId);
+
+  // 「纯镜像标签页」= 除了 sidebar 插件注入的 Sidebar pane 以外，没有任何别的
+  // source 上报过 agent 行。这时整棵子树都归我们平衡。
+  //
+  // 必须这么判的原因：sidebar 插件会给**每个**标签页注入一个 Sidebar pane，而
+  // `balanceSplitPlans` 只处理「子树里全是我们的 pane」的节点。之前 sidebar pane
+  // 被当成外来 pane，根 split 就永远被跳过 —— 结果是我们自己建的 oc-sessions
+  // 标签页从没被平衡过，sidebar 在里面白占一半空间（实测 42/78 行），而每个
+  // session pane 只剩 9 行。
+  const exclusive = panes.every((p) => !isForeignAgentPane(p) || p?.label === SIDEBAR_PANE_LABEL);
+
+  for (const pane of panes) {
     const id = str(pane?.pane_id);
     if (!id) continue;
-    // 别人的 agent 行一律不碰：认领路径万一抢到了 sidebar 的 pane，
-    // 也不能因此去动 sidebar 那一列的比例
-    if (isForeignAgentPane(pane)) continue;
+    // 非纯镜像标签页（认领路径万一抢到了用户的标签页）：别人的 agent 行一律不碰，
+    // 不能因此去动用户侧边栏那一列的比例
+    if (!exclusive && isForeignAgentPane(pane)) continue;
     if (id === anchor || tracked.has(id) || herdr.isMirrorPane(pane)) out.add(id);
   }
   return out;
@@ -1713,6 +1802,15 @@ async function teardownMirror(sessionID, rec, reason) {
 
   const closed = await herdr.paneClose(rec.paneId);
   if (!closed.ok) {
+    // pane 已经不在了 = 目标已达成。当成失败保留映射的话，这一行就永久丢了：
+    // 下一轮还是会去关同一个不存在的 pane，永远重建不回来（实测 session 还在跑，
+    // 侧边栏却再没有它的行，每轮刷一条 warn）。
+    if (isPaneNotFound(closed.error)) {
+      log("info", `镜像 pane ${rec.paneId} 已被外部关闭，丢弃映射下轮重建（${reason}）`);
+      delete runtime.state.panes[sessionID];
+      await store.removeFile(path.join(STATE_DIR, `mirror-${sessionID}.json`));
+      return;
+    }
     log("warn", `关闭镜像 pane ${rec.paneId} 失败，保留映射下轮重试: ${closed.error}`);
     return;
   }

@@ -363,8 +363,8 @@ function baseSlug(cwd) {
 /**
  * transcript 的目录名 = cwd 里**每个非字母数字字符换成 `-`**。
  *
- * 本机实测 `/home/Sighthesia/0_Files/Producing/Software/herdr` →
- * `-home-Sighthesia-0-Files-Producing-Software-herdr`（`_` 也变 `-`）。
+ * 本机实测 `/home/alice/.local/share/oc-some-plugin` →
+ * `-home-alice--local-share-oc-some-plugin`（`.` 和 `/` 都变 `-`，所以是连续两个 `-`）。
  *
  * 超过 200 字符时 Claude Code 会截断并加一个路径哈希 —— **不要去实现那个哈希**：
  * 官方没给算法，猜出来的路径只会读不到文件。这里老老实实生成短路径，长路径自然读不到，

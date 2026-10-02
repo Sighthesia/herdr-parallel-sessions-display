@@ -36,7 +36,7 @@ Herdr 插件：把**同一个 opencode server 内所有运行中的根 session**
 
 ```bash
 # 开发：link 本目录，改完重启看板标签页即生效
-herdr plugin link /home/Sighthesia/0_Files/Producing/Software/herdr
+herdr plugin link /绝对路径/herdr
 
 # 真正的 .env 在这里（仓库里的 config/.env.example 只是模板，已 gitignore）
 herdr plugin config-dir opencode.session-mirror

@@ -543,8 +543,21 @@ export function mapThreadStatus(statusType) {
  *
  * 标题优先 `name`（用户改过的 thread 名），退到 `preview`（首条用户消息，通常都有），
  * 再退到占位符。目录字段就是 `cwd`。
+ *
+ * ## `ephemeral` 的 thread 直接返回 null
+ *
+ * 实测：**每建立一次 app-server 连接，共享守护进程就会造一个 `ephemeral` thread。**
+ * 它们不进 `thread/list`，但会被 `thread/loaded/list` 报上来，于是「按 id 补查
+ * `thread/read`」那条路径会把它们全捞回来 —— 而它们 `name`/`preview` 都是空串，
+ * 侧边栏上就堆出一串 `(无标题)`（实测一次连接就多一行，界面上出现 4 行噪音）。
+ *
+ * schema 里对 `ephemeral` 的说明是「should not be materialized on disk」，也就是
+ * 「不是一次真正的会话」，本来就不该显示。所以在这里挡掉，别让调用方各写一遍。
+ *
+ * @returns {{id:string,title:string,directory:string,state:string|null}|null}
  */
 export function normalizeThread(t) {
+  if (t?.ephemeral === true) return null;
   const title = String(t?.name || t?.preview || "").trim() || "(无标题)";
   return {
     id: String(t?.id || ""),

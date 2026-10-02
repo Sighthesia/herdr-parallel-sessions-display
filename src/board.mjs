@@ -790,7 +790,9 @@ async function fetchCodexSessions() {
 
     const take = (raw) => {
       const t = normalizeThread(raw);
-      if (!t.id || seen.has(t.id)) return;
+      // ephemeral 的 thread 直接跳过（normalizeThread 返回 null）—— 每建一次
+      // app-server 连接守护进程就造一个，不挡掉的话侧边栏会堆出一串「(无标题)」
+      if (!t || !t.id || seen.has(t.id)) return;
       const inMemory = loadedSet.has(t.id);
       // 两个证据都说「不在内存里」→ 历史遗留，不显示
       if (!inMemory && t.state === null) return;

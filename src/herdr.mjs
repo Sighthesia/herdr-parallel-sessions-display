@@ -422,23 +422,31 @@ export const MIRROR_SESSION_TOKEN = "oc_session";
 export const PARALLEL_TOKEN = "oc_par";
 
 /**
- * 多行版：每个并行 session 一个 token，各占侧边栏一行。
+ * 每个 session 一个 token，各占侧边栏一行（`$oc_sess1` … `$oc_sess6`）。
  *
- * 为什么必须一行一个 token：token 的值里**换行会被去掉**（实测
- * `"a\nb\nc"` 存下来是 `"abc"`），所以单个 token 无论塞什么都只能渲染成一行。
- * 想让 N 个 session 各占一行，只能用 N 个 token 分别放进 N 个 row。
+ * ## 为什么一行一个 token
  *
- * token 数量受两条限制夹击：
- *   · `ui.sidebar.agents.rows` 最多 16 行
- *   · 如果某一行**所有 token 都为空时 Herdr 不折叠该行**，那么每多一个 slot，
- *     每个 agent 行就多一行空白。所以 slot 数是「能显示几个」与「空白有多难看」
- *     的取舍，默认 4。
+ * token 的值里**换行会被去掉**（实测 `"a\nb\nc"` 存下来是 `"abc"`），所以单个
+ * token 无论塞什么都只能渲染成一行。想让 N 个 session 各占一行，只能用 N 个
+ * token 分别放进 N 个 row。
+ *
+ * ## 为什么官方 session 也在里面
+ *
+ * 只让插件管并行 session、官方那行用内置 `terminal_title_stripped` 的话，两种
+ * 格式混在一起读不出层级：内置行缩进 2 格且没有连接线，插件行顶格带 `│ └─`，
+ * 反而比它 supposed 的父节点更靠左。所以官方 session 也由插件写进来，**所有
+ * session 行同一格式**（官方那个用 `▸` 点出）。
+ *
+ * ## 槽位数量
+ *
+ * **已实测空的槽位不会渲染成空白行**，所以槽位可以放心加。`rows` 最多 16 行，
+ * 现在用 2 + 6 = 8 行，余量充足。要增减就同时改这里和 config.toml 的 `rows`。
  *
  * 侧边栏模板里对应写：
- *   rows = [["workspace"], ["state_icon","agent"], ["terminal_title_stripped"],
- *           ["$oc_par1"], ["$oc_par2"], ["$oc_par3"], ["$oc_par4"]]
+ *   rows = [["workspace"], ["state_icon","agent"],
+ *           ["$oc_sess1"], …, ["$oc_sess6"]]
  */
-export const PARALLEL_TOKENS = ["oc_par1", "oc_par2", "oc_par3", "oc_par4"];
+export const SESSION_TOKENS = ["oc_sess1", "oc_sess2", "oc_sess3", "oc_sess4", "oc_sess5", "oc_sess6"];
 
 /** 算一个 agent 是不是我们自己的镜像行。 */
 export function isMirrorRow(agent) {

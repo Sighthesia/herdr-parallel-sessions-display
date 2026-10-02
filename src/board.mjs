@@ -1074,9 +1074,12 @@ function stopFocusRedirect() {
  * ## 值格式与硬限制
  *
  * Herdr 对单个 token 值**硬截断在 80 字符**（实测请求 82 字符存下来是 80），
- * 而且换行会被去掉 —— 所以多个 session 只能挤在一行里，用 `·` 分隔。
- * 侧边栏本身也不宽，实际能看到的更少。宁可少而准：最多列 `PARALLEL_TITLE_COUNT`
- * 个标题，剩下的用「+N」收尾。
+ * 而且换行会被去掉 —— 所以一行只能放一个 session，多个必须各占一个 token /
+ * 一个 row。侧边栏本身也不宽，实际能看到的更少。
+ *
+ * **官方 session 也由这里写进 `$oc_sess*`**，不是用内置
+ * `terminal_title_stripped`。原因见 {@link formatParallelSlots}：内置那行拿不到
+ * 树形连接线、和插件行缩进不一致，两种格式混在一起读不出层级。
  *
  * ## 没有官方 agent 的目录
  *
@@ -1095,7 +1098,7 @@ async function publishInlineParallel(wanted, statesById) {
     (a) => !herdr.isMirrorRow(a) && a.agent && typeof a.agent_session?.source === "string",
   );
   if (official.length === 0) {
-    log("debug", "内联模式：当前没有官方 agent 行，无处挂载并行 session 信息");
+    log("debug", "内联模式：当前没有官方 agent 行，无处挂载 session 列表");
     return 0;
   }
 
@@ -1142,9 +1145,11 @@ async function publishInlineParallel(wanted, statesById) {
   // 随进程生死；board 重启后它空了，于是上一轮挂在别人工作区上的过期 token
   // 再也没人清，一直挂在侧边栏上（实测 session 都跑完了，oc_par 还显示着旧的
   // 「内行验证-B」）。以 agent.list 的实际值为准才幂等。
-  const tokens = herdr.PARALLEL_TOKENS;
-  // 单行版时代的残留 token，早已不在模板里，顺手清掉免得白占 metadata 配额
-  const legacyTokens = [herdr.PARALLEL_TOKEN];
+  const tokens = herdr.SESSION_TOKENS;
+  // 历史版本用过的 token 名，早已不在模板里，顺手清掉免得白占 metadata 配额：
+  //   oc_par    = 单行版（多个 session 用 · 挤在一行）
+  //   oc_par1..4 = 多行版但只放并行 session，官方那行还是内置 terminal_title
+  const legacyTokens = [herdr.PARALLEL_TOKEN, "oc_par1", "oc_par2", "oc_par3", "oc_par4"];
   const desired = new Map();
   for (const [workspaceId, infos] of byWorkspace) {
     const host = pickHost(workspaceId);
@@ -1155,7 +1160,18 @@ async function publishInlineParallel(wanted, statesById) {
       );
       continue;
     }
-    desired.set(str(host.pane_id), { agent: host, slots: formatParallelSlots(infos, statesById) });
+    // **官方 session 排第一**：它是用户 TUI 里正在用的那个，用 ▸ 点出来，
+    // 下面的并行 session 是「切走但还在跑」的。标题直接取官方行的终端标题，
+    // 不额外查 opencode —— 实测 `terminal_title_stripped` 就是那个 session 的标题。
+    const list = [
+      {
+        title: stripAgentPrefix(host.terminal_title_stripped || host.title || host.pane_id),
+        state: host.agent_status,
+        official: true,
+      },
+      ...infos.map((i) => ({ title: i.title, state: statesById.get(i.id) || "", official: false })),
+    ];
+    desired.set(str(host.pane_id), { agent: host, slots: formatParallelSlots(list) });
   }
 
   let attached = 0;
@@ -1281,7 +1297,36 @@ export function resolveInlineHostWorkspace(directory, index, official) {
 }
 
 /**
- * 把一组并行 session 拆成「每个一行」的值数组，每行带 ASCII 树形符号。
+ * 把一个工作区下的**全部** session（官方那个 + 所有并行的）拆成「每个一行」，
+ * 每行带 ASCII 树形符号。
+ *
+ * ## 为什么连官方 session 也由插件生成
+ *
+ * 一开始只让插件管并行的 session，官方那行用内置 `terminal_title_stripped`。
+ * 结果视觉上散架 —— 实测渲染：
+ *
+ * ```
+ * [1] afloat
+ * ◐ opencode
+ *   OC | 实现 Hover 菜单式 Mod 键 Window Hint     ← 内置行，缩进 2 格、无连接线
+ * │ └─ ● 排查 Shell 重载启动…                      ← 插件行，顶格
+ * ```
+ *
+ * `│ └─` 反而比它 supposed 的父节点更靠左，完全读不出层级：官方行拿不到连接线
+ * （`terminal_title_stripped` 是内置 token，内容不可改，`rules` 只能改样式），
+ * 而插件行又没法缩进（下面说）。
+ *
+ * 所以官方 session 也由插件写进 `$oc_sess*`，**所有 session 行同一格式**：
+ *
+ * ```
+ * [1] afloat
+ * ◐ opencode
+ * │ ├─ ○ 实现 Hover 菜单式 Mod 键 Window Hint     ← 官方 TUI 当前选中的
+ * │ ├─ ● 排查 Shell 重载启动初始化卡顿              ← 并行
+ * │ └─ ● Tray hover二级菜单点击收起…                ← 并行
+ * ```
+ *
+ * 模板里相应去掉 `terminal_title_stripped`，只留 `$oc_sess*`。
  *
  * ## 缩进为什么用 `│` 而不是空格
  *
@@ -1291,19 +1336,6 @@ export function resolveInlineHostWorkspace(directory, index, official) {
  * `│`（U+2502 box drawing）不是空白，不会被 trim；在等宽终端里和 `─` 同宽，
  * 正好当「子级的父级连接线」用 —— 这也是标准树状图的画法。
  *
- * 目标效果：
- *
- * ```
- * [1] afloat
- *   opencode
- *   OC | Tray hover二级菜单…          ← 官方行跑的 session（根）
- * │ ├─ ● 实现 Hover 菜单式…           ← 并行 session（子）
- * │ └─ ● 排查 Shell 重载启动…
- * ```
- *
- * 官方那一行拿不到连接线（`terminal_title_stripped` 是内置 token，内容不可改），
- * 所以它作为「根」、下面几行作为它的分支，靠 `│ ├─` / `│ └─` 读出层级。
- *
  * ## 不能塞进一个 token
  *
  * token 值里的换行会被去掉（实测 `"a\nb\nc"` 存下来是 `"abc"`），所以一行只能
@@ -1311,21 +1343,22 @@ export function resolveInlineHostWorkspace(directory, index, official) {
  *
  * ## 槽位不够时
  *
- * 超出 `herdr.PARALLEL_TOKENS` 长度时把多出来的折成最后一行末尾的「+N」——
+ * 超出 `herdr.SESSION_TOKENS` 长度时把多出来的折成最后一行末尾的「+N」——
  * 让人知道「还有几个」比静默丢掉强。**已实测空槽位不会渲染成空白行**，所以
  * 槽位可以放心多加。
+ *
+ * @param {Array<{title:string, official?:boolean}>} sessions 官方 session 排第一
  */
-export function formatParallelSlots(infos, statesById = new Map()) {
-  const slots = herdr.PARALLEL_TOKENS;
+export function formatParallelSlots(sessions) {
+  const slots = herdr.SESSION_TOKENS;
   const limit = config.parallelTokenMax;
   const trunk = config.parallelTrunk;
 
-  const marked = infos.map((i) => {
-    const st = statesById.get(i.id) || "";
+  const marked = (sessions || []).map((s) => {
+    const st = s.state || "";
     const mark =
       st === "working" ? "●" : st === "blocked" ? "▲" : st === "idle" ? "○" : st === "retry" ? "↻" : "·";
-    const t = store.truncate(store.sanitizeText(i.title || "(无标题)", 60), 60);
-    return { mark, title: t };
+    return { mark, title: store.truncate(store.sanitizeText(s.title || "(无标题)", 60), 60), official: s.official };
   });
   if (marked.length === 0) return slots.map(() => "");
 
@@ -1334,7 +1367,9 @@ export function formatParallelSlots(infos, statesById = new Map()) {
 
   for (let i = 0; i < shown; i += 1) {
     const lastLine = i === shown - 1 && marked.length <= slots.length;
-    out[i] = `${trunk} ${lastLine ? "└─" : "├─"} ${marked[i].mark} ${marked[i].title}`;
+    // 官方 session 是「当前 TUI 里正在用的那个」，用 ▸ 点出它，比状态图标更好认
+    const head = marked[i].official ? `▸ ${marked[i].mark}` : marked[i].mark;
+    out[i] = `${trunk} ${lastLine ? "└─" : "├─"} ${head} ${marked[i].title}`;
   }
 
   // 溢出：把多出来的折进最后一行末尾的「+N」
@@ -1345,6 +1380,22 @@ export function formatParallelSlots(infos, statesById = new Map()) {
     out[shown - 1] = last.length + tail.length <= limit ? last + tail : last.slice(0, Math.max(0, limit - tail.length)) + tail;
   }
   return out;
+}
+
+/**
+ * 去掉终端标题开头的 agent 标识前缀（`OC | `、`✻ │ ` 之类）。
+ *
+ * 官方 opencode TUI 会把窗口标题设成 `<标识> | <会话标题>`（用户那边是 `OC | `）。
+ * 在树状图里每一行都是 opencode，重复这个前缀既占宽度又没有信息量，所以砍掉。
+ * 只砍「短标识 + 竖线」这种明确的形状，不确定的原样保留。
+ */
+export function stripAgentPrefix(title) {
+  const s = String(title || "").trim();
+  const m = s.match(/^(\S{1,4})\s*[|｜]\s*/);
+  if (!m) return s || "(无标题)";
+  const rest = s.slice(m[0].length);
+  // 砍完几乎不剩东西就别砍了（那大概是标题本身就是这么写的）
+  return rest.length >= 3 ? rest : s;
 }
 
 /**

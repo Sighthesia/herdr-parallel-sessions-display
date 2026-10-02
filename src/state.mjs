@@ -51,7 +51,9 @@ export const CONFIG_DEFAULTS = Object.freeze({
   INLINE_ALWAYS_LIST: "true",
   // 单个 token 值的上限。Herdr 侧硬截断在 80 字符，插件先自己截好。
   PARALLEL_TOKEN_MAX: "78",
-  // 树状前缀里的父级竖线，默认空（用户反馈多余）。
+  // 会话行的连接符：bar=│▸ ● 标题（默认，整列对齐）/ tree=├─ ▸ 标题 / none=▸ 标题
+  PARALLEL_CONNECTOR: "bar",
+  // tree 模式下叠加在连接符之前的父级竖线，默认空。
   PARALLEL_TRUNK: "",
   // --- codex（SPEC 第 11 节）---
   CODEX_ENABLED: "true",

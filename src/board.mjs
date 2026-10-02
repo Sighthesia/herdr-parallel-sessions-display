@@ -65,9 +65,22 @@ const config = {
   // oc_par token 的值上限。实测 Herdr 对单个 token 值硬截断在 80 字符，
   // 插件自己先算好并用「+N」收尾，避免被拦腰截断在半句话上。
   parallelTokenMax: store.asInt(raw, "PARALLEL_TOKEN_MAX", 78, 8, 80),
-  // session 行树状前缀里的「父级竖线」。默认空 —— 用户反馈这条竖线是多余的。
-  // Herdr 会 trim 前导空白，所以想改成空格缩进是做不到的（传 "  └─ x" 存下来
-  // 是 "└─ x"）。要加回来就设成 "│" 或别的非空白字符。
+  // session 行开头的连接符。
+  //
+  //   bar（默认）= `│▸ ● 标题` / `│  ● 标题`  ← 一根竖线通到底，所有行的标记和
+  //               标题都落在同一列
+  //   tree        = `├─ ▸ 标题` / `└─ 标题`，前面再叠加 PARALLEL_TRUNK
+  //   none        = `▸ 标题` / `● 标题`，完全不加前缀
+  //
+  // 默认从 tree 改成 bar 的原因：`├─`/`└─` 是 2 格宽的连接符，和 Herdr 自己在
+  // agent 下面画的树状导轨叠在一起时对不齐；而所有行用同一根竖线，标记占位补齐
+  // 之后整列是齐的。
+  //
+  // 竖线只能画在 token 值里：Herdr 会 trim **前导**空白（传 `"  └─ x"` 存下来是
+  // `"└─ x"`），Unicode 空白（U+00A0、U+2000–200A、U+3000）同样会被 trim，所以
+  // 空格缩进根本存不住。竖线之后的补位空格是**中间**的空格，不受影响。
+  connector: store.asEnum(raw, "PARALLEL_CONNECTOR", ["bar", "tree", "none"], "bar"),
+  // tree 模式下叠加在连接符之前的父级竖线，默认空。
   parallelTrunk: store.asString(raw, "PARALLEL_TRUNK", ""),
   // 没有并行 session 时，官方 session 自己那一行还要不要写。
   // 默认要 —— 模板里已经没有 terminal_title_stripped 了，不写就等于官方标题消失。
@@ -1939,6 +1952,7 @@ export function formatParallelSlots(sessions) {
   const slots = herdr.SESSION_TOKENS;
   const limit = config.parallelTokenMax;
   const trunk = config.parallelTrunk;
+  const connector = config.connector;
 
   const marked = (sessions || []).map((s) => {
     const st = s.state || "";
@@ -1953,11 +1967,22 @@ export function formatParallelSlots(sessions) {
 
   for (let i = 0; i < shown; i += 1) {
     const lastLine = i === shown - 1 && marked.length <= slots.length;
+    const m = marked[i];
     // 官方 session 是「当前 TUI 里正在用的那个」，用 ▸ 点出它，比状态图标更好认
-    const head = marked[i].official ? `▸ ${marked[i].mark}` : marked[i].mark;
-    // trunk 为空时不要留下那个空格（Herdr 反正会 trim，但代码里就别制造）
-    const stem = trunk ? `${trunk} ` : "";
-    out[i] = `${stem}${lastLine ? "└─" : "├─"} ${head} ${marked[i].title}`;
+    let prefix;
+    if (connector === "none") {
+      prefix = m.official ? `▸ ${m.mark}` : m.mark;
+    } else if (connector === "tree") {
+      // trunk 为空时不要留下那个空格（Herdr 反正会 trim，但代码里就别制造）
+      const stem = trunk ? `${trunk} ` : "";
+      const head = m.official ? `▸ ${m.mark}` : m.mark;
+      prefix = `${stem}${lastLine ? "└─" : "├─"} ${head}`;
+    } else {
+      // bar：竖线 + **固定两格**的标记位。官方行 `▸ `、其余 `  `，补出来的空格是
+      // 中间的空格（不是前导），所以 Herdr 的 trim 不影响 —— 整列才能真对齐。
+      prefix = `│${m.official ? "▸ " : "  "}${m.mark}`;
+    }
+    out[i] = `${prefix} ${m.title}`;
   }
 
   // 溢出：把多出来的折进最后一行末尾的「+N」

@@ -94,12 +94,18 @@ const config = {
   // 2×4 点阵，是这里能做到的最接近形态。
   //
   // 动画要自己播：见 {@link startBusySpinner}。
-  busyFrames: store.asString(raw, "PARALLEL_BUSY_FRAMES", "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"),
+  busyFrames: store.asString(raw, "PARALLEL_BUSY_FRAMES", "●"),
   // 每帧多少毫秒。10 帧 × 150ms = 1.5s 一轮，比 opencode 的 1.2s 略慢，
   // 因为我们的重算周期比它粗（见 startBusySpinner 的取舍说明）。
   busyFrameMs: store.asInt(raw, "PARALLEL_BUSY_FRAME_MS", 150, 50, 5_000),
-  // 关掉就退回静态单帧（取序列第一个字符）。
-  busyAnimate: store.asBool(raw, "PARALLEL_BUSY_ANIMATE", true),
+  //
+  // **默认关。** 动画的代价是实测出来的，不是猜的：转轮期间约 12% 单核（无动画
+  // 5%），4 个忙行就是 27 次侧边栏重绘/秒，省不掉 —— 那部分开销在 Herdr 侧。
+  //
+  // 「实心圆 + 静帧」的观感损失很小：同一行的 state_icon 本来就在用 Herdr 自己的
+  // 点阵转轮，转起来的是那一行，不是我们这个标记。所以默认给一个安静的实心圆，
+  // 想看动画的人自己开。
+  busyAnimate: store.asBool(raw, "PARALLEL_BUSY_ANIMATE", false),
   // tree 模式下叠加在连接符之前的父级竖线，默认空。
   parallelTrunk: store.asString(raw, "PARALLEL_TRUNK", ""),
   // 没有并行 session 时，官方 session 自己那一行还要不要写。
@@ -161,25 +167,27 @@ const MIRROR_LABEL_MAX = 40;
 const BUSY_PLACEHOLDER = "\uE000";
 
 /**
- * 转轮帧序列。配置为空或全是空白时退回 Herdr 的默认序列。
+ * 转轮帧序列。
  *
- * 注意**单字符也要当序列用**（只转一帧，等于静态但仍走同一条渲染路径），
- * 所以 `PARALLEL_BUSY_FRAMES=●` 是合法的「换回实心圆」写法。
+ * **单字符也要当序列用**（只取一帧 = 静态，但走同一条渲染路径），所以默认的
+ * `PARALLEL_BUSY_FRAMES=●` 就是「实心圆、不转」—— 这正是默认状态。
+ *
+ * 想开动画就把这一项设成多字符（Herdr 自己的点阵转轮帧）**并且**打开
+ * `PARALLEL_BUSY_ANIMATE`：只写多字符而不开动画仍然是静帧（取第一个字符），
+ * 这样不会因为填了序列就意外把 12% 的 CPU 花出去。
  */
 function busyFrameList() {
-  const raw = String(config.busyFrames || "").trim();
-  if (!raw) return [...(config.__busyDefaultFrames ?? BUSY_FRAMES_DEFAULT)];
-  const chars = [...raw];
-  return chars.length > 0 ? chars : [...BUSY_FRAMES_DEFAULT];
+  const chars = [...String(config.busyFrames || "").trim()];
+  return chars.length > 0 ? chars : ["●"];
 }
 
-/** Herdr 0.9.3 `braille_spinner_working` 的帧序列。 */
+/** Herdr 0.9.3 `braille_spinner_working` 的帧序列，开动画时用这个。 */
 const BUSY_FRAMES_DEFAULT = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏";
 
-/** 当前该显示哪一帧。 */
+/** 当前该显示哪一帧。不转就永远是第一个。 */
 function busyGlyph() {
   const frames = busyFrameList();
-  if (!config.busyAnimate || frames.length <= 1) return frames[0] || "⠿";
+  if (!config.busyAnimate || frames.length <= 1) return frames[0] || "●";
   return frames[runtime.busyFrame % frames.length];
 }
 
@@ -205,8 +213,11 @@ function busyGlyph() {
  */
 function startBusySpinner() {
   if (runtime.busyTimer || !config.busyAnimate || runtime.shuttingDown) return;
-  const frames = busyFrameList();
-  if (frames.length <= 1) return;
+  // 只填了多字符序列、但序列其实没有可轮换的内容时不必起定时器
+  if (busyFrameList().length <= 1) return;
+  if (config.busyFrames === BUSY_FRAMES_DEFAULT) {
+    log("info", "运行中标记改用点阵转轮（CPU 约 12%，关掉：PARALLEL_BUSY_ANIMATE=false）");
+  }
   runtime.busyTimer = setInterval(() => void tickBusySpinner(), config.busyFrameMs);
   runtime.busyTimer.unref?.();
 }

@@ -533,31 +533,34 @@ hook 将来真跑起来时写的是同一个值。而不补报的后果是「因
 **A/B 实测**：同一个工作区开两个 codex pane，一个开着补报、一个关着。开着的那行
 `agent_session` 有值且挂上了树，关着的没有——确认是插件补的，不是官方 hook。
 
-### 12.9 运行中标记：盲文点阵转轮
+### 12.9 运行中标记：实心圆（点阵转轮保留但默认不启用）
 
-`working` 的标记会转起来，帧序列取 Herdr 自己的 `braille_spinner_working`
-（0.9.3 二进制里扫出：`⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏`；2.1.228 起 Herdr 改用半圆，盲文序列仍在）。
+`working` 的标记默认是**实心圆 `●`，静止**；点阵转轮实现保留但不启用。
 
-为什么是盲文：opencode v2 的运行指示器（`session-progress-indicator-v2.tsx`）是**点阵**
-风格 —— 5×5 共 25 个点，改 opacity 播对角波纹，中心点常亮，1200ms 一轮。侧边栏复现不了
-原样（token 静态文本、换行被去掉、值硬截断 80 字符、Herdr 不播动画，二维点阵画不进一行），
-而盲文每格本身就是 2×4 点阵，是最接近的形态。用同一套字符也让 session 标记和同一行的
-`state_icon` 属于同一种视觉语言。
+想开：两项都要设，只设序列仍是静帧（免得填了序列就意外花 CPU）——
+`PARALLEL_BUSY_FRAMES=⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏` + `PARALLEL_BUSY_ANIMATE=true`，可选
+`PARALLEL_BUSY_FRAME_MS` 调帧率。
 
-**动画必须自己播**：Herdr 只为它自己的 `state_icon` 播动画，自定义 token 拿不到，所以插件
-要周期性把下一帧写回去。
+为什么默认关：实测**转轮 12% 单核 vs 关闭 4%**，多花 8% 换来的观感提升有限 —— 同一行的
+`state_icon` 本来就在用 Herdr 自己的点阵转轮转着，**转起来的是那一行，不是我们这个标记**。
 
-实现上**单开 ticker，不把主重算循环跑快** —— 主 `reconcile` 一轮要拉 opencode 活跃集合、
-扫会话、扫 pane、查权限，为 150ms 的动画跑它会拖垮 Herdr 和 opencode。ticker 只在内存里
-换字：主循环渲染时把忙标记写成占位符 `\uE000` 并缓存这些行，ticker 到点把占位符换成下一帧
-写回去，不做任何查询。没有忙标记就停掉定时器，空闲期零开销。
+为什么默认不用点阵：opencode v2 的运行指示器（`session-progress-indicator-v2.tsx`）是
+5×5 共 25 个点的 SVG，改 opacity 播对角波纹，1200ms 一轮。侧边栏复现不了原样（token 静态
+文本、换行被去掉、值硬截断 80 字符、Herdr 不播动画），二维点阵画不进一行。
 
-写入走 `attachMetadataFast`（socket 上的 `pane.report_metadata`）而不是 CLI：`attachMetadata`
-每次都 spawn 一个 `herdr` 进程，实测一次 5ms，转轮 150ms 一帧 × N 个忙行就是每秒几十次
-spawn。不过实测只省了约 2%（14% → 12%），**瓶颈不在 spawn 而在 Herdr 每次 token 变化都要
-重绘侧边栏**。所以帧率必须可调：`PARALLEL_BUSY_FRAME_MS` 调大一倍开销大致减半。
+实现要点（保留这套代码的理由）：
 
-配置：`PARALLEL_BUSY_FRAMES`（单字符即静态）、`PARALLEL_BUSY_FRAME_MS`、`PARALLEL_BUSY_ANIMATE`。
+- **动画必须自己播**：Herdr 只为它自己的 `state_icon` 播动画，自定义 token 拿不到。
+- **单开 ticker，不把主重算循环跑快**：主 `reconcile` 一轮要拉 opencode 活跃集合、扫会话、
+  扫 pane、查权限，为 150ms 的动画跑它会拖垮两边。ticker 只在内存里换字 —— 主循环渲染时把
+  忙标记写成占位符 `\uE000` 并缓存这些行，ticker 到点换成下一帧写回去，不做任何查询；没有
+  忙标记就停掉定时器，空闲期零开销。用私用区字符当占位符是为了避免会话标题里恰好出现同一
+  个字符时被误替换。
+- **写入走 socket**（`attachMetadataFast` → `pane.report_metadata`）而非 CLI：原实现每次
+  都 spawn 一个 `herdr` 进程（一次约 5ms），150ms 一帧 × N 个忙行就是每秒几十次 spawn。
+- **但瓶颈不在 spawn**：为此实测只省 2%（14% → 12%），真正省不掉的是 Herdr 每次 token 变化
+  都要重绘侧边栏（4 个忙行 × 6.7 次/秒 ≈ 27 次/秒）。所以帧率必须可调，这是默认关它的
+  根本原因。
 
 ### 12.10 每个工作区只挑一个挂载点，但每行都要显示自己
 

@@ -169,8 +169,8 @@ command = "opencode.session-mirror.board"
 | `PARALLEL_TOKEN_MAX` | `78` | `oc_par` token 的值上限。Herdr 侧对单个 token 值硬截断在 80 字符 |
 | `PARALLEL_CONNECTOR` | `bar` | 会话行的连接符：`bar`（`│▸ ● 标题`，竖线通到底、整列对齐）/ `tree`（`├─ ▸ 标题`）/ `none`（`▸ 标题`） |
 | `PARALLEL_BUSY_FRAME_MS` | `150` | 转轮每帧多少毫秒。10 帧 × 150ms ≈ 1.5s 一轮 |
-| `PARALLEL_BUSY_ANIMATE` | `true` | 关掉就退回静态单帧（取序列第一个字符） |
-| `PARALLEL_BUSY_FRAMES` | `⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏` | 「正在跑」标记的**帧序列**（Herdr 自己的点阵转轮）。给单个字符如 `●` 即为静态 |
+| `PARALLEL_BUSY_ANIMATE` | `false` | **默认关**（实测要多花 8% 单核）。想看点阵转轮见下 |
+| `PARALLEL_BUSY_FRAMES` | `●` | 「正在跑」标记的**帧序列**。默认单字符 = 实心圆、静态 |
 | `PARALLEL_TRUNK` | 空 | session 行树状前缀里的父级竖线（`│`）。默认空 —— 想加回来设成 `│` 之类的非空白字符（空格存不住，Herdr 会 trim） |
 | `INLINE_ALWAYS_LIST` | `true` | 该 agent 的工作区里没有并行 session 时，**官方 session 自己那一行**还要不要写。模板里已经没有 `terminal_title_stripped` 了，关掉就等于官方标题消失 |
 | `REBALANCE_INTERVAL_MS` | `30000` | 常规重平衡巡检间隔。建行/回收时是即时的，这里只负责把别人（sidebar 插件、用户手动拖动）改乱的布局纠回来 |
@@ -253,29 +253,37 @@ rows = [
 `bar` 模式下官方行占 `▸ ` 两格、其余行用两个空格补位，所以所有行对齐。补出来的
 是**中间**的空格，不受 Herdr trim 前导空白的影响。
 
-### 「正在跑」的标记：盲文点阵转轮
+### 「正在跑」的标记：实心圆（点阵转轮保留但默认不启用）
 
-「运行中」那个标记会**转起来**，用的是 Herdr 自己的点阵转轮帧序列
-`⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏`（从 0.9.3 二进制里扫出来的 `braille_spinner_working`）。同一行的
-`state_icon` 此刻正在用这套字符转圈，我们的 session 标记用的是同一种视觉语言。
+默认是**实心圆 `●`，静止**。
 
-**为什么是盲文**：opencode v2 的运行指示器
+想让这个标记像 opencode v2 那样转起来是可以的（下面说怎么开），但**默认关**——实测转轮
+期间约 12% 单核、关掉 4%，多花的那 8% 换来的观感提升有限：同一行的 `state_icon` 本来就
+在用 Herdr 自己的点阵转轮（`⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏`），**转起来的是那一行，不是我们这个标记**。
+
+**为什么默认的实心圆不是点阵**：opencode v2 的运行指示器
 （[`session-progress-indicator-v2.tsx`](https://github.com/anomalyco/opencode/blob/1ddb0873aee50d209d1a8d7f91b89c5daf692d49/packages/session-ui/src/v2/components/session-progress-indicator-v2.tsx)）
-是**点阵**风格 —— 5×5 共 25 个点，靠改 opacity 播一道对角波纹。侧边栏复现不了原样：
-token 是静态文本、换行会被去掉、值硬截断 80 字符、Herdr 不会替我们播动画，那个二维点阵
-画不进一行。而盲文每个字符本身就是 2×4 的点阵，所以「一格点阵」是能做到的最接近形态。
+是 5×5 共 25 个点的点阵，靠改 opacity 播对角波纹。侧边栏复现不了原样：token 是静态文本、
+换行会被去掉、值硬截断 80 字符、Herdr 不会替我们播动画，那个二维点阵画不进一行。
 
-**动画是自己播的**：Herdr 只会为它自己的 `state_icon` 播动画，自定义 token 拿不到，所以
-插件得周期性地把下一帧写回去。为此单开了一个 ticker 而**没有**把主重算循环跑快 ——
-主循环一轮要做的事很重（拉活跃集合、扫会话、扫 pane、查权限），为了一次 150ms 的动画去
-跑它会把 Herdr 和 opencode 拖垮。ticker 只在内存里换字：主循环渲染完把带忙标记的行缓存
-下来（标记换成占位符），ticker 只负责把占位符换成下一帧写回去，不做任何查询。**没有忙
-标记时定时器直接停掉，空闲期零开销。**
+**想开点阵转轮**（两项都要设，只设序列仍然是静帧）：
 
-**开销**：转轮期间约 12% 单核（关掉是 5%）。瓶颈不在进程 spawn，而在 Herdr 每次 token
-变化都要重绘侧边栏 —— 4 个忙行 × 6.7 次/秒 ≈ 27 次/秒。所以帧率是可调的：
-`PARALLEL_BUSY_FRAME_MS` 调大到 300 就是 3s 一轮、开销减半。想彻底关掉动画：
-`PARALLEL_BUSY_ANIMATE=false`。想换回实心圆：`PARALLEL_BUSY_FRAMES=●`（单字符即静态）。
+```bash
+PARALLEL_BUSY_FRAMES=⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏
+PARALLEL_BUSY_ANIMATE=true
+PARALLEL_BUSY_FRAME_MS=300    # 3s 一轮，开销约减半
+```
+
+**动画怎么实现的**：Herdr 只会为它自己的 `state_icon` 播动画，自定义 token 拿不到，所以
+插件得周期性地把下一帧写回去。为此单开了一个 ticker 而**没有**把主重算循环跑快 —— 主循环
+一轮要做的事很重（拉活跃集合、扫会话、扫 pane、查权限），为了一次 150ms 的动画去跑它会
+把 Herdr 和 opencode 拖垮。ticker 只在内存里换字：主循环渲染完把带忙标记的行缓存下来
+（标记换成占位符），ticker 只负责把占位符换成下一帧写回去，不做任何查询。**没有忙标记时
+定时器直接停掉，空闲期零开销。**
+
+**开销实测**：12%（转轮）vs 4%（关闭）。瓶颈**不在**进程 spawn —— 为此专门加了走 socket
+的写入路径，只省了 2%（14% → 12%）；真正省不掉的是 Herdr 每次 token 变化都要重绘侧边栏，
+4 个忙行 × 6.7 次/秒 ≈ 27 次/秒。所以帧率必须可调，这就是默认关它的原因。
 
 官方那一行也由插件生成，是因为内置 `terminal_title_stripped` 拿不到树形连接线
 （内置 token 内容不可改，`rules` 只能改样式），两种格式混在一起会因为缩进不一致而

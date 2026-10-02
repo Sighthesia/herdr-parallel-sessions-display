@@ -195,6 +195,118 @@ export function socketCall(method, params = {}, { timeoutMs = DEFAULT_SOCKET_TIM
 }
 
 // ---------------------------------------------------------------------------
+// 事件订阅（长连接）
+// ---------------------------------------------------------------------------
+
+/**
+ * 订阅 `pane.focused`，用于「焦点落到镜像 pane 就转到该目录真正的前台 agent」。
+ *
+ * CLI 没有事件订阅的封装，`events.subscribe` 只能走裸 socket，所以这里维持一条
+ * 长连接。断了自动退避重连 —— Herdr 重启、socket 被清理、插件热重载都会断，
+ * 一次性调用撑不住。
+ *
+ * @param {{onFocus:(info:{paneId:string,workspaceId:string})=>void, onError?:(err:Error)=>void}} handlers
+ * @returns {{stop:()=>void}} stop 幂等
+ */
+export function subscribePaneFocused({ onFocus, onError } = {}) {
+  const endpoint = socketEndpoint();
+  let socket = null;
+  let stopped = false;
+  let retryMs = 1_000;
+  let reconnectTimer = null;
+  let buffer = "";
+
+  function scheduleReconnect() {
+    if (stopped) return;
+    reconnectTimer = setTimeout(() => {
+      retryMs = Math.min(retryMs * 2, 30_000);
+      open();
+    }, retryMs);
+    reconnectTimer.unref?.();
+  }
+
+  function open() {
+    if (stopped) return;
+    if (!endpoint) {
+      onError?.(new Error("HERDR_SOCKET_PATH 未设置，无法订阅 pane.focused"));
+      return;
+    }
+    buffer = "";
+    const subId = nextRequestId();
+    socket = net.createConnection(endpoint, () => {
+      retryMs = 1_000; // 连上就重置退避
+      socket.write(
+        `${JSON.stringify({
+          id: subId,
+          method: "events.subscribe",
+          params: { subscriptions: [{ type: "pane.focused" }] },
+        })}\n`,
+      );
+    });
+
+    socket.on("data", (chunk) => {
+      buffer += chunk.toString("utf8");
+      // 事件流是 newline-delimited；一次 data 可能带来多条，也可能半条
+      for (;;) {
+        const nl = buffer.indexOf("\n");
+        if (nl < 0) break;
+        const line = buffer.slice(0, nl);
+        buffer = buffer.slice(nl + 1);
+        if (!line.trim()) continue;
+        let msg;
+        try {
+          msg = JSON.parse(line);
+        } catch {
+          continue; // 心跳之类，认不出来就跳过
+        }
+        // 订阅应答：带 id 的是我们那条请求的回应。方法名或参数写错时服务端会
+        // 在这里回错误 —— 必须报出来，否则会安静地什么都不推。
+        if (msg && msg.id === subId) {
+          if (msg.error) onError?.(new Error(`events.subscribe 失败: ${msg.error.code || ""} ${msg.error.message || ""}`));
+          continue;
+        }
+        if (msg?.event !== "pane.focused") continue;
+        const paneId = String(msg?.data?.pane_id || "");
+        if (!paneId) continue;
+        try {
+          onFocus?.({ paneId, workspaceId: String(msg?.data?.workspace_id || "") });
+        } catch (err) {
+          onError?.(err);
+        }
+      }
+    });
+
+    socket.on("error", (err) => {
+      onError?.(err);
+      try {
+        socket?.destroy();
+      } catch {
+        /* ignore */
+      }
+      scheduleReconnect();
+    });
+    socket.on("close", () => scheduleReconnect());
+    socket.on("end", () => scheduleReconnect());
+  }
+
+  open();
+
+  return {
+    stop() {
+      stopped = true;
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+      try {
+        socket?.destroy();
+      } catch {
+        /* ignore */
+      }
+      socket = null;
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
 // 只读查询
 // ---------------------------------------------------------------------------
 
@@ -510,6 +622,90 @@ function truncateMessage(text) {
 
 /** 我们上报时用的 agent 标签。与官方集成同名，Agents 视图里看起来一致。 */
 export const AGENT_LABEL = "opencode";
+
+// ---------------------------------------------------------------------------
+// agent 聚焦
+// ---------------------------------------------------------------------------
+
+/**
+ * 聚焦一个 agent 行（会连带切到它所在的 workspace / tab）。
+ *
+ * 这是「点镜像行 → 落到同目录真正的前台 agent」的执行端：Herdr 侧边栏的点击
+ * 行为我们改不了（见 SPEC 7.3），只能在焦点真的落到镜像 pane 上之后，由本插件
+ * 把焦点转走。
+ */
+export function agentFocus(target) {
+  return cli(["agent", "focus", String(target || "")]);
+}
+
+/**
+ * 找一个工作区里「真正的前台 agent」——也就是 Herdr 自己侦测到、且**不是**我们
+ * 上报的 agent 行。
+ *
+ * 这是镜像行点击重定向的落点。挑不出就返回 null（调用方保持原样，让用户看到
+ * 只读卡片 —— 总比弹到一个不对的 pane 好）。
+ *
+ * ## 为什么有 avoidTabIds
+ *
+ * 官方 opencode 有可能**就开在 `oc-sessions` 标签页里**（那是镜像 pane 被官方
+ * 集成接管后的遗留，实测出现过）。如果不做排除，点镜像行会跳到同一个镜像标签页
+ * 里的另一个 pane —— 视觉上根本没离开 oc-sessions，用户的意图（去这个目录干活）
+ * 没有被满足。所以给这些标签页里的候选加一份**重罚**，让用户自己标签页里的 agent
+ * 优先；用户标签页里一个都没有时，重罚不影响「有总比没有强」。
+ *
+ * ## 排序规则
+ *
+ * 先看标签页（在用户标签页里 = 0 分，在 oc-sessions 里 = 10 分），再看状态：
+ * 当前聚焦的优先，其次真正在忙的（working → blocked），再是 idle / done，
+ * 最后按 pane_id 稳定排序兜底。只用稳定键排序，避免落点乱跳。
+ *
+ * @param {string} workspaceId
+ * @param {string} excludePaneId 焦点当前所在的 pane（就是那个镜像 pane）
+ * @param {{avoidTabIds?: Set<string>|string[]}} [options] 这些标签页里的候选降权
+ * @returns {Promise<string|null>} 目标 pane_id
+ */
+export async function findForegroundAgentPane(workspaceId, excludePaneId = "", options = {}) {
+  const ws = String(workspaceId || "");
+  if (!ws) return null;
+
+  const res = await cli(["agent", "list"]);
+  const list = resultOf(res)?.agents;
+  if (!Array.isArray(list)) return null;
+
+  const avoid = new Set(Array.isArray(options.avoidTabIds) ? options.avoidTabIds : options.avoidTabIds || []);
+
+  const usable = list.filter((a) => {
+    if (String(a?.workspace_id || "") !== ws) return false;
+    if (excludePaneId && String(a?.pane_id || "") === String(excludePaneId)) return false;
+    if (!a?.agent) return false;
+    if (isMirrorRow(a)) return false;
+    // 别的 source 上报的才算「Herdr 侦测到的前台 agent」
+    const src = a?.agent_session?.source;
+    if (typeof src === "string" && src.length > 0 && src === ownSource()) return false;
+    return true;
+  });
+  if (usable.length === 0) return null;
+
+  const rank = (a) => {
+    // 落在 oc-sessions 里的候选重罚：跳过去等于没离开镜像标签页
+    const tabPenalty = avoid.size > 0 && avoid.has(String(a?.tab_id || "")) ? 10 : 0;
+    if (a.focused) return tabPenalty;
+    switch (a.agent_status) {
+      case "working":
+        return tabPenalty + 1;
+      case "blocked":
+        return tabPenalty + 2;
+      case "idle":
+        return tabPenalty + 3;
+      case "done":
+        return tabPenalty + 4;
+      default:
+        return tabPenalty + 5;
+    }
+  };
+  usable.sort((a, b) => rank(a) - rank(b) || String(a.pane_id).localeCompare(String(b.pane_id)));
+  return String(usable[0].pane_id);
+}
 
 // ---------------------------------------------------------------------------
 // agent.view —— 全局副作用，只有 socket API，必须显式开关

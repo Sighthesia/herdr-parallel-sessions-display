@@ -54,6 +54,9 @@ const config = {
   paneRatio: store.asFloat(raw, "MIRROR_PANE_RATIO", 0.5, 0.02, 0.98),
   paneDirection: store.asEnum(raw, "MIRROR_PANE_DIRECTION", ["down", "right"], "down"),
   rebalanceIntervalMs: store.asInt(raw, "REBALANCE_INTERVAL_MS", 30_000, 5_000, 600_000),
+  // 焦点落到镜像 pane 时，转到同目录真正的前台 agent（见 SPEC 7.3）
+  focusRedirect: store.asBool(raw, "FOCUS_REDIRECT", true),
+  focusRedirectCooldownMs: store.asInt(raw, "FOCUS_REDIRECT_COOLDOWN_MS", 2_500, 0, 60_000),
   sessionLimit: store.asInt(raw, "SESSION_LIST_LIMIT", 200, 10, 2_000),
   sessionPages: store.asInt(raw, "SESSION_PAGE_LIMIT", 8, 1, 50),
   retryDetection: store.asBool(raw, "RETRY_DETECTION", true),
@@ -135,6 +138,12 @@ const runtime = {
   balancedThisPass: false,
   /** 上次常规重平衡的时间戳，用来节流 `maybeRebalanceAll`。 */
   lastRebalanceAt: 0,
+  /** `pane.focused` 订阅句柄。 */
+  focusSub: null,
+  /** 镜像 pane id -> 上次重定向的时刻，用来防抖。 */
+  focusCooldown: new Map(),
+  /** 重定向进行中。防止 agent focus 触发的回焦事件再次进入处理。 */
+  focusRedirecting: false,
   /** pane 全量列表的索引（目录 → workspace 解析、认领标签页、孤儿回收都要用），带 TTL 缓存。 */
   paneIndex: null,
   shuttingDown: false,
@@ -322,6 +331,8 @@ async function modePane() {
   installSignalHandlers();
   await reconcile("启动"); // 先把 client 建起来，reconcile 内部会顺带开 SSE
 
+  startFocusRedirect();
+
   runtime.timers.push(
     setInterval(() => {
       void drainRequestFlags();
@@ -355,6 +366,7 @@ function installSignalHandlers() {
       runtime.shuttingDown = true;
       log("info", `收到 ${signal}，退出管理器（镜像行保留，下次启动会恢复）`);
       for (const timer of runtime.timers) clearInterval(timer);
+      stopFocusRedirect();
       void (async () => {
         persistState();
         await releaseBoardLock();
@@ -903,6 +915,105 @@ function isPaneNotFound(error) {
   const code = error?.error?.code ?? error?.code;
   const msg = String(error?.error?.message ?? error?.message ?? "");
   return code === "pane_not_found" || /pane .* not found/i.test(msg);
+}
+
+/**
+ * 焦点落到镜像 pane 上 → 转到该目录真正的前台 agent。
+ *
+ * ## 为什么需要它
+ *
+ * Herdr 的侧边栏行点击行为**没有任何 per-row 开关**（SPEC 7.3 有完整核查记录）：
+ * `agent.view.set` 只有 filter/sort/label，`AgentInfo` 里唯一相关的
+ * `interactive_ready` 在 0.9.3 根本不返回，config 也没有相关项，插件 v1 更是
+ * 明确排除非终端 UI。所以「让镜像行不可点击」在 Herdr 上做不到。
+ *
+ * 退而求其次的做法是让跳转**落到有用的地方**：镜像行是只读的（里面不跑
+ * opencode），点进去只能看一张说明卡；用户的真实意图通常是「我要去这个目录
+ * 干活」，那就该落在那个目录真正在对话的 TUI 上。
+ *
+ * ## 为什么不选别的做法
+ *
+ * 「把焦点转走」比「每次重建后按官方行排序 / 让只读卡片做得更醒目」都更贴近
+ * 用户动作：用户点的那一行消失在意料之外，落点却在意料之中。同一个 workspace
+ * 内部切换，用户几乎察觉不到中间过程。
+ *
+ * ## 副作用（必须让用户知道）
+ *
+ * 「焦点落在镜像 pane」不只由点侧边栏行产生。按 `prefix+alt+N` 切工作区时 Herdr
+ * 会恢复该工作区上次聚焦的 pane —— 如果那正好是镜像 pane，同样会被弹走。
+ * 多数情况下这是合心意的（用户去这个工作区就是为了干活），但如果你就是想去
+ * `oc-sessions` 标签页看看，会被弹回来，需要点一次官方行。
+ * `FOCUS_REDIRECT=false` 可以完全关掉这个行为。
+ *
+ * @param {{paneId:string,workspaceId:string}} info `pane.focused` 事件
+ */
+async function handlePaneFocused(info) {
+  if (!config.focusRedirect || runtime.shuttingDown) return;
+  // agent focus 自身也会触发 pane.focused，挡掉重入
+  if (runtime.focusRedirecting) return;
+
+  const paneId = str(info?.paneId);
+  const workspaceId = str(info?.workspaceId);
+  if (!paneId) return;
+
+  const index = await paneIndex();
+  const pane = (index.panes || []).find((p) => str(p?.pane_id) === paneId);
+  // 焦点落在镜像 pane 上 —— 这才是我们要拦的情况
+  if (!pane || !herdr.isMirrorPane(pane)) return;
+
+  const now = Date.now();
+  const last = Number(runtime.focusCooldown.get(paneId) || 0);
+  if (now - last < config.focusRedirectCooldownMs) return;
+  runtime.focusCooldown.set(paneId, now);
+
+  // 同目录有没有真正的前台 agent？没有就保持原样，让用户看到只读卡片 ——
+  // 弹到一个不对的 pane 比不弹更糟。
+  // 落点优先挑**用户自己标签页**里的 agent：官方 opencode 有可能就开在
+  // oc-sessions 里（镜像 pane 被接管后的遗留），跳过去等于没离开镜像标签页。
+  const avoidTabIds = new Set(
+    Object.values(runtime.state.mirrors || {})
+      .map((m) => str(m?.tabId))
+      .filter(Boolean),
+  );
+  if (str(runtime.state.central?.tabId)) avoidTabIds.add(str(runtime.state.central.tabId));
+
+  const target = await herdr.findForegroundAgentPane(workspaceId, paneId, { avoidTabIds });
+  if (!target) {
+    log("debug", `镜像行 ${paneId} 获得焦点，但工作区 ${workspaceId} 没有前台 agent，保持原样`);
+    return;
+  }
+
+  runtime.focusRedirecting = true;
+  try {
+    const res = await herdr.agentFocus(target);
+    if (res?.ok === false) log("debug", `focus 重定向 ${paneId} → ${target} 失败：${res.error || ""}`);
+    else log("info", `镜像行 ${paneId} 获得焦点 → 转到前台 agent ${target}`);
+  } catch (err) {
+    log("debug", `focus 重定向异常：${err?.message || err}`);
+  } finally {
+    // 留一点窗口把回焦事件挡掉，再放行下一次
+    setTimeout(() => {
+      runtime.focusRedirecting = false;
+    }, 400).unref?.();
+  }
+}
+
+/** 启动焦点重定向订阅。只在常驻模式有意义。 */
+function startFocusRedirect() {
+  if (!config.focusRedirect || runtime.focusSub) return;
+  runtime.focusSub = herdr.subscribePaneFocused({
+    onFocus: (info) => {
+      void handlePaneFocused(info).catch((err) => log("debug", `focus 重定向出错: ${err?.message || err}`));
+    },
+    onError: (err) => log("debug", `pane.focused 订阅异常: ${err?.message || err}`),
+  });
+  log("info", "已订阅 pane.focused（镜像行获得焦点时转到同目录前台 agent）");
+}
+
+function stopFocusRedirect() {
+  runtime.focusSub?.stop();
+  runtime.focusSub = null;
+  runtime.focusCooldown.clear();
 }
 
 /** 是不是「连接层」错误 —— 只有这类才值得丢掉 client 重新发现。 */function isTransportError(err) {

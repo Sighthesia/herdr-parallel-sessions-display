@@ -163,6 +163,8 @@ command = "opencode.session-mirror.board"
 | `MIRROR_PANE_RATIO` | `0.5` | 初始切分比例，建完立刻被重平衡覆盖 |
 | `MIRROR_PANE_DIRECTION` | `down` | 排列方向 `down` / `right` |
 | `REBALANCE_INTERVAL_MS` | `30000` | 常规重平衡巡检间隔。建行/回收时是即时的，这里只负责把别人（sidebar 插件、用户手动拖动）改乱的布局纠回来 |
+| `FOCUS_REDIRECT` | `true` | 焦点落到镜像行时，自动转到同目录真正的前台 agent，见下 |
+| `FOCUS_REDIRECT_COOLDOWN_MS` | `2500` | 同一个镜像行的重定向冷却，防抖 |
 | `SESSION_LIST_LIMIT` | `200` | 每页拉多少条会话 |
 | `SESSION_PAGE_LIMIT` | `8` | 最多翻几页找活跃 session |
 | `RETRY_DETECTION` | `true` | 是否探测「正在重试」状态（v2 下每 session 多一次请求） |
@@ -190,7 +192,27 @@ command = "opencode.session-mirror.board"
 想在某个镜像位置直接和 session 对话，手动敲 `opencode --session <id>` 即可：那一行会
 变成官方行，插件检测到标记丢失后主动让出，不会打架。
 
-### 关于 `INSTALL_AGENT_VIEW`
+### 关于 `FOCUS_REDIRECT`（点镜像行会发生什么）
+
+Herdr 的侧边栏**没有「某行不可点击」的开关**。`agent.view.set` 只有 filter / sort /
+label；`AgentInfo` 里唯一相关的 `interactive_ready` 在 0.9.3 根本不返回；config 里
+没有相关项；插件 v1 明确排除非终端 UI。所以镜像行只能保持可点击。
+
+`FOCUS_REDIRECT=true`（默认）时的行为是：**焦点一旦落到镜像 pane，就立刻转到该目录
+真正的前台 agent**——也就是 Herdr 自己侦测到、且不是我们上报的那一行。落点规则：
+
+1. 先排除 `oc-sessions` 标签页里的候选。官方 opencode 有可能就开在这个标签页里
+   （镜像 pane 被官方集成接管后的遗留），跳过去等于没离开镜像标签页。
+2. 在用户自己的标签页里，优先当前聚焦的，其次 `working` → `blocked` → `idle` → `done`。
+3. 该工作区一个官方 agent 都没有时（例如 `Sessions` 兜底工作区）**不跳转**，保留原来
+   的只读卡片——弹到一个不对的 pane 比不弹更糟。
+
+**副作用要知道**：焦点落在镜像 pane 上不只由点侧边栏行产生。按 `prefix+alt+N` 切工作区
+时 Herdr 会恢复该工作区上次聚焦的 pane，如果那正好是镜像 pane，同样会被弹走。多数
+情况下这是合心意的（你去这个工作区就是为了干活），但如果你就是想去 `oc-sessions` 标签页
+看看，会被弹回来，需要再点一次官方行。设 `FOCUS_REDIRECT=false` 可完全关掉。
+
+
 
 `agent.view.set` 是**全局**设置，会影响整个 Agents 侧边栏的所有 agent，不只是镜像行。
 所以默认关闭。打开后：

@@ -167,6 +167,8 @@ command = "opencode.session-mirror.board"
 | `MIRROR_PANE_DIRECTION` | `down` | 排列方向 `down` / `right` |
 | `MIRROR_INLINE` | `true` | **内联模式**：完全不建镜像 pane / `oc-sessions` 标签页，见下。`false` = 回到「每个 session 一个镜像行」的旧模型 |
 | `PARALLEL_TOKEN_MAX` | `78` | `oc_par` token 的值上限。Herdr 侧对单个 token 值硬截断在 80 字符 |
+| `PARALLEL_CONNECTOR` | `bar` | 会话行的连接符：`bar`（`│▸ ● 标题`，竖线通到底、整列对齐）/ `tree`（`├─ ▸ 标题`）/ `none`（`▸ 标题`） |
+| `PARALLEL_BUSY_MARK` | `⠿` | 「正在跑」那个标记。默认盲文点阵，对齐 opencode v2 的点阵指示器（见下）。换回实心圆设成 `●` |
 | `PARALLEL_TRUNK` | 空 | session 行树状前缀里的父级竖线（`│`）。默认空 —— 想加回来设成 `│` 之类的非空白字符（空格存不住，Herdr 会 trim） |
 | `INLINE_ALWAYS_LIST` | `true` | 该 agent 的工作区里没有并行 session 时，**官方 session 自己那一行**还要不要写。模板里已经没有 `terminal_title_stripped` 了，关掉就等于官方标题消失 |
 | `REBALANCE_INTERVAL_MS` | `30000` | 常规重平衡巡检间隔。建行/回收时是即时的，这里只负责把别人（sidebar 插件、用户手动拖动）改乱的布局纠回来 |
@@ -248,6 +250,24 @@ rows = [
 
 `bar` 模式下官方行占 `▸ ` 两格、其余行用两个空格补位，所以所有行对齐。补出来的
 是**中间**的空格，不受 Herdr trim 前导空白的影响。
+
+### 「正在跑」的标记为什么是盲文点阵
+
+默认用 `⠿`（一格 8 点全亮的盲文），不是实心圆 `●`。
+
+opencode v2 的运行指示器是**点阵**风格 ——
+[`session-progress-indicator-v2.tsx`](https://github.com/anomalyco/opencode/blob/1ddb0873aee50d209d1a8d7f91b89c5daf692d49/packages/session-ui/src/v2/components/session-progress-indicator-v2.tsx)
+里是 5×5 共 25 个点，靠改 opacity 播放一道对角波纹（中心点常亮，1200ms 一轮）。
+
+**侧边栏里复现不了原样**：Herdr 的 token 是静态文本 —— 值里的换行会被去掉、单个值硬
+截断 80 字符、Herdr 不会替我们播放动画。那个二维点阵没法画在一行里，只能压成一个字符。
+
+选盲文而不是随手找个符号，是因为**盲文每个字符本身就是 2×4 的点阵**，所以「一格点阵」
+是这里能做到的最接近的形态。而且它和 Herdr 自己的 busy spinner 是同一族：从 0.9.3 的
+二进制里挖出来，那个转轮的帧序列是 `⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏` —— 同一行的 `state_icon`
+此刻正在用同一套点阵转圈，这里再点一次是同语言，不是两套风格打架。
+
+想换回实心圆：`PARALLEL_BUSY_MARK=●`。
 
 官方那一行也由插件生成，是因为内置 `terminal_title_stripped` 拿不到树形连接线
 （内置 token 内容不可改，`rules` 只能改样式），两种格式混在一起会因为缩进不一致而

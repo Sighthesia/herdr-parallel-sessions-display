@@ -80,6 +80,24 @@ const config = {
   // `"└─ x"`），Unicode 空白（U+00A0、U+2000–200A、U+3000）同样会被 trim，所以
   // 空格缩进根本存不住。竖线之后的补位空格是**中间**的空格，不受影响。
   connector: store.asEnum(raw, "PARALLEL_CONNECTOR", ["bar", "tree", "none"], "bar"),
+  // 「正在跑」那个标记。
+  //
+  // 默认用盲文点阵 `⠿`（8 点全亮的一格）而不是实心圆 `●`，因为 opencode v2 的
+  // 运行指示器就是**点阵**风格：
+  //   packages/session-ui/src/v2/components/session-progress-indicator-v2.tsx
+  // 那是 5×5 共 25 个点的 SVG，靠改 opacity 播放一道对角波纹（中心点常亮）。
+  //
+  // **但侧边栏里复现不了**：Herdr 的 token 是静态文本 —— 值里的换行会被去掉，
+  // 单个值硬截断 80 字符，Herdr 不会替我们播放动画。所以 5×5 的二维点阵没法
+  // 在一行里画出来，只能压成一个字符。
+  //
+  // 盲文这一格（U+28FF）每个字符本身就是 2×4 的点阵，所以「一格点阵」是这里
+  // 能做到的最接近的形态；而且和 Herdr 自己那个 busy spinner 是同一族 ——
+  // 从二进制里挖出来它的帧序列是 `⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏`，也就是说同一行的
+  // `state_icon` 此刻正在用同一套点阵转圈，这里再点一次是同语言。
+  //
+  // 想要动画就把它改成转轮的某一帧序列里的一格；想换回实心圆设成 "●"。
+  busyMark: store.asString(raw, "PARALLEL_BUSY_MARK", "⠿") || "⠿",
   // tree 模式下叠加在连接符之前的父级竖线，默认空。
   parallelTrunk: store.asString(raw, "PARALLEL_TRUNK", ""),
   // 没有并行 session 时，官方 session 自己那一行还要不要写。
@@ -1677,7 +1695,7 @@ async function publishInlineSessions(providers) {
       desired.set(paneId, { agent: host, slots: formatParallelSlots(list) });
 
       // 同一工作区里**其它**同 agent 官方行：不挂这个目录的会话树（挂载点唯一，
-      // 见 SPEC 12.9），但必须让它们显示自己那一个 session。
+      // 见 SPEC 12.10），但必须让它们显示自己那一个 session。
       //
       // 不写的话，下面那个写/清循环会把它们判成「本轮不需要」→ 清空全部槽位；
       // 而模板里已经没有 terminal_title_stripped 了，于是**那一行渲染成空白**，
@@ -1957,7 +1975,15 @@ export function formatParallelSlots(sessions) {
   const marked = (sessions || []).map((s) => {
     const st = s.state || "";
     const mark =
-      st === "working" ? "●" : st === "blocked" ? "▲" : st === "idle" ? "○" : st === "retry" ? "↻" : "·";
+      st === "working"
+        ? config.busyMark
+        : st === "blocked"
+          ? "▲"
+          : st === "idle"
+            ? "○"
+            : st === "retry"
+              ? "↻"
+              : "·";
     return { mark, title: store.truncate(store.sanitizeText(s.title || "(无标题)", 60), 60), official: s.official };
   });
   if (marked.length === 0) return slots.map(() => "");

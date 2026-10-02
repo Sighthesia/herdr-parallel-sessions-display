@@ -100,6 +100,11 @@ const config = {
   // 守护进程在**同一个 app-server 上**（用户自己在跑 codex），连接不该长时间挂着
   // 不放，否则 codex 重启时要等我们的 socket 断开才起得来。
   codexTimeoutMs: store.asInt(raw, "CODEX_TIMEOUT_MS", 8_000, 500, 60_000),
+  // 官方行没有 agent_session 时，插件要不要自己补报一次身份（见 herdr.mjs 的
+  // reportBuiltinAgentSession）。默认开 —— 不补的话 codex 在 TUI 刚启动、
+  // 还没跑过一轮对话时完全不可见，而这个插件的全部价值就是「显示正在跑的会话」。
+  // 设成 false 回到纯被动：只显示官方集成已经报上来的，绝不代替它写。
+  codexAdoptSession: store.asBool(raw, "CODEX_ADOPT_SESSION", true),
   logLevel: store.asEnum(raw, "LOG_LEVEL", ["debug", "info", "warn", "error", "silent"], "info"),
 };
 
@@ -192,6 +197,14 @@ const runtime = {
     lastError: "",
     /** 「采到会话但没有对应官方行」的前置条件提示是否已经 info 说过一次。 */
     missingRowsHinted: "",
+    /**
+     * 我们补报过的会话：pane_id -> thread id。
+     *
+     * 用来避免每 5 秒重复上报一次（上报会推高 seq，白白消耗 herdr 的序号空间）。
+     * 只在行**丢了** agent_session 时才需要重来，所以进程内记账就够了 ——
+     * board 重启后那行要么已经有 agent_session（跳过），要么确实需要补报。
+     */
+    adopted: new Map(),
   },
   timers: [],
   /** 一轮重算里已经重平衡过没有。回收一批行时不必每个都重算一次布局。 */
@@ -798,7 +811,12 @@ async function fetchCodexSessions() {
       if (!inMemory && t.state === null) return;
       // 只有一条证据说「在内存里」时以它为准（双保险的另一半）
       seen.add(t.id);
-      wanted.push({ id: t.id, title: t.title, directory: t.directory });
+      wanted.push({
+        id: t.id,
+        title: t.title,
+        directory: t.directory,
+        updatedAt: t.updatedAt || 0,
+      });
       statesById.set(t.id, t.state || "idle");
     };
 
@@ -831,6 +849,84 @@ async function fetchCodexSessions() {
     if (err instanceof CodexError) log("debug", `codex 请求失败：${err.message}`);
     return { ok: false, reason: err?.message || String(err) };
   }
+}
+
+/**
+ * 为「有 codex 官方行、但还没有 agent_session」的行补报一次会话身份。
+ *
+ * ## 为什么需要这一步
+ *
+ * 内联模式靠 `pane.report_metadata --applies-to-source` 往官方行上挂 token，
+ * 而那个参数要求**目标 source 已经在该 pane 上有记录**。没有记录时写完立刻
+ * 消失（实测 `tokens` 变 null）。而 codex 这边会真的缺：Codex 0.160 的
+ * `SessionStart` hook **在 TUI 启动时不触发**，官方行就一直空着
+ * `agent_session` —— 于是 codex 会话一条都显示不出来。
+ *
+ * 写进去的 thread id 是从 codex 自己的 app-server 读出来的真值，官方 hook
+ * 将来真跑起来时写的是同一个值。关掉：`CODEX_ADOPT_SESSION=false`。
+ *
+ * ## 挑哪个会话当「官方那个」
+ *
+ * 用官方行的 `foreground_cwd` 精确匹配会话的 `cwd`（pane 里跑着 codex TUI，
+ * 前台进程的 cwd 就是这个 pane 在跑的那个会话的目录）。同目录有多个时：
+ * 已补报过的那个仍然有效就继续用它 → 否则优先正在跑的 → 再否则取最近动过的。
+ *
+ * @param {object[]} wanted 本轮采集到的 codex 会话
+ * @param {Map<string,string>} statesById 会话 id -> 展示用状态（挑「正在跑的」时用）
+ * @returns {Promise<number>} 补报成功的行数
+ */
+async function adoptCodexSessions(wanted, statesById) {
+  if (!config.codexAdoptSession) return 0;
+
+  const rows = await herdr
+    .agentList()
+    .then((agents) =>
+      agents.filter((a) => a.agent === "codex" && !a.agent_session?.value).map((a) => ({
+        paneId: str(a.pane_id),
+        dir: normalizeDir(a.foreground_cwd || a.cwd),
+      })),
+    );
+  if (rows.length === 0) return 0;
+
+  let adopted = 0;
+  for (const row of rows) {
+    if (!row.paneId || !row.dir) continue;
+    const candidates = wanted
+      .filter((w) => normalizeDir(w.directory) === row.dir)
+      .sort((a, b) => {
+        const alreadyA = runtime.codex.adopted.get(row.paneId) === a.id ? 0 : 1;
+        const alreadyB = runtime.codex.adopted.get(row.paneId) === b.id ? 0 : 1;
+        if (alreadyA !== alreadyB) return alreadyA - alreadyB;
+        const runningA = statesById.get(a.id) === "working" ? 0 : 1;
+        const runningB = statesById.get(b.id) === "working" ? 0 : 1;
+        if (runningA !== runningB) return runningA - runningB;
+        return (b.updatedAt || 0) - (a.updatedAt || 0);
+      });
+    if (candidates.length === 0) continue;
+
+    const pick = candidates[0];
+    if (runtime.codex.adopted.get(row.paneId) === pick.id) continue;
+
+    const res = await herdr.reportBuiltinAgentSession({
+      paneId: row.paneId,
+      agent: "codex",
+      sessionId: pick.id,
+      seq: nextSeq(),
+    });
+    if (res.ok) {
+      runtime.codex.adopted.set(row.paneId, pick.id);
+      adopted += 1;
+      log(
+        "info",
+        `已为 ${row.paneId}（${row.dir}）补报 codex 会话身份 ${shortId(pick.id)}` +
+          `「${pick.title.slice(0, 24)}」—— 该行的 SessionStart hook 尚未上报` +
+          `（CODEX_ADOPT_SESSION=false 可关闭此行为）`,
+      );
+    } else {
+      log("warn", `为 ${row.paneId} 补报 codex 会话身份失败：${res.error || res.stderr}`);
+    }
+  }
+  return adopted;
 }
 
 // ---------------------------------------------------------------------------
@@ -1101,6 +1197,9 @@ async function applySessionState({ client, roots, activeStates, polledPermission
   // 根本不经过 publishInlineSessions，没必要为此去连 codex 的守护进程。
   if (config.mirrorInline) {
     const codex = await fetchCodexSessions();
+    // 补报必须在挂载**之前**：--applies-to-source 要求目标 source 在该 pane 上
+    // 已有记录，而官方行的 agent_session 缺失时挂上去会立刻消失。
+    if (codex.ok) await adoptCodexSessions(codex.wanted, codex.statesById);
     const attached = await publishInlineSessions([
       { agent: "opencode", wanted, statesById: parallelStates },
       {

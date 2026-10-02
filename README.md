@@ -183,6 +183,7 @@ command = "opencode.session-mirror.board"
 | `CODEX_SOURCE_KINDS` | 空 | 留空 = 内置 `cli,exec,appServer,vscode`（排除法滤掉子 agent）。**不要只填 `cli`**，实测会把 vscode 源的会话全滤掉且不报错 |
 | `CODEX_SESSION_LIMIT` | `100` | 每页拉多少条 thread |
 | `CODEX_TIMEOUT_MS` | `8000` | 单次 app-server 请求超时 |
+| `CODEX_ADOPT_SESSION` | `true` | 官方行没有 `agent_session` 时，由插件以 `herdr:codex` 的身份补报一次（读的是 codex 自己的 app-server，写的是真实 thread id）。**不补的话 codex 在 TUI 刚启动、还没跑过一轮对话时完全不可见**，见下 |
 
 改完 `.env` 需要重启看板面板（关掉标签页再打开）才生效。
 
@@ -301,9 +302,32 @@ herdr integration status        # 确认 codex: current
 滤掉子 agent）。**不要只填 `cli`** —— 实测会把 vscode 源的会话全部滤掉，而且不报错，
 表现是列表凭空消失。子 agent 不单列。
 
-**还没验证的**：codex 官方行的 `agent_session.value` 理论上就是 codex 的 thread id，
-匹配上就能直接用会话自己的标题（比终端标题可靠）。这条路径要装完集成再开一个真实
-codex 会话才能验证，目前走的是「按 `foreground_cwd` 匹配 + 读终端标题」的退回路径。
+### 为什么需要 `CODEX_ADOPT_SESSION`
+
+内联模式靠 `pane.report_metadata --applies-to-source` 往官方行上挂 token，而这个参数
+要求**目标 source 已经在那个 pane 上有记录**。没有记录时写完立刻消失（实测 `tokens`
+变 null）。
+
+codex 这边会真的缺：**Codex 0.160 的 `SessionStart` hook 在 TUI 启动时不触发**
+（二进制里是 `run_pending_session_start_hook`，挂起到会话真正开始干活才跑）。实测两种
+方式都确认过——直接观察 hook 是否被调用、以及用 `bypass_hook_trust` 排除「信任失效」
+这个干扰因素后重测，结论一致。
+
+于是官方行一直空着 `agent_session`，codex 会话一条都显示不出来。所以插件会自己补报一次：
+从 **codex 自己的 app-server** 读出该目录的真实 thread id，以 `herdr:codex` 的身份写进
+`agent_session`。写的是真值，官方 hook 将来真跑起来时写的是同一个值。
+
+补报之后，`agent_session.value` 就是 codex 的 thread id，和 app-server 返回的 `id` 完全
+对上——于是「用会话自己的标题而不是终端标题」这条精确匹配路径也顺带生效了。
+
+**挑哪个会话当「官方那个」**：用官方行的 `foreground_cwd` 精确匹配会话的 `cwd`。同目录
+有多个时，已补报过的那个仍然有效就继续用它，否则优先正在跑的，再否则取最近动过的。
+
+**关掉它**（`CODEX_ADOPT_SESSION=false`）就回到纯被动：只显示官方集成已经报上来的，绝不
+代替它写。代价是 codex 在跑完第一轮对话之前完全不可见。
+
+> 顺带说明：`--applies-to-source herdr:codex` 猜一个 source 去挂是**挂不上**的，
+> token 写完再查就是 null。所以「补报」和「挂载」必须都做，缺一不可。
 
 ### 关于 `FOCUS_REDIRECT`（只在 `MIRROR_INLINE=false` 时生效）
 

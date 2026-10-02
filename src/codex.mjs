@@ -564,6 +564,8 @@ export function normalizeThread(t) {
     title,
     directory: String(t?.cwd || ""),
     state: mapThreadStatus(t?.status?.type),
+    /** Unix 秒。同一目录有多个会话时用它挑「最近动过的那个」当官方会话。 */
+    updatedAt: Number(t?.updatedAt || 0),
   };
 }
 

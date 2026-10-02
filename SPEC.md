@@ -499,12 +499,48 @@ Node 内置 `WebSocket` **不支持 unix socket**，所以帧编解码要自己�
 
 内联模式只往官方行上挂 token，所以**没装集成时 codex 的 session 一行都不显示**。插件会在采集到会话但找不到对应官方行时打一条 info 级日志说明这件事（只说一次，之后降级 debug）。
 
-### 12.8 token 命名
+### 12.8 补报会话身份（`CODEX_ADOPT_SESSION`）
+
+内联模式挂 token 用 `pane.report_metadata --applies-to-source`，而它要求**目标 source
+已经在该 pane 上有记录**。没有记录时写完立刻消失 —— 实测猜一个 `herdr:codex` 去挂，
+写完再查 `tokens` 就是 null。
+
+codex 恰好会缺：Codex 0.160 的 `SessionStart` hook **在 TUI 启动时不触发**（二进制里是
+`run_pending_session_start_hook`，挂起到会话真正开始干活才跑）。这里要说明验证过程中踩
+到的坑：**第一轮测试是无效的** —— 当时改了 hook 命令去做记录壳，但 `trusted_hash` 是按
+命令内容算的，改命令等于把信任作废，codex 就会跳过它。第二轮用 `bypass_hook_trust`
+排除这个干扰因素后重测，结论才站得住。
+
+于是官方行一直空着 `agent_session`，内联模式无处可挂。插件的做法是：从 **codex 自己的
+app-server** 读出该目录的真实 thread id，以 `herdr:codex` 的身份补报一次 `agent_session`。
+
+为什么这不算抢官方集成的归属：写进去的 `agent_session_id` 是真值，不是我们编的；官方
+hook 将来真跑起来时写的是同一个值。而不补报的后果是「因为官方还没上报，所以什么都不
+显示」，那是更糟的结果。仍然保留了关闭开关（`CODEX_ADOPT_SESSION=false`）回到纯被动。
+
+挑选规则：用官方行的 `foreground_cwd` 精确匹配会话的 `cwd`；同目录有多个时，已补报过
+的仍然有效就继续用它 → 否则优先 `working` → 再否则取 `updatedAt` 最大的。
+
+补报之后 `agent_session.value` 与 app-server 的 `thread.id` 完全对上，于是 12 节点里
+「用会话自己的标题而不是终端标题」那条精确匹配路径顺带生效。
+
+**A/B 实测**：同一个工作区开两个 codex pane，一个开着补报、一个关着。开着的那行
+`agent_session` 有值且挂上了树，关着的没有——确认是插件补的，不是官方 hook。
+
+### 12.9 每个工作区只挑一个挂载点
+
+同工作区有多个同 agent 的官方行时，按「正在忙 → 正在聚焦 → 空闲」的顺序只挑**一个**
+挂载点。所以同一工作区开三个 codex 窗口时，只有其中一行下面会出现会话树，另外两行是
+正常的原生行。与 opencode 侧行为一致。
+
+### 12.10 token 命名
 
 沿用 `oc_sess1..oc_sess6`，**不因为支持多 agent 就改名**。token 挂在**具体某个 agent 行**上，不同 agent 的行本来就是不同的 pane，天然不冲突。改 token 名要动 `config.toml` 的 rows、README、SPEC，收益不抵风险。
 
-### 12.9 已知边界（codex）
+### 12.11 已知边界（codex）
 
 - **`thread/read` 补查回来的 thread 可能没有标题**（`preview` 为空串，实测碰到过），只能显示 `(无标题)`。
-- **codex 的官方行拿不到 id 精确匹配时**会退回按 `foreground_cwd` 解析（和 opencode 侧同一条路）。理论上 `agent_session.value` 就是 codex 的 thread id（herdr 的 codex hook 取 hook 输入的 `session_id`，而 codex thread id 是 UUIDv7），但**这条路径还没有真机验证** —— 需要先 `herdr integration install codex` 再开一个 codex 会话。
+- **codex 的官方行拿不到 id 精确匹配时**会退回按 `foreground_cwd` 解析（和 opencode 侧同一条路）。走补报（12.8）时 `agent_session.value` 与 thread id 天然相等，所以走的是精确匹配那条；只有官方 hook 自己上报、而我们没补报时才可能落到退回路径。
+- **同工作区多个 codex 窗口时只有一个会显示会话树**（12.9），这是挂载点唯一决定的，不是 bug。
+- **本机 codex 侧网络不通**（`moai.top` DNS 解析失败），所以 codex TUI 发消息会失败。但这不影响插件：会话数据全部来自本地 app-server，不联网。
 - **codex 的终端标题未必有信息量**，所以 id 匹配成功时用 thread 自己的 `name`/`preview`，匹配不上才退回终端标题。

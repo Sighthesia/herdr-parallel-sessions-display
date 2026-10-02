@@ -28,6 +28,58 @@ export function ownSource() {
   return `plugin:${pluginId()}`;
 }
 
+/**
+ * Herdr **内置集成**的 source id，规律是 `herdr:<规范 agent 名>`。
+ *
+ * 从 herdr 0.9.3 二进制里核过：内置集成的 hook 脚本里写死的是
+ * `source = "herdr:opencode"` / `"herdr:claude"` / `"herdr:codex"` 这类值。
+ * 官方集成正常上报时，`agent_session.source` 就是这个字符串。
+ */
+export function builtinSource(agent) {
+  return `herdr:${agent}`;
+}
+
+/**
+ * 以某个内置集成的身份补报一次 agent session 身份。
+ *
+ * ## 什么时候需要
+ *
+ * `pane.report_metadata` 的 `--applies-to-source` 要求**目标 source 已经在那个
+ * pane 上有记录**，否则 token 挂上去立刻消失（实测：官方行没有 agent_session 时，
+ * 猜一个 `herdr:codex` 去 `--applies-to-source`，写完再查 tokens 是 null）。
+ *
+ * codex 这边会真的缺：Codex 0.160 的 `SessionStart` hook **在 TUI 启动时不触发**
+ * （二进制里是 `run_pending_session_start_hook`，挂起到会话真正开始干活才跑），
+ * 于是官方行一直空着 `agent_session`，内联模式就无处可挂 —— 而这个插件的价值
+ * 恰恰是「显示正在跑的会话」。
+ *
+ * ## 为什么这不算抢官方集成的归属
+ *
+ * 写进去的 `agent_session_id` 是从 **codex 自己的 app-server** 读出来的真实
+ * thread id，不是我们编的。官方 hook 将来真跑起来时写的是同一个值，两边一致。
+ * 反过来，不补报就等于「因为官方还没上报，所以什么都不显示」，那是更糟的结果。
+ *
+ * 所以这是一个**可以关掉**的行为：`CODEX_ADOPT_SESSION=false` 即回到纯被动。
+ *
+ * @param {{paneId:string, agent:string, sessionId:string, seq:number}} input
+ */
+export async function reportBuiltinAgentSession({ paneId, agent, sessionId, seq }) {
+  const args = [
+    "pane",
+    "report-agent-session",
+    paneId,
+    "--source",
+    builtinSource(agent),
+    "--agent",
+    agent,
+    "--agent-session-id",
+    String(sessionId),
+    "--seq",
+    String(seq),
+  ];
+  return cli(args);
+}
+
 let requestCounter = 0;
 
 function nextRequestId() {

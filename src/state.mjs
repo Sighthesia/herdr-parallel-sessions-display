@@ -42,6 +42,9 @@ export const CONFIG_DEFAULTS = Object.freeze({
   CODEX_SOURCE_KINDS: "",
   CODEX_SESSION_LIMIT: "100",
   CODEX_TIMEOUT_MS: "8000",
+  // 官方行没有 agent_session 时，由插件以 herdr:codex 的身份补报一次（读的是
+  // codex 自己的 app-server，写的是真实 thread id）。设成 false 回到纯被动。
+  CODEX_ADOPT_SESSION: "true",
 });
 
 const KNOWN_KEYS = new Set(Object.keys(CONFIG_DEFAULTS));

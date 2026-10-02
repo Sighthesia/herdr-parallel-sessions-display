@@ -760,7 +760,14 @@ function failCodex(reason) {
  *                 | {ok:false, reason:string}>}
  */
 async function fetchCodexSessions() {
-  if (!config.codexEnabled) return { ok: false, reason: "CODEX_ENABLED=false" };
+  // 主动关掉和「连不上」是两回事，必须分开标记。
+  //
+  // `disabled` 表示用户**主动**关了 codex 支持 —— 这时候该把之前挂上去的 token
+  // 撤掉，否则侧边栏上会一直留着关之前那一版会话列表。踩过的坑：最初这里直接
+  // 返回 `ok:false`，和「守护进程连不上」共用同一条路，而下游把 `ok:false`
+  // 一律当成「本轮失败，既不写也不清」，于是 `CODEX_ENABLED=false` 之后残留
+  // 永远留在官方行上（实测 codex 集成装好后那一行一直显示关之前的 6 条会话）。
+  if (!config.codexEnabled) return { ok: false, disabled: true, reason: "CODEX_ENABLED=false" };
 
   const client = await getCodexClient();
   if (!client) return { ok: false, reason: runtime.codex.lastError || "codex 退避中" };
@@ -1099,6 +1106,8 @@ async function applySessionState({ client, roots, activeStates, polledPermission
         wanted: codex.ok ? codex.wanted : [],
         statesById: codex.ok ? codex.statesById : new Map(),
         failed: !codex.ok,
+        // 主动关掉（CODEX_ENABLED=false）和采集失败要分开：前者要清残留，后者要保留。
+        disabled: Boolean(codex.disabled),
         failedReason: codex.ok ? "" : codex.reason,
       },
     ]);
@@ -1373,6 +1382,8 @@ async function publishInlineSessions(providers) {
 
   let attached = 0;
   let cleared = 0;
+  /** 本轮有意处理过（含「有意保留」）的 pane，兜底清扫时跳过。 */
+  const handled = new Set();
 
   for (const provider of providers || []) {
     const agentName = str(provider?.agent);
@@ -1384,14 +1395,24 @@ async function publishInlineSessions(providers) {
       continue;
     }
 
-    if (provider.failed) {
+    if (provider.failed && !provider.disabled) {
       // 既不写也不清：守护进程抖一下不该让侧边栏上的 session 行全空掉再全回来。
+      //
+      // `disabled` 不走这条路 —— 那是用户主动关的，要的是**撤掉**之前挂上去的
+      // token（`wanted` 传空数组即可，下面照常走写/清循环，`desired` 里不会有
+      // 这一行，于是所有槽位被判定为过期而清空）。
       log(
         "debug",
         `${agentName} 采集本轮失败（${provider.failedReason || "未知"}），` +
           `保持 ${rows.length} 行现有 token 不动`,
       );
+      // 标记成「本轮有意保留」，别被后面的兜底清扫当成孤儿清掉。
+      for (const a of rows) handled.add(str(a.pane_id));
       continue;
+    }
+    if (provider.disabled) {
+      closeCodexClient();
+      log("debug", `${agentName} 支持已被 ${provider.failedReason || "关闭"}，撤掉 ${rows.length} 行上的旧 token`);
     }
 
     // --- 官方 session：id 精确匹配 --------------------------------------
@@ -1450,7 +1471,13 @@ async function publishInlineSessions(providers) {
     // 模板里已经没有 terminal_title_stripped 了，官方 session 的标题现在也靠
     // $oc_sess1 —— 只遍历 byWorkspace 的话，「没有并行 session」的工作区会一个
     // token 都不写，那一行就彻底空了（实测官方标题直接消失）。
-    for (const workspaceId of new Set(rows.map((a) => str(a.workspace_id)))) {
+    //
+    // `provider.disabled` 时**一个工作区都不遍历**，`desired` 保持为空 → 下面
+    // 的写/清循环会把这些行上的槽位全判为过期并清掉，那一行退回成 Herdr 原生
+    // 的样子（只剩内置 token 渲染的内容）。不能只让 `wanted` 为空：默认的
+    // `INLINE_ALWAYS_LIST=true` 仍会把官方 session 那一行写上去，那就还是我们
+    // 的内容、不是原生的。
+    for (const workspaceId of provider.disabled ? [] : new Set(rows.map((a) => str(a.workspace_id)))) {
       const host = pickHost(workspaceId);
       if (!host) continue;
       const paneId = str(host.pane_id);
@@ -1480,6 +1507,7 @@ async function publishInlineSessions(providers) {
     // --- 写 / 清 ----------------------------------------------------------
     for (const agent of rows) {
       const paneId = str(agent.pane_id);
+      handled.add(paneId);
       const want = desired.get(paneId);
       const actualTokens = agent.tokens || {};
       // 本轮该有值的槽位 + 本轮该为空但实际有值的槽位
@@ -1535,6 +1563,38 @@ async function publishInlineSessions(providers) {
       } else {
         log("warn", `并行信息挂载失败（${paneId}）：${res.error}`);
       }
+    }
+  }
+
+  // --- 兜底清扫：带着我们的 token、却没被本轮处理过的行 --------------------
+  //
+  // 有些行现在进不了 `official`，于是永远轮不到上面的清理，token 就一直挂在
+  // 侧边栏上。实测踩到过：herdr 的 codex 集成只在 `SessionStart` 时上报
+  // `agent_session`，会话结束后该字段消失 → 那一行不再满足「官方行」判定
+  // （`agent_session?.source` 得是字符串）→ `CODEX_ENABLED=false` 之后
+  // 关之前的 6 条会话一直留在界面上，谁也清不掉。
+  //
+  // 所以这里不按「是不是官方行」判断，只按「有没有我们的 token 且本轮没碰过」。
+  // 不带 `--applies-to-source` 调用：实测那只会清 token，不会把这一行的 agent
+  // 归属抢走（`agent` 仍是 codex），因为接管靠的是 `report-agent` 不是
+  // `report-metadata`。
+  for (const agent of agents) {
+    const paneId = str(agent?.pane_id);
+    if (!paneId || handled.has(paneId)) continue;
+    const actual = agent.tokens || {};
+    const stale = tokens.filter((t) => actual[t] != null);
+    const legacy = legacyTokens.filter((t) => actual[t] != null);
+    if (stale.length === 0 && legacy.length === 0) continue;
+    const res = await herdr.attachMetadata({ paneId, clear: [...stale, ...legacy], seq: nextSeq() });
+    if (res.ok) {
+      cleared += 1;
+      log(
+        "info",
+        `清扫 ${paneId}（agent=${agent.agent || "?"}）：它已不再上报 agent_session，` +
+          `之前挂的 ${[...stale, ...legacy].join(",")} 已撤掉`,
+      );
+    } else {
+      log("warn", `清扫 ${paneId} 的 ${[...stale, ...legacy].join(",")} 失败：${res.error}`);
     }
   }
 

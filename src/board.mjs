@@ -64,6 +64,10 @@ const config = {
   // oc_par token 的值上限。实测 Herdr 对单个 token 值硬截断在 80 字符，
   // 插件自己先算好并用「+N」收尾，避免被拦腰截断在半句话上。
   parallelTokenMax: store.asInt(raw, "PARALLEL_TOKEN_MAX", 78, 8, 80),
+  // 并行 session 行的树状前缀。用 box-drawing 垂直线而不是空格：Herdr 会 trim
+  // token 值的前导空白（实测传 "  └─ x" 存下来是 "└─ x"），空格缩进存不住。
+  // 想换成别的（比如 ├─ 前缀或全角空格）改这里。
+  parallelTrunk: store.asString(raw, "PARALLEL_TRUNK", "│"),
   sessionLimit: store.asInt(raw, "SESSION_LIST_LIMIT", 200, 10, 2_000),
   sessionPages: store.asInt(raw, "SESSION_PAGE_LIMIT", 8, 1, 50),
   retryDetection: store.asBool(raw, "RETRY_DETECTION", true),
@@ -1277,41 +1281,68 @@ export function resolveInlineHostWorkspace(directory, index, official) {
 }
 
 /**
- * 把一组并行 session 拆成「每个一行」的值数组。
+ * 把一组并行 session 拆成「每个一行」的值数组，每行带 ASCII 树形符号。
  *
- * **不能塞进一个 token** —— token 值里的换行会被去掉（实测 `"a\nb\nc"` 存下来是
- * `"abc"`），所以一行只能显示一个 session，多个必须各占一个 token / 一个 row。
+ * ## 缩进为什么用 `│` 而不是空格
  *
- * 槽位数 = `herdr.PARALLEL_TOKENS` 的长度。超出时把多出来的折成最后一行末尾的
- * 「+N」—— 让人知道「还有几个」比静默丢掉强。没占用的槽位返回空字符串，
- * 对应那一行渲染成空白。
+ * 最直觉的做法是前导空格，但 **Herdr 会 trim token 值的前导空白**（实测传
+ * `"  └─ ● 标题"` 存下来是 `"└─ ● 标题"`），所以空格缩进根本存不住。
  *
- * 单行上限仍是 80 字符（Herdr 硬截断），但每个 session 现在独享这个预算，
- * 标题基本能完整显示。
+ * `│`（U+2502 box drawing）不是空白，不会被 trim；在等宽终端里和 `─` 同宽，
+ * 正好当「子级的父级连接线」用 —— 这也是标准树状图的画法。
+ *
+ * 目标效果：
+ *
+ * ```
+ * [1] afloat
+ *   opencode
+ *   OC | Tray hover二级菜单…          ← 官方行跑的 session（根）
+ * │ ├─ ● 实现 Hover 菜单式…           ← 并行 session（子）
+ * │ └─ ● 排查 Shell 重载启动…
+ * ```
+ *
+ * 官方那一行拿不到连接线（`terminal_title_stripped` 是内置 token，内容不可改），
+ * 所以它作为「根」、下面几行作为它的分支，靠 `│ ├─` / `│ └─` 读出层级。
+ *
+ * ## 不能塞进一个 token
+ *
+ * token 值里的换行会被去掉（实测 `"a\nb\nc"` 存下来是 `"abc"`），所以一行只能
+ * 显示一个 session，多个必须各占一个 token / 一个 row。
+ *
+ * ## 槽位不够时
+ *
+ * 超出 `herdr.PARALLEL_TOKENS` 长度时把多出来的折成最后一行末尾的「+N」——
+ * 让人知道「还有几个」比静默丢掉强。**已实测空槽位不会渲染成空白行**，所以
+ * 槽位可以放心多加。
  */
 export function formatParallelSlots(infos, statesById = new Map()) {
   const slots = herdr.PARALLEL_TOKENS;
   const limit = config.parallelTokenMax;
+  const trunk = config.parallelTrunk;
+
   const marked = infos.map((i) => {
     const st = statesById.get(i.id) || "";
     const mark =
       st === "working" ? "●" : st === "blocked" ? "▲" : st === "idle" ? "○" : st === "retry" ? "↻" : "·";
     const t = store.truncate(store.sanitizeText(i.title || "(无标题)", 60), 60);
-    return `${mark} ${t}`.slice(0, limit);
+    return { mark, title: t };
   });
   if (marked.length === 0) return slots.map(() => "");
 
   const out = slots.map(() => "");
   const shown = Math.min(marked.length, slots.length);
-  for (let i = 0; i < shown - 1; i += 1) out[i] = marked[i];
 
-  // 最后一行：既要装最后一个标题，又要在有溢出时留出「+N」的位置
+  for (let i = 0; i < shown; i += 1) {
+    const lastLine = i === shown - 1 && marked.length <= slots.length;
+    out[i] = `${trunk} ${lastLine ? "└─" : "├─"} ${marked[i].mark} ${marked[i].title}`;
+  }
+
+  // 溢出：把多出来的折进最后一行末尾的「+N」
   const rest = marked.length - (shown - 1);
-  const tail = rest > 1 ? ` +${rest - 1}` : "";
-  if (marked[shown - 1].length + tail.length <= limit) {
-    out[shown - 1] = marked[shown - 1] + tail;
-  } else {
-    out[shown - 1] = marked[shown - 1].slice(0, Math.max(0, limit - tail.length)) + tail;
+  if (rest > 1) {
+    const tail = ` +${rest - 1}`;
+    const last = out[shown - 1];
+    out[shown - 1] = last.length + tail.length <= limit ? last + tail : last.slice(0, Math.max(0, limit - tail.length)) + tail;
   }
   return out;
 }

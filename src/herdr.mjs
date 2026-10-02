@@ -620,8 +620,32 @@ function truncateMessage(text) {
   return s.length > 160 ? `${s.slice(0, 157)}…` : s;
 }
 
-/** 我们上报时用的 agent 标签。与官方集成同名，Agents 视图里看起来一致。 */
-export const AGENT_LABEL = "opencode";
+/**
+ * 我们上报镜像行时用的 agent 名。
+ *
+ * **故意不叫 `opencode`。**
+ *
+ * 原因：Herdr 的 `ui.sidebar.agents.rows` 模板是**每个 agent 条目各渲染一遍**，
+ * 没有分组头去重机制（`ui.sidebar.spaces` 面板倒是有 `rows`，但它只接受
+ * `workspace` / `state_icon` 两个 token，列不出该 space 下的 agent）。所以只要
+ * 镜像行和官方行同名，同一个工作区里每多一个并行 session，`[1] afloat` 和
+ * `opencode` 就会各重复一次。
+ *
+ * 用一个不同的名字，就能靠 `rows_by_agent` 给镜像行单独一套模板 —— 不含
+ * `workspace`、不含 `agent`，只剩状态和标题，于是它读起来就是挂在官方 agent
+ * 下的一条附加信息，而不是一个平级的工作区分组。
+ *
+ * 名字必须匹配 `^[a-z][a-z0-9_-]{0,31}$`（Herdr 的 `invalid_agent_name`）。
+ * 想让自定义模板里不出现这个名字，就别在镜像行的 rows 里放 `agent` token。
+ */
+export const AGENT_LABEL = "opencode-mirror";
+
+/**
+ * 镜像行在**人类可见文本**里应该显示的名字。
+ *
+ * 上报名要唯一（为了区分模板），显示名要好看（pane 边框标签、pane 名都用它）。
+ */
+export const MIRROR_DISPLAY_LABEL = "opencode";
 
 // ---------------------------------------------------------------------------
 // agent 聚焦

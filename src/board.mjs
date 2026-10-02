@@ -76,8 +76,14 @@ const MIRROR_PREFIX = "oc_";
 /** 镜像 pane 名上限。侧边栏一行放不下更多，留点余量给状态符号。 */
 const MIRROR_LABEL_MAX = 40;
 
-/** 侧边栏第 2 行显示的 agent 名。和官方 opencode 行同名，看起来才一致。 */
-const MIRROR_AGENT_LABEL = herdr.AGENT_LABEL;
+/**
+ * pane 名里显示的 agent 名。
+ *
+ * 刻意用 `MIRROR_DISPLAY_LABEL`（`opencode`）而不是上报用的 `AGENT_LABEL`
+ * （`opencode-mirror`）：pane 边框标签和 pane 名是要给人看的，长的内部名只会
+ * 挤掉标题。上报名唯一是为了拿到独立的行模板，显示名要好看。
+ */
+const MIRROR_AGENT_LABEL = herdr.MIRROR_DISPLAY_LABEL;
 
 function log(level, ...args) {
   if (LEVELS[level] < LEVELS[config.logLevel]) return;

@@ -57,6 +57,13 @@ const config = {
   // 焦点落到镜像 pane 时，转到同目录真正的前台 agent（见 SPEC 7.3）
   focusRedirect: store.asBool(raw, "FOCUS_REDIRECT", true),
   focusRedirectCooldownMs: store.asInt(raw, "FOCUS_REDIRECT_COOLDOWN_MS", 2_500, 0, 60_000),
+  // 内联模式：完全不建镜像 pane，把并行 session 信息挂到该目录官方 agent 行的
+  // token 上（见 SPEC 8）。false = 回到「每个 session 一个镜像行」的旧模型，
+  // 那个模式会在每个涉及的工作区建一个 oc-sessions 标签页。
+  mirrorInline: store.asBool(raw, "MIRROR_INLINE", true),
+  // oc_par token 的值上限。实测 Herdr 对单个 token 值硬截断在 80 字符，
+  // 插件自己先算好并用「+N」收尾，避免被拦腰截断在半句话上。
+  parallelTokenMax: store.asInt(raw, "PARALLEL_TOKEN_MAX", 78, 8, 80),
   sessionLimit: store.asInt(raw, "SESSION_LIST_LIMIT", 200, 10, 2_000),
   sessionPages: store.asInt(raw, "SESSION_PAGE_LIMIT", 8, 1, 50),
   retryDetection: store.asBool(raw, "RETRY_DETECTION", true),
@@ -147,6 +154,8 @@ const runtime = {
   balancedThisPass: false,
   /** 上次常规重平衡的时间戳，用来节流 `maybeRebalanceAll`。 */
   lastRebalanceAt: 0,
+  /** 内联模式：上一次 attach 的 seq，仅用于日志排查。 */
+  lastAttachSeq: 0,
   /** `pane.focused` 订阅句柄。 */
   focusSub: null,
   /** 镜像 pane id -> 上次重定向的时刻，用来防抖。 */
@@ -327,6 +336,10 @@ async function modePane() {
 
   // 接管历史映射：上次残留的 pane 可能已经没了，逐个验证
   await validateTrackedPanes();
+
+  // 内联模式：把旧「建 pane 模式」留下的镜像 pane / oc-sessions 标签页清掉。
+  // 放在 validateTrackedPanes 之后 —— 先确认映射有效，再按内联逻辑收摊。
+  if (config.mirrorInline) await migrateToInline();
 
   if (config.legacyResumeMode && config.legacyResumeMode !== "mirror") {
     log(
@@ -783,6 +796,9 @@ async function applySessionState({ client, roots, activeStates, polledPermission
   // 边建边补，所以同一轮里先建出来的 pane 不会把自己当成失效。
   const alive = new Set(((await paneIndex({ force: true })).panes || []).map((p) => str(p?.pane_id)));
 
+  // 内联模式：session id -> 展示用状态，交给 publishInlineParallel 拼 token
+  const parallelStates = new Map();
+
   for (const info of wanted) {
     if (runtime.shuttingDown) return;
     if (!store.isValidSessionId(info.id)) {
@@ -831,7 +847,7 @@ async function applySessionState({ client, roots, activeStates, polledPermission
       rec.lastState = "";
     }
 
-    if (!rec.paneId) {
+    if (!rec.paneId && !config.mirrorInline) {
       // 不因为空间不足而放弃建行：切完立刻重平衡，实在还是 0 行也照样把行建出来。
       const created = await createMirrorPane(info);
       if (!created) {
@@ -855,8 +871,14 @@ async function applySessionState({ client, roots, activeStates, polledPermission
       rec.idleSince = 0;
     }
 
-    await reportMirror(info.id, rec);
+    // 内联模式不需要自己的 agent 行，只把状态记进 rec 供 token 拼接用
+    if (!config.mirrorInline) await reportMirror(info.id, rec);
+    parallelStates.set(info.id, state);
   }
+
+  // --- 3b. 内联模式：并行 session 信息挂到官方 agent 行 ------------------------
+  // 完全不建 pane，也就不需要镜像标签页、不需要镜像行、不会被官方集成接管。
+  if (config.mirrorInline) await publishInlineParallel(wanted, parallelStates);
 
   // --- 4. 写镜像 pane 的显示状态 ------------------------------------------
   await publishMirrorSnapshots();
@@ -894,6 +916,8 @@ async function applySessionState({ client, roots, activeStates, polledPermission
  * 不受这里的节流影响。
  */
 async function maybeRebalanceAll() {
+  // 内联模式不建镜像 pane，也就没有镜像标签页要平衡
+  if (config.mirrorInline) return;
   const now = Date.now();
   if (now - runtime.lastRebalanceAt < config.rebalanceIntervalMs) return;
   runtime.lastRebalanceAt = now;
@@ -1007,8 +1031,12 @@ async function handlePaneFocused(info) {
   }
 }
 
-/** 启动焦点重定向订阅。只在常驻模式有意义。 */
+/** 启动焦点重定向订阅。只在常驻模式、且不是内联模式时才有意义。 */
 function startFocusRedirect() {
+  // 内联模式没有镜像 pane，「焦点落到镜像行」这个事件根本不会发生，
+  // 订阅它只是白占一条 socket 连接。而且点击需求已经天然满足了 ——
+  // 侧边栏里只有官方行，点它本来就跳官方 pane。
+  if (config.mirrorInline) return;
   if (!config.focusRedirect || runtime.focusSub) return;
   runtime.focusSub = herdr.subscribePaneFocused({
     onFocus: (info) => {
@@ -1023,6 +1051,302 @@ function stopFocusRedirect() {
   runtime.focusSub?.stop();
   runtime.focusSub = null;
   runtime.focusCooldown.clear();
+}
+
+/**
+ * 内联模式：把「这个目录还有哪些 session 在跑」挂到该目录**官方 agent 行**上。
+ *
+ * ## 为什么不建 pane
+ *
+ * Herdr 的 agent 行必须绑定真实 pane，这是硬约束。但 `pane.report_metadata` 有个
+ * `--applies-to-source`：**能往别的 source 上报的 agent 行附加自己的 token，
+ * 而不接管那一行**。实测官方集成随后重报（working → idle）token 照样存活，
+ * `agent` 字段和 `agent_session.source` 都不受影响。
+ *
+ * 于是并行 session 的信息不需要自己的 pane —— 挂在官方行上就行，侧边栏模板引用
+ * `$oc_par` 即可。顺带白送一件事：点击那行本来就跳官方 pane，所以
+ * 「点镜像信息只跳到真正的前台 agent」不再需要 FOCUS_REDIRECT。
+ *
+ * ## 值格式与硬限制
+ *
+ * Herdr 对单个 token 值**硬截断在 80 字符**（实测请求 82 字符存下来是 80），
+ * 而且换行会被去掉 —— 所以多个 session 只能挤在一行里，用 `·` 分隔。
+ * 侧边栏本身也不宽，实际能看到的更少。宁可少而准：最多列 `PARALLEL_TITLE_COUNT`
+ * 个标题，剩下的用「+N」收尾。
+ *
+ * ## 没有官方 agent 的目录
+ *
+ * session 在用户没开 TUI 的目录下（典型是 `/tmp` 下的临时工程）时，这个工作区
+ * 里没有可挂载的官方行，那条信息就无处可放 —— 内联模式下**直接不显示**并记日志。
+ * 想让这类 session 也可见，把 `MIRROR_INLINE` 设成 false 回到建 pane 的旧模型。
+ *
+ * @param {object[]} wanted     本轮要镜像的活跃根 session（已被官方占用的已剔除）
+ * @param {Map<string,string>} statesById  session id -> 展示用状态
+ */
+async function publishInlineParallel(wanted, statesById) {
+  const agents = await herdr.agentList();
+
+  // 官方行：不是我们上报的、且带 agent_session 的
+  const official = agents.filter(
+    (a) => !herdr.isMirrorRow(a) && a.agent && typeof a.agent_session?.source === "string",
+  );
+  if (official.length === 0) {
+    log("debug", "内联模式：当前没有官方 agent 行，无处挂载并行 session 信息");
+    return 0;
+  }
+
+  // 并行 session 按工作区分组：目录 → workspace
+  const index = await paneIndex({ force: true });
+  const byWorkspace = new Map();
+  const orphans = [];
+  for (const info of wanted) {
+    const hit = resolveInlineHostWorkspace(info.directory, index, official);
+    if (!hit?.workspaceId) {
+      orphans.push(info);
+      continue;
+    }
+    if (!byWorkspace.has(hit.workspaceId)) byWorkspace.set(hit.workspaceId, []);
+    byWorkspace.get(hit.workspaceId).push(info);
+  }
+  for (const o of orphans) {
+    log(
+      "info",
+      `${shortId(o.id)}「${(o.title || "").slice(0, 24)}」所在目录没有对应的 Herdr 工作区` +
+        `（或那个工作区里没有 opencode 的 agent 行），内联模式下无处显示。` +
+        `把 MIRROR_INLINE 设成 false 可回到建 pane 模式。`,
+    );
+  }
+
+  /** 工作区里挑一个官方行作为挂载点：优先正在忙的，其次当前聚焦的。 */
+  const pickHost = (workspaceId) => {
+    const rows = official.filter((a) => str(a.workspace_id) === str(workspaceId));
+    if (rows.length === 0) return null;
+    const rank = (a) => {
+      if (a.agent_status === "working") return 0;
+      if (a.agent_status === "blocked") return 1;
+      if (a.focused) return 2;
+      if (a.agent_status === "idle") return 3;
+      if (a.agent_status === "done") return 4;
+      return 5;
+    };
+    rows.sort((a, b) => rank(a) - rank(b) || str(a.pane_id).localeCompare(str(b.pane_id)));
+    return rows[0];
+  };
+
+  // 先算出「每个官方行应得的值」，再拿它跟实际值对比 —— **不依赖进程内的
+  // 记账**。踩过的坑：清理逻辑原本遍历 `runtime.attachedParallel`，而那个 Map
+  // 随进程生死；board 重启后它空了，于是上一轮挂在别人工作区上的过期 token
+  // 再也没人清，一直挂在侧边栏上（实测 session 都跑完了，oc_par 还显示着旧的
+  // 「内联验证-B」）。以 agent.list 的实际值为准才幂等。
+  const desired = new Map();
+  for (const [workspaceId, infos] of byWorkspace) {
+    const host = pickHost(workspaceId);
+    if (!host) {
+      log(
+        "debug",
+        `工作区 ${workspaceId} 有 ${infos.length} 个并行 session，但没有官方 agent 行可挂载`,
+      );
+      continue;
+    }
+    desired.set(str(host.pane_id), { agent: host, value: formatParallelToken(infos, statesById) });
+  }
+
+  let attached = 0;
+  let cleared = 0;
+
+  for (const agent of official) {
+    const paneId = str(agent.pane_id);
+    const actual = agent.tokens?.[herdr.PARALLEL_TOKEN];
+    const want = desired.get(paneId);
+
+    if (!want) {
+      // 本轮不该有，但实际有 → 清掉
+      if (actual == null) continue;
+      const res = await herdr.attachMetadata({
+        paneId,
+        targetSource: agent.agent_session.source,
+        clear: [herdr.PARALLEL_TOKEN],
+        seq: nextSeq(),
+      });
+      if (res.ok) {
+        cleared += 1;
+        log("debug", `清除 ${paneId} 上过期的 ${herdr.PARALLEL_TOKEN}`);
+      } else {
+        log("warn", `清除 ${paneId} 的 ${herdr.PARALLEL_TOKEN} 失败：${res.error}`);
+      }
+      continue;
+    }
+
+    // 值没变就不写，避免每 5 秒打一次 socket
+    if (actual === want.value) continue;
+    const res = await herdr.attachMetadata({
+      paneId,
+      targetSource: want.agent.agent_session.source,
+      tokens: { [herdr.PARALLEL_TOKEN]: want.value },
+      seq: nextSeq(),
+    });
+    if (res.ok) {
+      attached += 1;
+      log("debug", `并行信息已挂到 ${paneId}：${want.value}`);
+    } else {
+      log("warn", `并行信息挂载失败（${paneId}）：${res.error}`);
+    }
+  }
+
+  return attached + cleared;
+}
+
+/**
+ * 内联模式专用的「目录 → 工作区」解析：**返回该挂哪个官方 agent 行所在的工作区**。
+ *
+ * 和 {@link resolveWorkspaceForDirectory} 的根本区别：那条规则挑「该目录里 pane
+ * 最多的工作区」，因为它要的是一个**放镜像 pane 的容器**；而内联模式要挂的是
+ * **官方 agent 行本身**，必须是那个真的在跑这个目录 session 的 agent。
+ *
+ * 实测踩到的坑：`Software/herdr` 这个目录在 w19 里有 **7 个** pane 的 cwd（用户在
+ * ReimuMoePCB_DAPLink 工作区里跑了一堆 herdr-sidebar 实例），在 w1J 里只有 4 个。
+ * 「pane 最多优先」会选 w19 —— 但 w19 的 agent 跑的是 ReimuMoePCB_DAPLink 的
+ * session，信息挂过去就显示在不相干的分组下面了。
+ *
+ * @param {string} directory
+ * @param {object} index paneIndex
+ * @param {object[]} official 官方 agent 行
+ * @returns {{workspaceId:string, tier:string, paneHits:number}|null}
+ */
+export function resolveInlineHostWorkspace(directory, index, official) {
+  const dir = normalizeDir(directory);
+  if (!dir) return null;
+
+  // ── tier 1（精确，优先）──────────────────────────────────────────────
+  // 官方 agent 行的 `foreground_cwd` 就是它自己那个 session 的工作目录 ——
+  // 那个 pane 里跑着 opencode TUI，前台进程的 cwd 不可能是别的工程。
+  // 实测每一行都对得上：w1J:p1 → herdr、w19:p1 → ReimuMoePCB_DAPLink。
+  //
+  // 这一条无歧义，所以永远优先；有多个匹配就挑状态最忙的那个。
+  const exact = official.filter(
+    (a) => normalizeDir(a?.foreground_cwd) === dir || normalizeDir(a?.cwd) === dir,
+  );
+  if (exact.length > 0) {
+    const rank = (a) =>
+      a.agent_status === "working" ? 0 : a.agent_status === "blocked" ? 1 : a.focused ? 2 : a.agent_status === "idle" ? 3 : a.agent_status === "done" ? 4 : 5;
+    exact.sort((a, b) => rank(a) - rank(b) || str(a.pane_id).localeCompare(str(b.pane_id)));
+    return { workspaceId: str(exact[0].workspace_id), tier: "foreground-cwd", paneHits: 0 };
+  }
+
+  // ── tier 2（退化）────────────────────────────────────────────────────
+  // session 在子目录里、而官方 TUI 的 cwd 是它的某个祖先时才走到这里。
+  // 必须叠加「有官方 agent 行」这个条件：只按 pane 数量选会挑到
+  // 「恰好在那个目录下开了很多别的 pane、但没有 opencode」的工作区。
+  const hosts = new Set(official.map((a) => str(a.workspace_id)));
+  const byCount = new Map();
+  for (const field of ["cwd", "foreground_cwd"]) {
+    for (const pane of index.panes || []) {
+      const pdir = normalizeDir(pane?.[field]);
+      if (!pdir || (pdir !== dir && !pdir.startsWith(`${dir}/`))) continue;
+      const ws = str(pane?.workspace_id);
+      if (!ws || !hosts.has(ws)) continue;
+      byCount.set(ws, (byCount.get(ws) || 0) + 1);
+    }
+  }
+  const ranked = [...byCount.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+  if (ranked.length === 0) return null;
+  return { workspaceId: ranked[0][0], tier: "ancestor-cwd", paneHits: ranked[0][1] };
+}
+
+/**
+ * 把一组并行 session 拼成 token 值。
+ *
+ * 硬上限 80 字符（Herdr 侧硬截断），所以这里自己先算好：能放下几个标题就放几个，
+ * 剩下的用 `+N` 收尾 —— 让用户看到「还有几个」比硬截断在半句话里有用。
+ */
+export function formatParallelToken(infos, statesById = new Map()) {
+  const limit = config.parallelTokenMax;
+  const marked = infos.map((i) => {
+    const st = statesById.get(i.id) || "";
+    const mark =
+      st === "working" ? "●" : st === "blocked" ? "▲" : st === "idle" ? "○" : st === "retry" ? "↻" : "·";
+    return `${mark} ${store.truncate(store.sanitizeText(i.title || "(无标题)", 40), 40)}`;
+  });
+  if (marked.length === 0) return "";
+
+  const tail = (n) => ` +${n}`;
+  let out = marked[0];
+  for (let i = 1; i < marked.length; i += 1) {
+    const next = `${out} · ${marked[i]}`;
+    // 还要给「+N」留位置：至少 6 个字符，否则宁可现在就收尾
+    if (next.length + 6 > limit) {
+      out += tail(marked.length - i);
+      break;
+    }
+    out = next;
+  }
+  return out.slice(0, limit);
+}
+
+/**
+ * 从「建 pane 模式」切到「内联模式」时清理旧残留。
+ *
+ * 旧模式留下的镜像 pane / `oc-sessions` 标签页 / state 里的 mirrors+central 记录，
+ * 在内联模式下没有任何代码会去动它们 —— 会一直留在用户工作区里占地方。启动时
+ * 主动扫一遍清掉，让切换是一次干净的迁移而不是半吊子状态。
+ *
+ * 反向（内联 → 建 pane）不需要专门处理：下一轮 reconcile 会正常建行。
+ */
+async function migrateToInline() {
+  if (!config.mirrorInline) return 0;
+
+  let cleaned = 0;
+  const index = await paneIndex({ force: true });
+  const tracked = trackedMirrorPaneIds();
+
+  // 1) 镜像 pane
+  for (const pane of index.panes || []) {
+    const id = str(pane?.pane_id);
+    if (!id || !herdr.isMirrorPane(pane)) continue;
+    if (!tracked.has(id)) continue;
+    const closed = await herdr.paneClose(id);
+    if (closed.ok) {
+      cleaned += 1;
+      log("info", `内联模式：清掉旧模式遗留的镜像 pane ${id}`);
+    } else if (!isPaneNotFound(closed.error)) {
+      log("warn", `内联模式：清镜像 pane ${id} 失败：${closed.error}`);
+    }
+  }
+
+  // 2) 镜像标签页与工作区
+  for (const entry of Object.values(runtime.state.mirrors || {})) {
+    const tabId = str(entry?.tabId);
+    if (!tabId) continue;
+    const res = await herdr.tabClose(tabId);
+    if (res?.ok) {
+      cleaned += 1;
+      log("info", `内联模式：关掉旧模式遗留的镜像标签页 ${tabId}`);
+    }
+  }
+  if (str(runtime.state.central?.tabId)) {
+    const res = await herdr.tabClose(str(runtime.state.central.tabId));
+    if (res?.ok) cleaned += 1;
+  }
+  const centralWs = str(runtime.state.central?.workspaceId);
+  if (centralWs) {
+    await herdr.workspaceClose(centralWs);
+  }
+
+  if (Object.keys(runtime.state.mirrors || {}).length > 0) {
+    log("info", "内联模式：已清空 state 里的镜像标签页记录");
+    runtime.state.mirrors = {};
+  }
+  if (str(runtime.state.central?.workspaceId) || str(runtime.state.central?.tabId)) {
+    runtime.state.central = store.emptyCentral();
+  }
+  // 旧记录里的 paneId 一律作废：内联模式下 rec.paneId 恒为空
+  for (const rec of Object.values(runtime.state.panes)) rec.paneId = "";
+
+  if (cleaned > 0) {
+    invalidatePaneIndex();
+    log("info", `内联模式：迁移清理了 ${cleaned} 项旧残留`);
+  }
+  return cleaned;
 }
 
 /** 是不是「连接层」错误 —— 只有这类才值得丢掉 client 重新发现。 */function isTransportError(err) {
@@ -2238,6 +2562,8 @@ async function writeMirrorPresentation(paneId, sessionID, rec) {
 
 /** 把当前状态写到 STATE_DIR，供镜像 pane 里的驻留进程显示。 */
 async function publishMirrorSnapshots() {
+  // 内联模式没有镜像 pane，也就没有 pane 里的驻留进程要喂快照。
+  if (config.mirrorInline) return;
   for (const [sessionID, rec] of Object.entries(runtime.state.panes)) {
     const file = path.join(STATE_DIR, `mirror-${sessionID}.json`);
     try {

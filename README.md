@@ -162,6 +162,8 @@ command = "opencode.session-mirror.board"
 | `RESUME_MODE` | — | **已废弃**，写了会被忽略并在启动日志里提示。恢复命令恒为常驻进程，见下 |
 | `MIRROR_PANE_RATIO` | `0.5` | 初始切分比例，建完立刻被重平衡覆盖 |
 | `MIRROR_PANE_DIRECTION` | `down` | 排列方向 `down` / `right` |
+| `MIRROR_INLINE` | `true` | **内联模式**：完全不建镜像 pane / `oc-sessions` 标签页，见下。`false` = 回到「每个 session 一个镜像行」的旧模型 |
+| `PARALLEL_TOKEN_MAX` | `78` | `oc_par` token 的值上限。Herdr 侧对单个 token 值硬截断在 80 字符 |
 | `REBALANCE_INTERVAL_MS` | `30000` | 常规重平衡巡检间隔。建行/回收时是即时的，这里只负责把别人（sidebar 插件、用户手动拖动）改乱的布局纠回来 |
 | `FOCUS_REDIRECT` | `true` | 焦点落到镜像行时，自动转到同目录真正的前台 agent，见下 |
 | `FOCUS_REDIRECT_COOLDOWN_MS` | `2500` | 同一个镜像行的重定向冷却，防抖 |
@@ -192,11 +194,45 @@ command = "opencode.session-mirror.board"
 想在某个镜像位置直接和 session 对话，手动敲 `opencode --session <id>` 即可：那一行会
 变成官方行，插件检测到标记丢失后主动让出，不会打架。
 
-### 关于 `FOCUS_REDIRECT`（点镜像行会发生什么）
+### 内联模式（默认）：不建任何 pane
+
+`MIRROR_INLINE=true` 时插件**不创建任何镜像 pane，也不创建 `oc-sessions` 标签页**。
+它用 `pane.report_metadata` 的 `--applies-to-source` 把并行 session 的信息作为
+`$oc_par` token 挂到该目录**官方 agent 行**上，而**不接管那一行**：
+
+- 实测 `agent` 字段和 `agent_session.source` 都不受影响
+- 官方集成随后重报（`working` → `idle`）token 照样存活
+- 侧边栏里因此**只有官方行**，点击天然就跳到真正的前台 agent
+
+侧边栏模板要加一行 `["$oc_par"]`（没有并行 session 的行没有这个 token，渲染成空）。
+
+**挂载点怎么选**：优先用官方 agent 行的 `foreground_cwd` 精确匹配——那个 pane 里跑着
+opencode TUI，前台进程的 cwd 就是它那个 session 的目录，实测每一行都对得上。匹配不
+上才退到「该目录 pane 最多且有官方行」。**不能只用 pane 数量**：实测
+`Software/herdr` 在 `w19` 里有 7 个 pane 的 cwd 指向它（用户在那儿跑了一堆
+herdr-sidebar 实例）、在 `w1J` 里只有 4 个，光按数量会挂到不相干的工作区。
+
+**两个硬限制**（实测，不是保守估计）：
+
+- Herdr 对单个 token 值**硬截断在 80 字符**。插件自己先算好，放不下就用 `+N`
+  收尾，不会让你看到被拦腰截断的半句话。
+- 值里的**换行会被去掉**，所以多个 session 只能挤在一行用 `·` 分隔。侧边栏本身也不
+  宽，实际能看到的更少。
+
+**已知的功能损失**：session 在用户没开 TUI 的目录下（典型是 `/tmp` 下的临时工程）时，
+那个工作区里没有可挂载的官方行，这条信息就**不显示**（日志里会说明是哪个 session、
+哪个目录）。想让这类 session 也可见，把 `MIRROR_INLINE` 设成 `false` 回到建 pane 模式。
+
+### 关于 `FOCUS_REDIRECT`（只在 `MIRROR_INLINE=false` 时生效）
+
+> `MIRROR_INLINE=true`（默认）下**这段不适用**：侧边栏里只有官方行，点它本来就跳官方
+> pane，订阅不会被建立。内联模式就是下面那条「让跳转落到有用的地方」的最终形态 ——
+> 连镜像行都不需要了。
 
 Herdr 的侧边栏**没有「某行不可点击」的开关**。`agent.view.set` 只有 filter / sort /
 label；`AgentInfo` 里唯一相关的 `interactive_ready` 在 0.9.3 根本不返回；config 里
-没有相关项；插件 v1 明确排除非终端 UI。所以镜像行只能保持可点击。
+没有相关项；插件 v1 明确排除非终端 UI。所以在旧的「建 pane」模型下，镜像行只能保持
+可点击。
 
 `FOCUS_REDIRECT=true`（默认）时的行为是：**焦点一旦落到镜像 pane，就立刻转到该目录
 真正的前台 agent**——也就是 Herdr 自己侦测到、且不是我们上报的那一行。落点规则：

@@ -409,6 +409,18 @@ export const MIRROR_TOKEN = "oc_mirror";
 /** 镜像行用来公开 session id 的 token，`agent_session` 缺失时的去重回退来源。 */
 export const MIRROR_SESSION_TOKEN = "oc_session";
 
+/**
+ * 挂在**官方** agent 行上的 token，值是「这个目录还有哪些 session 在跑」。
+ *
+ * 内联模式（`MIRROR_INLINE=true`）专用：配合 `pane.report_metadata` 的
+ * `--applies-to-source`，能把 token 附加到官方集成那一行而不接管它，于是
+ * 并行 session 的信息不需要自己的 pane，也就不需要镜像标签页。
+ *
+ * 侧边栏模板里写 `["$oc_par"]` 即可。没有并行 session 的行没有这个 token，
+ * 那一行渲染成空。
+ */
+export const PARALLEL_TOKEN = "oc_par";
+
 /** 算一个 agent 是不是我们自己的镜像行。 */
 export function isMirrorRow(agent) {
   const tokens = agent?.tokens;
@@ -535,6 +547,41 @@ export async function paneRename(paneId, label) {
  *
  * @param {{paneId:string,state:string,seq:number,sessionId?:string,message?:string}} input
  */
+/**
+ * 把展示用的 token 挂到**别的 source 上报的 agent 行**上。
+ *
+ * 这是「完全不创建镜像 pane」的支点。`pane.report_metadata` 有个
+ * `--applies-to-source`：用它就能往官方集成（`herdr:opencode`）那一行上附加
+ * 自己的 token，而**不接管那一行** —— 实测 `agent` 字段和 `agent_session.source`
+ * 都不受影响，官方集成随后重报（working → idle）token 也照样存活。
+ *
+ * 于是「这个目录还有哪些 session 在跑」可以挂在该目录官方 agent 行的
+ * `oc_par` token 上，侧边栏模板引用 `$oc_par` 就能显示。
+ *
+ * 而且顺带白送一件事：点击那行本来就跳到官方 pane，所以「点镜像信息只跳到
+ * 真正的前台 agent」不再需要 FOCUS_REDIRECT —— 没有独立的镜像行了。
+ *
+ * @param {object} input
+ * @param {string} input.paneId        官方 agent 所在 pane
+ * @param {string} input.targetSource  目标 agent 的 source（`herdr:opencode`）
+ * @param {Record<string,string>} [input.tokens] 要设置的 token
+ * @param {string[]} [input.clear]      要清除的 token 名
+ * @param {number} input.seq
+ * @returns {Promise<{ok:boolean, error?:string}>}
+ */
+export async function attachMetadata({ paneId, targetSource, tokens = {}, clear = [], seq }) {
+  const args = ["pane", "report-metadata", paneId, "--source", ownSource()];
+  if (targetSource) args.push("--applies-to-source", targetSource);
+  for (const [k, v] of Object.entries(tokens)) {
+    args.push("--token", `${k}=${String(v ?? "")}`);
+  }
+  for (const k of clear) args.push("--clear-token", k);
+  args.push("--seq", String(seq));
+  const res = await cli(args);
+  if (!res.ok) return { ok: false, error: res.error || res.stderr || "report-metadata 失败" };
+  return { ok: true };
+}
+
 export async function reportAgent({ paneId, state, seq, sessionId, message }) {
   const args = [
     "pane",

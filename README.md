@@ -159,7 +159,7 @@ command = "opencode.session-mirror.board"
 | `POLL_INTERVAL_MS` | `5000` | 轮询兜底间隔 |
 | `IDLE_GRACE_MS` | `15000` | 转为非活跃后保留行的宽限时间 |
 | `AGENT_VIEW_SCOPE` | `mirror` | 投影范围：`mirror` 只显示镜像行 / `sort-only` 只排序 |
-| `RESUME_MODE` | `opencode` | Herdr 重启后的恢复命令，见下 |
+| `RESUME_MODE` | — | **已废弃**，写了会被忽略并在启动日志里提示。恢复命令恒为常驻进程，见下 |
 | `MIRROR_PANE_RATIO` | `0.5` | 初始切分比例，建完立刻被重平衡覆盖 |
 | `MIRROR_PANE_DIRECTION` | `down` | 排列方向 `down` / `right` |
 | `REBALANCE_INTERVAL_MS` | `30000` | 常规重平衡巡检间隔。建行/回收时是即时的，这里只负责把别人（sidebar 插件、用户手动拖动）改乱的布局纠回来 |
@@ -173,15 +173,22 @@ command = "opencode.session-mirror.board"
 
 改完 `.env` 需要重启看板面板（关掉标签页再打开）才生效。
 
-### 关于 `RESUME_MODE`
+### 关于恢复命令（`RESUME_MODE` 已废弃）
 
-`opencode`（默认）恢复命令是 `opencode --session <id>`。注意副作用：**Herdr 重启后
-这个镜像 pane 会真的跑起 opencode**。此时官方集成会在同一个 pane 上报，那个 session
-变成「已有人上报」，我们下一轮去重就主动让出这一行 —— 所以不会出现重复行，反而变成
-了那一行可以直接交互的真实 session。
+恢复命令**恒为常驻进程**（`node mirror.mjs`），镜像 pane 内绝不运行 opencode。
 
-如果你要严格保证「镜像 pane 内永不运行 opencode」，设成 `mirror`，恢复命令就只是
-重启空转的驻留进程。
+曾经有个 `RESUME_MODE=opencode` 选项，恢复命令是 `opencode --session <id>`，理由是
+「重启后镜像行还能接着聊」。**实测证明它会摧毁整个插件，已删除**：Herdr 重启时它在
+镜像 pane 里拉起 opencode TUI，官方集成随即在**同一个 pane** 上报官方 agent 行，把
+`oc_mirror` / `oc_session` 标记直接覆盖掉 —— 不是多出一行重复行，而是**这一行整个
+消失**。同时状态文件里 `paneId` 还在，插件以为它活着，既不重建也不让出，该目录的镜像
+功能静默失效。
+
+> 旧文档里写「下一轮去重会看到该 session 已被占用，主动让出这一行，所以不会出现重复
+> 行」—— 这个推理假设官方集成会**新增**一行，实测是**覆盖**同一行。
+
+想在某个镜像位置直接和 session 对话，手动敲 `opencode --session <id>` 即可：那一行会
+变成官方行，插件检测到标记丢失后主动让出，不会打架。
 
 ### 关于 `INSTALL_AGENT_VIEW`
 

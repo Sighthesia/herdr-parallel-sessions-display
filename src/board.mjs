@@ -47,7 +47,10 @@ const config = {
   agentViewScope: store.asEnum(raw, "AGENT_VIEW_SCOPE", ["mirror", "sort-only"], "mirror"),
   pollIntervalMs: store.asInt(raw, "POLL_INTERVAL_MS", 5_000, 1_000, 600_000),
   idleGraceMs: store.asInt(raw, "IDLE_GRACE_MS", 15_000, 0, 3_600_000),
-  resumeMode: store.asEnum(raw, "RESUME_MODE", ["opencode", "mirror"], "opencode"),
+  // 已废弃：RESUME_MODE=opencode 会在 herdr 重启时于镜像 pane 里拉起 opencode TUI，
+  // 官方集成随即覆盖掉我们这一行（不是新增重复行），镜像功能对该目录静默失效。
+  // 只读不认，写了就在启动时明确告知已忽略。
+  legacyResumeMode: str(raw?.RESUME_MODE || "").trim(),
   paneRatio: store.asFloat(raw, "MIRROR_PANE_RATIO", 0.5, 0.02, 0.98),
   paneDirection: store.asEnum(raw, "MIRROR_PANE_DIRECTION", ["down", "right"], "down"),
   rebalanceIntervalMs: store.asInt(raw, "REBALANCE_INTERVAL_MS", 30_000, 5_000, 600_000),
@@ -306,6 +309,15 @@ async function modePane() {
 
   // 接管历史映射：上次残留的 pane 可能已经没了，逐个验证
   await validateTrackedPanes();
+
+  if (config.legacyResumeMode && config.legacyResumeMode !== "mirror") {
+    log(
+      "warn",
+      `已忽略 RESUME_MODE=${config.legacyResumeMode}：那个值会在 Herdr 重启时于镜像 pane 里` +
+        `拉起 opencode，官方集成随即覆盖掉这一行（不是新增重复行），镜像功能会静默失效。` +
+        `恢复命令恒为常驻进程。想在某个镜像位置直接对话，手动敲 opencode --session <id> 即可。`,
+    );
+  }
 
   installSignalHandlers();
   await reconcile("启动"); // 先把 client 建起来，reconcile 内部会顺带开 SSE
@@ -668,6 +680,7 @@ async function applySessionState({ client, roots, activeStates, polledPermission
   {
     const index = await paneIndex();
     await sweepOrphanPanes("重算");
+    await sweepTakenOverPanes(index, "重算");
     pruneDeadCentral(index);
   }
 
@@ -1493,6 +1506,51 @@ async function sweepOrphanPanes(reason, { force = false } = {}) {
 }
 
 /**
+ * 清掉「映射还在、但这一行已经被别的来源接管」的镜像行。
+ *
+ * 接管就是 `oc_mirror` token 消失：有人在镜像 pane 里手动敲了
+ * `opencode --session <id>`，或者（旧的 `RESUME_MODE=opencode`）Herdr 重启时
+ * 自动重放了恢复命令。官方集成随后在同一个 pane 上报官方行，我们的标记被覆盖。
+ *
+ * 只看「pane 还在不在」是发现不了的 —— pane 好好地在那儿，于是这一行静默消失。
+ *
+ * 接管后官方集成已经报了该 session id，所以删掉映射就等于**让出**：正常的
+ * claimed 去重逻辑会接手。等这个 session 不再被任何 TUI 选中，它自然重新变成
+ * 镜像行。这也正是「同一 session 只出现一行」这条规则在起作用。
+ *
+ * 复用本轮已经取到的 pane 索引，不额外发请求。
+ */
+async function sweepTakenOverPanes(index, reason) {
+  const tracked = trackedMirrorPaneIds();
+  if (tracked.size === 0) return 0;
+
+  const live = new Map();
+  for (const pane of index.panes || []) {
+    const id = str(pane?.pane_id);
+    if (id) live.set(id, pane);
+  }
+
+  let dropped = 0;
+  for (const [sessionID, rec] of Object.entries(runtime.state.panes)) {
+    const paneId = str(rec?.paneId);
+    if (!paneId || !tracked.has(paneId)) continue;
+    const pane = live.get(paneId);
+    if (pane && herdr.isMirrorPane(pane)) continue;
+    if (!pane) continue; // pane 真没了，交给 validateTrackedPanes / 建行自愈
+
+    log("info", `镜像行 ${shortId(sessionID)} 的 pane ${paneId} 已被其它来源接管，让出（${reason}）`);
+    // 刻意**不**调 releaseAgent、也**不**关 pane：这一行现在归官方集成所有，
+    // 里面很可能有一个用户正在用的 opencode TUI。我们对它已经没有任何权利，
+    // 碰它就是破坏用户的工作。放弃映射就够了。
+    delete runtime.state.panes[sessionID];
+    await store.removeFile(path.join(STATE_DIR, `mirror-${sessionID}.json`));
+    dropped += 1;
+  }
+  if (dropped > 0) invalidatePaneIndex();
+  return dropped;
+}
+
+/**
  * 清掉「central 兜底工作区已经没了」的记录。
  *
  * 需要这一步是因为 herdr 会**自动回收空工作区**：标签页关掉之后工作区自己就没了，
@@ -1907,17 +1965,25 @@ function fingerprintOf(rec) {
 /**
  * Herdr 会把 resume 命令重新执行，规则（官方 add-herdr-support 文档）：
  * 第一个词必须是 PATH 上的纯命令名，不能是路径；<=64 个参数；参数里不能有控制字符。
- * 所以这里只能用 "node" / "opencode"，不能用 process.execPath。
+ * 所以这里只能用 "node"，不能用 process.execPath。
+ *
+ * **恢复命令恒为常驻进程，绝不恢复 opencode。**
+ *
+ * 曾经有个 `RESUME_MODE=opencode` 选项，恢复命令是 `opencode --session <id>`，
+ * 理由是「重启后镜像行还能接着聊」。实测证明它会摧毁整个插件：
+ * herdr 重启时它在镜像 pane 里拉起 opencode TUI，官方集成随即在**同一个 pane**
+ * 上报官方 agent 行，把我们的 `oc_mirror` / `oc_session` token 直接覆盖掉 ——
+ * 不是多出一行重复行，而是**这一行整个消失**。而状态文件里 `paneId` 还在，
+ * 插件于是以为它活着，既不重建也不让出，镜像功能对该目录静默失效。
+ *
+ * 旧注释里写「下一轮去重会看到该 session 已被占用，主动让出这一行，所以不会
+ * 重复」—— 这个推理是错的，它假设官方集成会**新增**一行，实际是**覆盖**同一行。
+ *
+ * 想在某个镜像位置直接和 session 对话，就手动敲 `opencode --session <id>`；
+ * 那样它会变成一个官方行，插件下一轮就会自动让出，不会打架。
  */
-function resumeArgvFor(sessionID) {
-  if (config.resumeMode === "mirror") {
-    // 不恢复 opencode，只恢复驻留进程 —— 严格遵守「镜像 pane 不运行 opencode」
-    return ["node", MIRROR_SCRIPT];
-  }
-  // SPEC 6.2：恢复命令用 `opencode --session <id>`。
-  // 副作用是 herdr 重启后这个 pane 会真的跑起 opencode；此时官方集成会在同一个 pane 上报，
-  // 我们下一轮去重就会看到该 session 已被占用，主动让出这一行 —— 所以不会重复。
-  return ["opencode", "--session", sessionID];
+function resumeArgvFor() {
+  return ["node", MIRROR_SCRIPT];
 }
 
 /**
@@ -1944,7 +2010,7 @@ async function reportMirror(sessionID, rec) {
 
   const firstReport = rec.reportedAt === 0 || rec.fingerprint === "";
   const stateChanged = firstReport || rec.state !== rec.lastState || rec.stateMessage !== rec.lastStateMessage;
-  const identityStale = firstReport || rec.lastResume !== config.resumeMode;
+  const identityStale = firstReport || rec.lastResume !== "mirror";
 
   // --- 步骤 1：状态 + session 身份（不含 resume argv） ----------------------
   if (firstReport || stateChanged || identityStale) {
@@ -1976,8 +2042,8 @@ async function reportMirror(sessionID, rec) {
       resumeArgv: resumeArgvFor(sessionID),
     });
     if (res.ok) {
-      rec.lastResume = config.resumeMode;
-      log("info", `上报[2/2] ${shortId(sessionID)} 恢复命令已挂上（${config.resumeMode}）`);
+      rec.lastResume = "mirror";
+      log("info", `上报[2/2] ${shortId(sessionID)} 恢复命令已挂上（常驻进程，不跑 opencode）`);
     } else {
       log("warn", `上报[2/2] 失败（${shortId(sessionID)}），只影响 Herdr 重启后的恢复，不影响这一行: ${res.error}`);
     }
@@ -2086,6 +2152,27 @@ async function validateTrackedPanes() {
     const pane = await herdr.paneGet(rec.paneId);
     if (!pane) {
       log("info", `上次的镜像 pane ${rec.paneId} 已不存在，丢弃该行（session 仍在跑会重新建）`);
+      delete runtime.state.panes[sessionID];
+      await store.removeFile(path.join(STATE_DIR, `mirror-${sessionID}.json`));
+      dropped += 1;
+      continue;
+    }
+    // pane 还在、但 `oc_mirror` 标记没了 → 这一行已经被**别的来源接管**。
+    //
+    // 真实事故：`RESUME_MODE=opencode` 让 Herdr 重启时在镜像 pane 里拉起 opencode
+    // TUI，官方集成在同一个 pane 上报官方行，把我们的 token 覆盖掉了。只查
+    // 「pane 还在不在」完全看不出这一点——pane 好好地在那儿，于是这一行静默消失，
+    // 而状态文件里映射还在，插件既不重建也不让出。
+    //
+    // 接管之后官方集成已经报了该 session id，所以正确做法是**删掉映射让它让出**，
+    // 由正常的 claimed 去重逻辑接手；等这个 session 不再被任何 TUI 选中，它会
+    // 自然重新变成镜像行。
+    if (!herdr.isMirrorPane(pane)) {
+      log(
+        "info",
+        `镜像 pane ${rec.paneId} 已被其它来源接管（标记丢失），让出这一行` +
+          `（session 仍在跑且未被选中时会重新建）`,
+      );
       delete runtime.state.panes[sessionID];
       await store.removeFile(path.join(STATE_DIR, `mirror-${sessionID}.json`));
       dropped += 1;

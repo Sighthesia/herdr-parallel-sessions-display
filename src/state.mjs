@@ -22,7 +22,8 @@ export const CONFIG_DEFAULTS = Object.freeze({
   // --- SPEC 第 7 节之外、为可运行性补的项（README 有完整表格）---
   AGENT_VIEW_SCOPE: "mirror", // mirror | sort-only
   MIRROR_TAB_LABEL: "oc-sessions",
-  RESUME_MODE: "opencode", // opencode | mirror
+  // 已废弃：写什么都会被忽略，只用来在启动日志里提示。恢复命令恒为常驻进程。
+  RESUME_MODE: "",
   MIRROR_PANE_RATIO: "0.5",
   MIRROR_PANE_DIRECTION: "down",
   SESSION_LIST_LIMIT: "200",

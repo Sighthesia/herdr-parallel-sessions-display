@@ -421,6 +421,25 @@ export const MIRROR_SESSION_TOKEN = "oc_session";
  */
 export const PARALLEL_TOKEN = "oc_par";
 
+/**
+ * 多行版：每个并行 session 一个 token，各占侧边栏一行。
+ *
+ * 为什么必须一行一个 token：token 的值里**换行会被去掉**（实测
+ * `"a\nb\nc"` 存下来是 `"abc"`），所以单个 token 无论塞什么都只能渲染成一行。
+ * 想让 N 个 session 各占一行，只能用 N 个 token 分别放进 N 个 row。
+ *
+ * token 数量受两条限制夹击：
+ *   · `ui.sidebar.agents.rows` 最多 16 行
+ *   · 如果某一行**所有 token 都为空时 Herdr 不折叠该行**，那么每多一个 slot，
+ *     每个 agent 行就多一行空白。所以 slot 数是「能显示几个」与「空白有多难看」
+ *     的取舍，默认 4。
+ *
+ * 侧边栏模板里对应写：
+ *   rows = [["workspace"], ["state_icon","agent"], ["terminal_title_stripped"],
+ *           ["$oc_par1"], ["$oc_par2"], ["$oc_par3"], ["$oc_par4"]]
+ */
+export const PARALLEL_TOKENS = ["oc_par1", "oc_par2", "oc_par3", "oc_par4"];
+
 /** 算一个 agent 是不是我们自己的镜像行。 */
 export function isMirrorRow(agent) {
   const tokens = agent?.tokens;

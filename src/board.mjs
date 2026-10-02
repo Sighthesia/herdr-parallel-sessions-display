@@ -1133,11 +1133,14 @@ async function publishInlineParallel(wanted, statesById) {
     return rows[0];
   };
 
-  // 先算出「每个官方行应得的值」，再拿它跟实际值对比 —— **不依赖进程内的
+  // 先算出「每个官方行应得的槽位值」，再拿它跟实际值对比 —— **不依赖进程内的
   // 记账**。踩过的坑：清理逻辑原本遍历 `runtime.attachedParallel`，而那个 Map
   // 随进程生死；board 重启后它空了，于是上一轮挂在别人工作区上的过期 token
   // 再也没人清，一直挂在侧边栏上（实测 session 都跑完了，oc_par 还显示着旧的
-  // 「内联验证-B」）。以 agent.list 的实际值为准才幂等。
+  // 「内行验证-B」）。以 agent.list 的实际值为准才幂等。
+  const tokens = herdr.PARALLEL_TOKENS;
+  // 单行版时代的残留 token，早已不在模板里，顺手清掉免得白占 metadata 配额
+  const legacyTokens = [herdr.PARALLEL_TOKEN];
   const desired = new Map();
   for (const [workspaceId, infos] of byWorkspace) {
     const host = pickHost(workspaceId);
@@ -1148,7 +1151,7 @@ async function publishInlineParallel(wanted, statesById) {
       );
       continue;
     }
-    desired.set(str(host.pane_id), { agent: host, value: formatParallelToken(infos, statesById) });
+    desired.set(str(host.pane_id), { agent: host, slots: formatParallelSlots(infos, statesById) });
   }
 
   let attached = 0;
@@ -1156,38 +1159,58 @@ async function publishInlineParallel(wanted, statesById) {
 
   for (const agent of official) {
     const paneId = str(agent.pane_id);
-    const actual = agent.tokens?.[herdr.PARALLEL_TOKEN];
     const want = desired.get(paneId);
+    const actualTokens = agent.tokens || {};
+    // 本轮该有值的槽位 + 本轮该为空但实际有值的槽位
+    const stale = tokens.filter((t) => actualTokens[t] != null);
+    const legacy = legacyTokens.filter((t) => actualTokens[t] != null);
 
     if (!want) {
-      // 本轮不该有，但实际有 → 清掉
-      if (actual == null) continue;
+      if (stale.length === 0 && legacy.length === 0) continue;
       const res = await herdr.attachMetadata({
         paneId,
         targetSource: agent.agent_session.source,
-        clear: [herdr.PARALLEL_TOKEN],
+        clear: [...stale, ...legacy],
         seq: nextSeq(),
       });
       if (res.ok) {
         cleared += 1;
-        log("debug", `清除 ${paneId} 上过期的 ${herdr.PARALLEL_TOKEN}`);
+        log("debug", `清除 ${paneId} 上过期的 ${stale.join(",")}`);
       } else {
-        log("warn", `清除 ${paneId} 的 ${herdr.PARALLEL_TOKEN} 失败：${res.error}`);
+        log("warn", `清除 ${paneId} 的 ${stale.join(",")} 失败：${res.error}`);
       }
       continue;
     }
 
-    // 值没变就不写，避免每 5 秒打一次 socket
-    if (actual === want.value) continue;
+    // 只写「值不同」的槽位；用不到的槽位显式置空（attachMetadata 用空串覆盖）
+    const payload = {};
+    const toClear = [...legacy];
+    for (let i = 0; i < tokens.length; i += 1) {
+      const name = tokens[i];
+      const next = want.slots[i] ?? "";
+      const cur = actualTokens[name];
+      if (next) {
+        if (cur !== next) payload[name] = next;
+      } else if (cur != null) {
+        toClear.push(name);
+      }
+    }
+    if (Object.keys(payload).length === 0 && toClear.length === 0) continue;
+
     const res = await herdr.attachMetadata({
       paneId,
       targetSource: want.agent.agent_session.source,
-      tokens: { [herdr.PARALLEL_TOKEN]: want.value },
+      tokens: payload,
+      clear: toClear,
       seq: nextSeq(),
     });
     if (res.ok) {
       attached += 1;
-      log("debug", `并行信息已挂到 ${paneId}：${want.value}`);
+      log(
+        "debug",
+        `并行信息已挂到 ${paneId}：${want.slots.filter(Boolean).join(" / ")}` +
+          (toClear.length ? `（清掉 ${toClear.join(",")}）` : ""),
+      );
     } else {
       log("warn", `并行信息挂载失败（${paneId}）：${res.error}`);
     }
@@ -1254,33 +1277,43 @@ export function resolveInlineHostWorkspace(directory, index, official) {
 }
 
 /**
- * 把一组并行 session 拼成 token 值。
+ * 把一组并行 session 拆成「每个一行」的值数组。
  *
- * 硬上限 80 字符（Herdr 侧硬截断），所以这里自己先算好：能放下几个标题就放几个，
- * 剩下的用 `+N` 收尾 —— 让用户看到「还有几个」比硬截断在半句话里有用。
+ * **不能塞进一个 token** —— token 值里的换行会被去掉（实测 `"a\nb\nc"` 存下来是
+ * `"abc"`），所以一行只能显示一个 session，多个必须各占一个 token / 一个 row。
+ *
+ * 槽位数 = `herdr.PARALLEL_TOKENS` 的长度。超出时把多出来的折成最后一行末尾的
+ * 「+N」—— 让人知道「还有几个」比静默丢掉强。没占用的槽位返回空字符串，
+ * 对应那一行渲染成空白。
+ *
+ * 单行上限仍是 80 字符（Herdr 硬截断），但每个 session 现在独享这个预算，
+ * 标题基本能完整显示。
  */
-export function formatParallelToken(infos, statesById = new Map()) {
+export function formatParallelSlots(infos, statesById = new Map()) {
+  const slots = herdr.PARALLEL_TOKENS;
   const limit = config.parallelTokenMax;
   const marked = infos.map((i) => {
     const st = statesById.get(i.id) || "";
     const mark =
       st === "working" ? "●" : st === "blocked" ? "▲" : st === "idle" ? "○" : st === "retry" ? "↻" : "·";
-    return `${mark} ${store.truncate(store.sanitizeText(i.title || "(无标题)", 40), 40)}`;
+    const t = store.truncate(store.sanitizeText(i.title || "(无标题)", 60), 60);
+    return `${mark} ${t}`.slice(0, limit);
   });
-  if (marked.length === 0) return "";
+  if (marked.length === 0) return slots.map(() => "");
 
-  const tail = (n) => ` +${n}`;
-  let out = marked[0];
-  for (let i = 1; i < marked.length; i += 1) {
-    const next = `${out} · ${marked[i]}`;
-    // 还要给「+N」留位置：至少 6 个字符，否则宁可现在就收尾
-    if (next.length + 6 > limit) {
-      out += tail(marked.length - i);
-      break;
-    }
-    out = next;
+  const out = slots.map(() => "");
+  const shown = Math.min(marked.length, slots.length);
+  for (let i = 0; i < shown - 1; i += 1) out[i] = marked[i];
+
+  // 最后一行：既要装最后一个标题，又要在有溢出时留出「+N」的位置
+  const rest = marked.length - (shown - 1);
+  const tail = rest > 1 ? ` +${rest - 1}` : "";
+  if (marked[shown - 1].length + tail.length <= limit) {
+    out[shown - 1] = marked[shown - 1] + tail;
+  } else {
+    out[shown - 1] = marked[shown - 1].slice(0, Math.max(0, limit - tail.length)) + tail;
   }
-  return out.slice(0, limit);
+  return out;
 }
 
 /**

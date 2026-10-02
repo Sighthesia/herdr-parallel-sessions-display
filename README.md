@@ -6,6 +6,8 @@ Agents 视图里。
 默认走**内联模式**：不创建任何 pane、不创建任何标签页，session 列表以 token 的形式挂在
 该目录的官方 agent 行下面，画成 ASCII 树状图。
 
+想改这个插件本身的话，见文末的[「开发」](#开发)。
+
 ## 它解决什么问题
 
 你在一个目录里开着 OpenCode，同一个 server 里跑着好几个 session。Herdr 自带的
@@ -118,18 +120,62 @@ Herdr Agents 视图
 
 ## 安装
 
-```bash
-# 1. 从本目录 link（开发）或从 GitHub install
-herdr plugin link /path/to/opencode-session-mirror
+### 前置条件
 
-# 2. 找到配置目录，把 config/.env.example 复制成 .env
+| 依赖 | 要求 | 说明 |
+| --- | --- | --- |
+| [Herdr](https://herdr.dev/) | ≥ 0.9.3 | `herdr-plugin.toml` 里 `min_herdr_version` 声明的最低版本，低于它 Herdr 直接拒绝安装 |
+| [Node.js](https://nodejs.org/) | **必须在 `PATH` 上** | 常驻进程就是 `node src/board.mjs`，而 Herdr 是在 `PATH` 上找 `node`。**找不到时不会报错**：启动钩子和三个 action 静默失败，侧边栏什么都不出现。验证：`node --version` |
+| 操作系统 | Linux 或 macOS | 清单里声明了这两个平台。**真机联调只在 Linux 上做过**，macOS 目前只有代码审查结论 |
+| opencode server | 正在运行 | 插件的全部数据都来自它的 HTTP 接口，没有它插件什么都不显示。开着任意一个 opencode TUI 就行 |
+
+**codex 和 Claude Code 是可选的**：没装就自动不采集对应那部分。装了还得有 Herdr 认得的
+**官方 agent 行**能挂 —— 默认的内联模式是把 session 列表挂在官方行下面的，一个官方行都没有
+就等于没地方挂（分别见下面「codex 支持」和「Claude Code 支持」）。
+
+插件**零第三方依赖、没有构建步骤**：清单里没有 `[[build]]`，代码全是 Node 内置模块的
+`.mjs`，仓库里也没有 `package.json`。所以不需要 `npm install`，克隆下来直接跑。
+
+### 从 GitHub 安装
+
+```bash
+herdr plugin install Sighthesia/herdr
+```
+
+`install` 只接受 GitHub 简写（`owner/repo` 或 `owner/repo/子目录`）。它用 `git` 克隆仓库，
+**在交互式终端里先给一次预览**（源地址 + 将会执行的命令）再让你确认；已经信任这个仓库
+加 `--yes` 跳过确认，想钉死某个分支、tag 或提交就加 `--ref`：
+
+```bash
+herdr plugin install Sighthesia/herdr --yes
+herdr plugin install Sighthesia/herdr --ref <分支或提交>
+```
+
+本插件没有 `[[build]]`，所以安装过程不会执行任何构建命令。
+
+然后写配置、打开看板：
+
+```bash
+# 1. 找到配置目录（install 时已经建好）
 herdr plugin config-dir opencode.session-mirror
 
-# 3. 打开看板（这会在 Herdr 里开一个标签页，进程在里面常驻）
+# 2. 把插件目录里的 config/.env.example 复制成上面那个目录下的 .env
+#    （插件目录就是那份检出，herdr-plugin.toml 在它的根目录）
+
+# 3. 打开看板 —— 常驻管理器就跑在这个标签页里
 herdr plugin pane open --plugin opencode.session-mirror --entrypoint board
 ```
 
-绑定快捷键的话，在 `~/.config/herdr/config.toml` 里加：
+GitHub 安装的插件目录是 Herdr 托管的检出目录，所以**模板要从那儿拿，`.env` 要写在
+`herdr plugin config-dir` 指出的目录里**，别写进插件目录。
+
+`.env` **可以全部留空**，默认值直接能跑；模板里每个键都带中文注释，配置项的含义见下面
+「配置」。**改完 `.env` 必须关掉看板标签页再重新打开才生效** —— 配置只在进程启动时读一次。
+
+### 可选：绑定快捷键
+
+不想绑键也行，这三个 action 都能在 Herdr 的命令面板里按 id 调用。绑键的话在
+`~/.config/herdr/config.toml` 里加：
 
 ```toml
 [[keys.command]]
@@ -145,6 +191,38 @@ command = "opencode.session-mirror.board"
 | `opencode.session-mirror.board` | 打开看板（常驻管理器） |
 | `opencode.session-mirror.sync` | 立刻触发一次全量重算 |
 | `opencode.session-mirror.reap` | 回收所有镜像行和镜像 pane |
+
+### 安装后如果侧边栏没反应
+
+按顺序走这三步，完整版见下面[「故障排查」](#故障排查)：
+
+1. **看板标签页在不在。** 常驻管理器就是那个标签页里的 node 进程，它不跑的时候插件什么都不做
+   （侧边栏上留着最后一次成功重算时的内容，看起来完全正常）。拉起来：
+   `herdr plugin action invoke opencode.session-mirror.sync`
+2. **看板面板的输出不进 plugin log**，只能读 pane：
+
+   ```bash
+   herdr pane list --json | jq -r '.result.panes[]|select(.label=="OpenCode Sessions")|.pane_id'
+   herdr pane read <看板pane_id> --lines 200
+   ```
+
+3. **开 debug。** 把 `LOG_LEVEL=debug` 写进 `.env`，关掉看板标签页再重新打开。debug 会逐条
+   打出每个 session 为什么建行 / 不建行。
+
+#### opencode server 找不到？
+
+自动探测的顺序是：`.env` 里的显式 `OPENCODE_SERVER_URL` → 默认端口 `4096` → 扫监听端口
+挑进程名含 `opencode` 的逐个试。
+
+最后一步依赖系统的 `lsof`（Linux 上优先用 `ss`，来自 `iproute2`）。**两个都没有时不会
+报错** —— 候选地址里就只剩默认端口，而你的 server 在别的端口上，于是永远连不上，表现和
+「插件坏了」一模一样。server 跑在非默认端口时也是这个症状。
+
+两个办法二选一：装上 `lsof`（或 `iproute2`），或者在 `.env` 里直接写死：
+
+```bash
+OPENCODE_SERVER_URL=http://127.0.0.1:4096
+```
 
 ## 配置
 
@@ -486,7 +564,7 @@ label；`AgentInfo` 里唯一相关的 `interactive_ready` 在 0.9.3 根本不�
 
 插件同时适配 opencode v1 和 v2 的 HTTP 面，靠 `/api/info` 或 `/global/health` 自动判定：
 
-| | v1 | v2（本机实测 2.0.21） |
+| | v1 | v2 |
 | --- | --- | --- |
 | 健康检查 | `GET /global/health` | `GET /api/info`（v2 没有 health 路由） |
 | 活跃状态 | `GET /session/status` | `GET /api/session/active` |
@@ -685,3 +763,90 @@ herdr plugin config-dir opencode.session-mirror   # 把绝对路径写进 CLAUDE
   token 也设了 pane label，但 `herdr-sidebar` 的 `hs_title` 优先级更高，改它要你自己动手。
 - v2 下 `retry` 探测每个活跃 session 多一次 HTTP 请求，行多时可以在 `.env` 里
   关掉 `RETRY_DETECTION`。
+
+## 开发
+
+改这个插件本身之前，先读完这一节。想改插件的只有作者，`install` 是给用户用的、`link`
+是给作者用的，两者不要混。
+
+### 本机开发流程
+
+```bash
+git clone https://github.com/Sighthesia/herdr.git
+cd herdr
+herdr plugin link /绝对路径/herdr
+```
+
+`link` **不会执行 `[[build]]`**（本插件也没有构建步骤），它只是把当前工作目录注册进去，
+所以「能不能跑起来」这件事由你自己保证。改完代码**关掉看板标签页再重新打开**才生效 ——
+不关的话跑的还是旧代码。已经 `install` 过同一插件再 `link` 会被 Herdr 拒绝，先
+`herdr plugin unlink opencode.session-mirror`。
+
+### 没有测试套件，验证只能真机联调
+
+这个仓库**没有 `package.json`、没有第三方依赖、没有构建、没有 lint、没有 CI，也没有任何
+能离线跑的测试**。别去找测试框架、别加 CI，这套东西目前不存在。
+
+纯函数（例如 `parseSs` / `parseLsof`）可以用 `node -e` 单独断言，但**行为正确性只能真机跑**：
+打开看板、开几个 opencode / codex / claude 会话、看侧边栏。
+
+### 自检模式
+
+```bash
+node src/board.mjs --mode once
+```
+
+跑一轮就退，不抢常驻锁。但正因为两者都往同一批 pane 上写 token，**它和常驻管理器并存时会
+互相覆盖侧边栏上的内容** —— 只在管理器不跑时用（或明知后果时再用）。
+
+### 怎么看日志
+
+看板面板的输出**不进 plugin log**（`herdr plugin log list` 里找不到），只能走 pane：
+
+```bash
+herdr pane list --json | jq -r '.result.panes[]|select(.label=="OpenCode Sessions")|.pane_id'
+herdr pane read <看板pane_id> --lines 200
+```
+
+`LOG_LEVEL=debug` 写进 `.env` 并重启看板标签页后会逐条打出每个 session 建行 / 不建行的
+原因。`.env` 里写了插件不认识的键时，启动日志会 warn。
+
+### 新增一个配置键必须同时改四处
+
+最容易踩的坑：`src/state.mjs` 里的 `CONFIG_DEFAULTS` 是**白名单**，不在里面的键会被
+`loadConfig` **静默丢弃** —— 表现是「改了配置完全没反应且没有任何提示」，历史上因此白配过
+七个键。新增一个键要同时改：
+
+1. `src/state.mjs` 的 `CONFIG_DEFAULTS`
+2. `src/board.mjs` 的 `config` 对象
+3. [`config/.env.example`](config/.env.example)
+4. 本文档的「配置」表格
+
+启动日志会对未知键打 warn（拼错的键也走这条路），看到就别再怀疑时序了 —— 那个键根本没被读。
+
+### 提交规范
+
+conventional commit，中文描述（与仓库历史一致）：
+
+```
+feat: 支持 xx
+fix: xx 场景下 yy 不对
+docs: 补上 zz 的说明
+perf: 降低忙标记开销
+```
+
+### 改代码前必读
+
+完整清单在 [`AGENTS.md`](AGENTS.md)：入口与装配方式（`herdr-plugin.toml` +
+`src/board.mjs` 的四种模式）、各文件职责、实测踩出来的硬约束、以及排障入口。最要紧的三条：
+
+- **不要碰官方集成文件**（`~/.config/opencode/plugins/herdr-agent-state.js`、
+  `~/.claude/hooks/herdr-agent-state.sh` 等），也不要用 `herdr integration install/uninstall`
+  —— 同一 pane 的状态归属是独占的。
+- **镜像 pane 里绝不运行 opencode，也绝不运行 claude**，恢复命令恒为常驻进程。
+- **只用 `layout.set_split_ratio`，绝不用 `layout.apply`**（apply 重建标签页、销毁所有
+  终端进程）。
+
+`AGENTS.md` 里那些注释的密度是有意的：它们写的是「为什么这样、实测踩到什么坑」，不是复述
+代码。改代码时保持这个密度。
+

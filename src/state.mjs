@@ -66,7 +66,7 @@ export const CONFIG_DEFAULTS = Object.freeze({
   // --- codex（SPEC 第 11 节）---
   CODEX_ENABLED: "true",
   CODEX_SOCKET: "",
-  CODEX_CLIENT_NAME: "herdr-session-mirror",
+  CODEX_CLIENT_NAME: "herdr-parallel-sessions-display",
   // 空 = 用 codex.mjs 里的默认集合（cli,exec,appServer,vscode，靠排除 subAgent* 实现
   // 「子 agent 不单列」）。不要只填 cli：实测 kind 是 vscode 的 thread 会被过滤掉。
   CODEX_SOURCE_KINDS: "",

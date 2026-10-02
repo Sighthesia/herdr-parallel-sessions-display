@@ -1,4 +1,4 @@
-# opencode-session-mirror
+# herdr-parallel-sessions-display
 
 把 **opencode**、**codex** 和 **Claude Code** 里正在运行的会话，按工作区分组显示在 Herdr
 Agents 视图里。
@@ -139,7 +139,7 @@ Herdr Agents 视图
 ### 从 GitHub 安装
 
 ```bash
-herdr plugin install Sighthesia/herdr
+herdr plugin install Sighthesia/herdr-parallel-sessions-display
 ```
 
 `install` 只接受 GitHub 简写（`owner/repo` 或 `owner/repo/子目录`）。它用 `git` 克隆仓库，
@@ -147,8 +147,8 @@ herdr plugin install Sighthesia/herdr
 加 `--yes` 跳过确认，想钉死某个分支、tag 或提交就加 `--ref`：
 
 ```bash
-herdr plugin install Sighthesia/herdr --yes
-herdr plugin install Sighthesia/herdr --ref <分支或提交>
+herdr plugin install Sighthesia/herdr-parallel-sessions-display --yes
+herdr plugin install Sighthesia/herdr-parallel-sessions-display --ref <分支或提交>
 ```
 
 本插件没有 `[[build]]`，所以安装过程不会执行任何构建命令。
@@ -157,13 +157,13 @@ herdr plugin install Sighthesia/herdr --ref <分支或提交>
 
 ```bash
 # 1. 找到配置目录（install 时已经建好）
-herdr plugin config-dir opencode.session-mirror
+herdr plugin config-dir herdr-parallel-sessions-display
 
 # 2. 把插件目录里的 config/.env.example 复制成上面那个目录下的 .env
 #    （插件目录就是那份检出，herdr-plugin.toml 在它的根目录）
 
 # 3. 打开看板 —— 常驻管理器就跑在这个标签页里
-herdr plugin pane open --plugin opencode.session-mirror --entrypoint board
+herdr plugin pane open --plugin herdr-parallel-sessions-display --entrypoint board
 ```
 
 GitHub 安装的插件目录是 Herdr 托管的检出目录，所以**模板要从那儿拿，`.env` 要写在
@@ -181,16 +181,16 @@ GitHub 安装的插件目录是 Herdr 托管的检出目录，所以**模板要�
 [[keys.command]]
 key = "prefix+shift+o"
 type = "plugin_action"
-command = "opencode.session-mirror.board"
+command = "herdr-parallel-sessions-display.board"
 ```
 
 插件自带三个 action：
 
 | action | 作用 |
 | --- | --- |
-| `opencode.session-mirror.board` | 打开看板（常驻管理器） |
-| `opencode.session-mirror.sync` | 立刻触发一次全量重算 |
-| `opencode.session-mirror.reap` | 回收所有镜像行和镜像 pane |
+| `herdr-parallel-sessions-display.board` | 打开看板（常驻管理器） |
+| `herdr-parallel-sessions-display.sync` | 立刻触发一次全量重算 |
+| `herdr-parallel-sessions-display.reap` | 回收所有镜像行和镜像 pane |
 
 ### 安装后如果侧边栏没反应
 
@@ -198,11 +198,11 @@ command = "opencode.session-mirror.board"
 
 1. **看板标签页在不在。** 常驻管理器就是那个标签页里的 node 进程，它不跑的时候插件什么都不做
    （侧边栏上留着最后一次成功重算时的内容，看起来完全正常）。拉起来：
-   `herdr plugin action invoke opencode.session-mirror.sync`
+   `herdr plugin action invoke herdr-parallel-sessions-display.sync`
 2. **看板面板的输出不进 plugin log**，只能读 pane：
 
    ```bash
-   herdr pane list --json | jq -r '.result.panes[]|select(.label=="OpenCode Sessions")|.pane_id'
+   herdr pane list --json | jq -r '.result.panes[]|select(.label=="Herdr Sessions")|.pane_id'
    herdr pane read <看板pane_id> --lines 200
    ```
 
@@ -226,7 +226,7 @@ OPENCODE_SERVER_URL=http://127.0.0.1:4096
 
 ## 配置
 
-写在 `herdr plugin config-dir opencode.session-mirror` 指出的目录下的 `.env`。
+写在 `herdr plugin config-dir herdr-parallel-sessions-display` 指出的目录下的 `.env`。
 完整的带注释版本见 [`config/.env.example`](config/.env.example)。
 
 | 键 | 默认 | 说明 |
@@ -264,7 +264,7 @@ OPENCODE_SERVER_URL=http://127.0.0.1:4096
 | `LOG_LEVEL` | `info` | `debug` 适合排查问题 |
 | `CODEX_ENABLED` | `true` | 是否采集 codex 的 session。关掉就完全不连 codex 的 app-server |
 | `CODEX_SOCKET` | 空 | codex app-server 控制 socket 路径。留空用默认 `~/.codex/app-server-control/app-server-control.sock` |
-| `CODEX_CLIENT_NAME` | `herdr-session-mirror` | `initialize` 握手里上报的客户端名 |
+| `CODEX_CLIENT_NAME` | `herdr-parallel-sessions-display` | `initialize` 握手里上报的客户端名 |
 | `CODEX_SOURCE_KINDS` | 空 | 留空 = 内置 `cli,exec,appServer,vscode`（排除法滤掉子 agent）。**不要只填 `cli`**，实测会把 vscode 源的会话全滤掉且不报错 |
 | `CODEX_SESSION_LIMIT` | `100` | 每页拉多少条 thread |
 | `CODEX_TIMEOUT_MS` | `8000` | 单次 app-server 请求超时 |
@@ -585,7 +585,7 @@ v2 的两个坑插件都处理了：SSE 会发 `: heartbeat` 注释行、事件�
 
 ```bash
 # 看板面板的输出不进 plugin log，要走 pane read —— 先找到看板那个 pane：
-herdr pane list --json | jq -r '.result.panes[] | select(.label=="OpenCode Sessions") | .pane_id'
+herdr pane list --json | jq -r '.result.panes[] | select(.label=="Herdr Sessions") | .pane_id'
 herdr pane read <看板pane_id> --lines 200
 ```
 
@@ -605,14 +605,14 @@ session 为什么建行 / 不建行（是让给真实 TUI 了，还是它是子 
 ps -ef | grep 'board\.mjs --mode pane' | grep -v grep
 
 # 2) 不在就拉起来。sync 动作会自己检查并重启它
-herdr plugin action invoke opencode.session-mirror.sync
+herdr plugin action invoke herdr-parallel-sessions-display.sync
 ```
 
 想让 Herdr 重启后自动拉起，把 `.env` 里的 `AUTO_START` 设成 `true`。
 
 **Agents 视图里一行都没有：**
 
-1. 看板面板是不是真的在跑？`herdr plugin pane open --plugin opencode.session-mirror --entrypoint board`
+1. 看板面板是不是真的在跑？`herdr plugin pane open --plugin herdr-parallel-sessions-display --entrypoint board`
 2. opencode server 能不能访问？日志里搜「已连接 opencode」。没有这行说明没连上。
    手动试一下：
 
@@ -630,7 +630,7 @@ herdr plugin action invoke opencode.session-mirror.sync
 
 ```bash
 # 1) 先把投影清掉。只清「确实是本插件装的」那一份，不会动别人的视图。
-herdr plugin action invoke opencode.session-mirror.sync
+herdr plugin action invoke herdr-parallel-sessions-display.sync
 ```
 
 > 上面这条 action 一启动就会做投影校准：`INSTALL_AGENT_VIEW=false` 而插件以为自己装过时，
@@ -644,7 +644,7 @@ herdr plugin action invoke opencode.session-mirror.sync
 # 2) 看板面板里搜这两行日志
 #    「重平衡镜像布局」      —— 说明镜像 pane 确实在
 #    「镜像行 N」            —— N=0 且投影仍带 filter 就是异常
-herdr plugin pane open --plugin opencode.session-mirror --entrypoint board
+herdr plugin pane open --plugin herdr-parallel-sessions-display --entrypoint board
 herdr pane read <看板pane_id> --lines 200
 ```
 
@@ -673,8 +673,8 @@ token。如果你装了 `herdr-sidebar`，它的 `hs_title` 优先级更高 —�
 **`Sessions` 兜底工作区不见了 / 镜像标签页残留：**
 
 ```bash
-herdr plugin pane open --plugin opencode.session-mirror --entrypoint board
-herdr plugin action invoke opencode.session-mirror.reap
+herdr plugin pane open --plugin herdr-parallel-sessions-display --entrypoint board
+herdr plugin action invoke herdr-parallel-sessions-display.reap
 ```
 
 `reap` 会先 release 再关掉所有镜像 pane，把每个目录的镜像标签页整页关掉，
@@ -710,7 +710,7 @@ claude agents --json
 
 # 3) claude 那个可执行文件在**看板进程**的 PATH 里吗？Herdr 是 GUI 起的，
 #    它的 PATH 未必和你终端一样。终端里能跑、插件里 spawn 不到就填 CLAUDE_BIN。
-herdr plugin config-dir opencode.session-mirror   # 把绝对路径写进 CLAUDE_BIN
+herdr plugin config-dir herdr-parallel-sessions-display   # 把绝对路径写进 CLAUDE_BIN
 ```
 
 - 第 1 步为空 = 没有 claude 跑在 Herdr 的 pane 里（后台 `claude -p` 的会话就属于这种，
@@ -772,15 +772,15 @@ herdr plugin config-dir opencode.session-mirror   # 把绝对路径写进 CLAUDE
 ### 本机开发流程
 
 ```bash
-git clone https://github.com/Sighthesia/herdr.git
-cd herdr
-herdr plugin link /绝对路径/herdr
+git clone https://github.com/Sighthesia/herdr-parallel-sessions-display.git
+cd herdr-parallel-sessions-display
+herdr plugin link /绝对路径/herdr-parallel-sessions-display
 ```
 
 `link` **不会执行 `[[build]]`**（本插件也没有构建步骤），它只是把当前工作目录注册进去，
 所以「能不能跑起来」这件事由你自己保证。改完代码**关掉看板标签页再重新打开**才生效 ——
 不关的话跑的还是旧代码。已经 `install` 过同一插件再 `link` 会被 Herdr 拒绝，先
-`herdr plugin unlink opencode.session-mirror`。
+`herdr plugin unlink herdr-parallel-sessions-display`。
 
 ### 没有测试套件，验证只能真机联调
 
@@ -804,7 +804,7 @@ node src/board.mjs --mode once
 看板面板的输出**不进 plugin log**（`herdr plugin log list` 里找不到），只能走 pane：
 
 ```bash
-herdr pane list --json | jq -r '.result.panes[]|select(.label=="OpenCode Sessions")|.pane_id'
+herdr pane list --json | jq -r '.result.panes[]|select(.label=="Herdr Sessions")|.pane_id'
 herdr pane read <看板pane_id> --lines 200
 ```
 

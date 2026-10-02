@@ -135,9 +135,9 @@ const config = {
   // 进程可能起在别处（`codex app-server daemon version` 会报真实路径），指过来最省事。
   codexSocket: store.asString(raw, "CODEX_SOCKET", ""),
   // clientInfo 会拼进 app-server 自己的 user-agent 串里（实测形如
-  // `codex-tui/0.160.0 … herdr/0.9.3 (herdr-session-mirror; 1)`），
+  // `codex-tui/0.160.0 … herdr/0.9.3 (herdr-parallel-sessions-display; 1)`），
   // 出问题时 codex 那边能一眼看出这条连接是谁。
-  codexClientName: store.asString(raw, "CODEX_CLIENT_NAME", "herdr-session-mirror"),
+  codexClientName: store.asString(raw, "CODEX_CLIENT_NAME", "herdr-parallel-sessions-display"),
   // 默认取「人开的」四种来源，**靠排除 subAgent\* 实现「子 agent 不单列」**。
   // 不能只填 `cli`：实测本机那两条 thread 的 kind 是 `vscode`，
   // `sourceKinds:["cli"]` 直接返回 0 条（会话凭空消失）。
@@ -4139,7 +4139,7 @@ export function shouldFilterMirror(agents) {
 export function buildAgentView(agents) {
   const params = {
     source: herdr.ownSource(),
-    label: "opencode-sessions",
+    label: "parallel-sessions",
     sort: [
       { field: "attention", order: "desc" },
       { field: "state_change_seq", order: "desc" },

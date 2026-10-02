@@ -233,7 +233,7 @@ export class CodexClient {
    */
   constructor(options = {}) {
     this.socketPath = options.socketPath || defaultSocketPath();
-    this.clientName = options.clientName || "herdr-session-mirror";
+    this.clientName = options.clientName || "herdr-parallel-sessions-display";
     this.clientVersion = options.clientVersion || "1";
     this.timeoutMs = options.timeoutMs || DEFAULT_TIMEOUT_MS;
 

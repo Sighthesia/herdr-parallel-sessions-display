@@ -36,26 +36,26 @@ Herdr 插件：把**同一个 opencode server 内所有运行中的根 session**
 
 ```bash
 # 开发：link 本目录，改完重启看板标签页即生效
-herdr plugin link /绝对路径/herdr
+herdr plugin link /绝对路径/herdr-parallel-sessions-display
 
 # 真正的 .env 在这里（仓库里的 config/.env.example 只是模板，已 gitignore）
-herdr plugin config-dir opencode.session-mirror
+herdr plugin config-dir herdr-parallel-sessions-display
 
 # 打开看板（常驻管理器跑在这个标签页里）
-herdr plugin pane open --plugin opencode.session-mirror --entrypoint board
+herdr plugin pane open --plugin herdr-parallel-sessions-display --entrypoint board
 
 # 立刻全量重算；管理器没在跑时这个 action 会自己把它拉起来
-herdr plugin action invoke opencode.session-mirror.sync
+herdr plugin action invoke herdr-parallel-sessions-display.sync
 
 # 收工：清所有镜像行 / 镜像 pane / 兜底工作区
-herdr plugin action invoke opencode.session-mirror.reap
+herdr plugin action invoke herdr-parallel-sessions-display.reap
 
 # 跑一轮就退的自检（不抢常驻锁，可在管理器运行时调试）
 node src/board.mjs --mode once
 ```
 
 - **日志不在 plugin log 里**，看板面板的输出要走
-  `herdr pane list --json | jq -r '.result.panes[]|select(.label=="OpenCode Sessions")|.pane_id'`
+  `herdr pane list --json | jq -r '.result.panes[]|select(.label=="Herdr Sessions")|.pane_id'`
   再 `herdr pane read <id> --lines 200`。排障先看这里。
 - 改完 `.env` **必须重启看板标签页**才生效。
 - 调不通就把 `LOG_LEVEL=debug`，debug 会逐条打出每个 session 建/不建行的原因。

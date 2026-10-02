@@ -20,7 +20,7 @@ export function socketPath() {
 }
 
 export function pluginId() {
-  return process.env.HERDR_PLUGIN_ID || "opencode.session-mirror";
+  return process.env.HERDR_PLUGIN_ID || "herdr-parallel-sessions-display";
 }
 
 /** 我们自己的 source。Herdr 规范要求 plugin 用 `plugin:<HERDR_PLUGIN_ID>`。 */

@@ -671,6 +671,36 @@ export async function attachMetadata({ paneId, targetSource, tokens = {}, clear 
   return { ok: true };
 }
 
+/**
+ * {@link attachMetadata} 的 socket 版本，用于高频调用（忙标记转轮）。
+ *
+ * ## 为什么单独开一个
+ *
+ * `attachMetadata` 走 CLI，也就是每帧都 spawn 一个 `herdr` 进程。实测一次约 5ms，
+ * 而转轮是 150ms 一帧、每个忙着的行都要写一次 —— 4 个忙行就是 ~27 次 spawn/秒，
+ * 实测吃掉 9% 单核（关掉动画是 5%，开掉是 14%）。
+ *
+ * 同一个 `pane.report_metadata` 方法在 socket API 上也有（herdr 的
+ * `PaneReportMetadataParams` 参数完全一致，含 `applies_to_source` / `tokens` /
+ * `seq`），直接发就不必 spawn。socket 不可用时退回 CLI，保证行为一致。
+ *
+ * @returns {Promise<{ok:boolean, error?:string}>}
+ */
+export async function attachMetadataFast({ paneId, targetSource, tokens = {}, clear = [], seq }) {
+  if (!socketEndpoint()) return attachMetadata({ paneId, targetSource, tokens, clear, seq });
+  const params = { pane_id: paneId, source: ownSource(), seq };
+  if (targetSource) params.applies_to_source = targetSource;
+  if (Object.keys(tokens).length > 0) params.tokens = { ...tokens };
+  // CLI 的 --clear-token 在 socket 侧就是把 token 设成 null（schema 里 value 允许 null）
+  for (const k of clear) params.tokens = { ...(params.tokens || {}), [k]: null };
+  try {
+    await socketCall("pane.report_metadata", params);
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: err?.message || String(err) };
+  }
+}
+
 export async function reportAgent({ paneId, state, seq, sessionId, message }) {
   const args = [
     "pane",

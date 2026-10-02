@@ -533,20 +533,31 @@ hook 将来真跑起来时写的是同一个值。而不补报的后果是「因
 **A/B 实测**：同一个工作区开两个 codex pane，一个开着补报、一个关着。开着的那行
 `agent_session` 有值且挂上了树，关着的没有——确认是插件补的，不是官方 hook。
 
-### 12.9 运行中标记：为什么是盲文点阵
+### 12.9 运行中标记：盲文点阵转轮
 
-`working` 的标记默认是 `⠿`（一格 8 点全亮的盲文），不是实心圆。
+`working` 的标记会转起来，帧序列取 Herdr 自己的 `braille_spinner_working`
+（0.9.3 二进制里扫出：`⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏`；2.1.228 起 Herdr 改用半圆，盲文序列仍在）。
 
-opencode v2 的运行指示器是点阵风格（`session-progress-indicator-v2.tsx`：5×5 共 25 个
-点，改 opacity 播一道对角波纹，中心点常亮，周期 1200ms）。**侧边栏复现不了原样**：
-token 是静态文本，换行会被去掉、值硬截断 80 字符、Herdr 不会替我们播动画 —— 二维点阵画
-不进一行。
+为什么是盲文：opencode v2 的运行指示器（`session-progress-indicator-v2.tsx`）是**点阵**
+风格 —— 5×5 共 25 个点，改 opacity 播对角波纹，中心点常亮，1200ms 一轮。侧边栏复现不了
+原样（token 静态文本、换行被去掉、值硬截断 80 字符、Herdr 不播动画，二维点阵画不进一行），
+而盲文每格本身就是 2×4 点阵，是最接近的形态。用同一套字符也让 session 标记和同一行的
+`state_icon` 属于同一种视觉语言。
 
-盲文每个字符本身就是 2×4 点阵，所以「一格点阵」是可达成的最接近形态；而且 Herdr 自己
-那个 busy spinner 就是同一族（0.9.3 二进制里挖到的帧序列 `⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏`，同一
-行的 `state_icon` 正在用这套点阵转圈），两者是同一种视觉语言而不是两套风格打架。
+**动画必须自己播**：Herdr 只为它自己的 `state_icon` 播动画，自定义 token 拿不到，所以插件
+要周期性把下一帧写回去。
 
-`PARALLEL_BUSY_MARK` 可改，想换回实心圆设成 `●`。
+实现上**单开 ticker，不把主重算循环跑快** —— 主 `reconcile` 一轮要拉 opencode 活跃集合、
+扫会话、扫 pane、查权限，为 150ms 的动画跑它会拖垮 Herdr 和 opencode。ticker 只在内存里
+换字：主循环渲染时把忙标记写成占位符 `\uE000` 并缓存这些行，ticker 到点把占位符换成下一帧
+写回去，不做任何查询。没有忙标记就停掉定时器，空闲期零开销。
+
+写入走 `attachMetadataFast`（socket 上的 `pane.report_metadata`）而不是 CLI：`attachMetadata`
+每次都 spawn 一个 `herdr` 进程，实测一次 5ms，转轮 150ms 一帧 × N 个忙行就是每秒几十次
+spawn。不过实测只省了约 2%（14% → 12%），**瓶颈不在 spawn 而在 Herdr 每次 token 变化都要
+重绘侧边栏**。所以帧率必须可调：`PARALLEL_BUSY_FRAME_MS` 调大一倍开销大致减半。
+
+配置：`PARALLEL_BUSY_FRAMES`（单字符即静态）、`PARALLEL_BUSY_FRAME_MS`、`PARALLEL_BUSY_ANIMATE`。
 
 ### 12.10 每个工作区只挑一个挂载点，但每行都要显示自己
 

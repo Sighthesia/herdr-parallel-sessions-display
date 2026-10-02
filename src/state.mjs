@@ -53,8 +53,11 @@ export const CONFIG_DEFAULTS = Object.freeze({
   PARALLEL_TOKEN_MAX: "78",
   // 会话行的连接符：bar=│▸ ● 标题（默认，整列对齐）/ tree=├─ ▸ 标题 / none=▸ 标题
   PARALLEL_CONNECTOR: "bar",
-  // 「正在跑」的标记，默认盲文点阵 ⠿（Herdr token 是静态文本，做不了动画）
-  PARALLEL_BUSY_MARK: "⠿",
+  // 「正在跑」标记的帧序列（Herdr 自己的点阵转轮）。单字符也合法 = 静态。
+  PARALLEL_BUSY_FRAMES: "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏",
+  // 每帧毫秒；10 帧 × 150ms ≈ 1.5s 一轮
+  PARALLEL_BUSY_FRAME_MS: "150",
+  PARALLEL_BUSY_ANIMATE: "true",
   // tree 模式下叠加在连接符之前的父级竖线，默认空。
   PARALLEL_TRUNK: "",
   // --- codex（SPEC 第 11 节）---

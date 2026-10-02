@@ -80,24 +80,26 @@ const config = {
   // `"└─ x"`），Unicode 空白（U+00A0、U+2000–200A、U+3000）同样会被 trim，所以
   // 空格缩进根本存不住。竖线之后的补位空格是**中间**的空格，不受影响。
   connector: store.asEnum(raw, "PARALLEL_CONNECTOR", ["bar", "tree", "none"], "bar"),
-  // 「正在跑」那个标记。
+  // 「正在跑」那个标记的**帧序列**。
   //
-  // 默认用盲文点阵 `⠿`（8 点全亮的一格）而不是实心圆 `●`，因为 opencode v2 的
-  // 运行指示器就是**点阵**风格：
-  //   packages/session-ui/src/v2/components/session-progress-indicator-v2.tsx
-  // 那是 5×5 共 25 个点的 SVG，靠改 opacity 播放一道对角波纹（中心点常亮）。
+  // 默认用 Herdr 自己的点阵转轮帧 —— 从 0.9.3 的二进制里扫出来的
+  // `braille_spinner_working` 就是这 10 个字符（2.1.228 起 Herdr 改用半圆，
+  // 盲文序列仍在二进制里）。用同一套字符 = 同一行的 state_icon 和我们的
+  // session 标记是同一种视觉语言。
   //
-  // **但侧边栏里复现不了**：Herdr 的 token 是静态文本 —— 值里的换行会被去掉，
-  // 单个值硬截断 80 字符，Herdr 不会替我们播放动画。所以 5×5 的二维点阵没法
-  // 在一行里画出来，只能压成一个字符。
+  // 关于 opencode v2 的那个指示器（`session-progress-indicator-v2.tsx`）：
+  // 那是 5×5 共 25 个点的 SVG，靠改 opacity 播对角波纹，**侧边栏复现不了原样**
+  // —— Herdr 的 token 是静态文本，换行会被去掉、值硬截断 80 字符、Herdr 不会
+  // 替我们播放动画。二维点阵画不进一行，只能压成一个字符；盲文每格本身就是
+  // 2×4 点阵，是这里能做到的最接近形态。
   //
-  // 盲文这一格（U+28FF）每个字符本身就是 2×4 的点阵，所以「一格点阵」是这里
-  // 能做到的最接近的形态；而且和 Herdr 自己那个 busy spinner 是同一族 ——
-  // 从二进制里挖出来它的帧序列是 `⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏`，也就是说同一行的
-  // `state_icon` 此刻正在用同一套点阵转圈，这里再点一次是同语言。
-  //
-  // 想要动画就把它改成转轮的某一帧序列里的一格；想换回实心圆设成 "●"。
-  busyMark: store.asString(raw, "PARALLEL_BUSY_MARK", "⠿") || "⠿",
+  // 动画要自己播：见 {@link startBusySpinner}。
+  busyFrames: store.asString(raw, "PARALLEL_BUSY_FRAMES", "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"),
+  // 每帧多少毫秒。10 帧 × 150ms = 1.5s 一轮，比 opencode 的 1.2s 略慢，
+  // 因为我们的重算周期比它粗（见 startBusySpinner 的取舍说明）。
+  busyFrameMs: store.asInt(raw, "PARALLEL_BUSY_FRAME_MS", 150, 50, 5_000),
+  // 关掉就退回静态单帧（取序列第一个字符）。
+  busyAnimate: store.asBool(raw, "PARALLEL_BUSY_ANIMATE", true),
   // tree 模式下叠加在连接符之前的父级竖线，默认空。
   parallelTrunk: store.asString(raw, "PARALLEL_TRUNK", ""),
   // 没有并行 session 时，官方 session 自己那一行还要不要写。
@@ -148,6 +150,107 @@ const MIRROR_PREFIX = "oc_";
 
 /** 镜像 pane 名上限。侧边栏一行放不下更多，留点余量给状态符号。 */
 const MIRROR_LABEL_MAX = 40;
+
+/**
+ * 忙标记在缓存里的占位符。
+ *
+ * 转轮动画要把已渲染的槽位里的忙标记**换掉**，而槽位是拼好的字符串。直接按字面量
+ * 替换有风险：万一某个会话标题里恰好出现了同一个字符就会被误替换。用一个私用区
+ * 字符当占位符就不会 —— 它只活在内存缓存里，永远不会发给 Herdr。
+ */
+const BUSY_PLACEHOLDER = "\uE000";
+
+/**
+ * 转轮帧序列。配置为空或全是空白时退回 Herdr 的默认序列。
+ *
+ * 注意**单字符也要当序列用**（只转一帧，等于静态但仍走同一条渲染路径），
+ * 所以 `PARALLEL_BUSY_FRAMES=●` 是合法的「换回实心圆」写法。
+ */
+function busyFrameList() {
+  const raw = String(config.busyFrames || "").trim();
+  if (!raw) return [...(config.__busyDefaultFrames ?? BUSY_FRAMES_DEFAULT)];
+  const chars = [...raw];
+  return chars.length > 0 ? chars : [...BUSY_FRAMES_DEFAULT];
+}
+
+/** Herdr 0.9.3 `braille_spinner_working` 的帧序列。 */
+const BUSY_FRAMES_DEFAULT = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏";
+
+/** 当前该显示哪一帧。 */
+function busyGlyph() {
+  const frames = busyFrameList();
+  if (!config.busyAnimate || frames.length <= 1) return frames[0] || "⠿";
+  return frames[runtime.busyFrame % frames.length];
+}
+
+/**
+ * 忙标记转轮：自己按帧重写 token。
+ *
+ * ## 为什么必须自己播
+ *
+ * Herdr 的 token 是静态文本，`state_icon` 那套动画是 Herdr 自己渲染的，我们的
+ * 自定义 token 拿不到。所以「运行中」要转起来，只能由插件周期性地把下一帧写回去。
+ *
+ * ## 为什么单独开一个 ticker 而不是跑快主循环
+ *
+ * 主 `reconcile` 一轮要做的事很重（拉 opencode 活跃集合、扫会话、扫 pane、查
+ * 权限…），为了一次 150ms 的动画去跑它会把 herdr 和 opencode 拖垮。所以这里
+ * **只在内存里换字**：主循环渲染完把「带忙标记的行」缓存下来（忙标记替换成
+ * {@link BUSY_PLACEHOLDER}），ticker 只负责把占位符换成下一帧再写回去，
+ * 不做任何查询。
+ *
+ * 没有忙标记时定时器直接停掉，空闲期零开销。
+ *
+ * 写入成本实测：一次 `herdr pane report-metadata` 约 5ms，150ms 一帧即 ~3% 单核。
+ */
+function startBusySpinner() {
+  if (runtime.busyTimer || !config.busyAnimate || runtime.shuttingDown) return;
+  const frames = busyFrameList();
+  if (frames.length <= 1) return;
+  runtime.busyTimer = setInterval(() => void tickBusySpinner(), config.busyFrameMs);
+  runtime.busyTimer.unref?.();
+}
+
+function stopBusySpinner() {
+  if (!runtime.busyTimer) return;
+  clearInterval(runtime.busyTimer);
+  runtime.busyTimer = null;
+}
+
+/**
+ * 推进一帧并写回。
+ *
+ * 只重写「值真的变了」的槽位，和主循环用同一套「比对实际值再决定写不写」的逻辑，
+ * 所以不会出现无意义的写入。
+ */
+async function tickBusySpinner() {
+  if (runtime.shuttingDown || runtime.busyRows.size === 0) return;
+  runtime.busyFrame = (runtime.busyFrame + 1) % busyFrameList().length;
+  const glyph = busyGlyph();
+
+  for (const [paneId, row] of runtime.busyRows) {
+    const payload = {};
+    for (const [i, base] of row.bases.entries()) {
+      const name = herdr.SESSION_TOKENS[i];
+      if (!name) continue;
+      const next = base.replaceAll(BUSY_PLACEHOLDER, glyph);
+      if (next && next !== row.current[i]) payload[name] = next;
+    }
+    if (Object.keys(payload).length === 0) continue;
+    // 走 socket 而不是 CLI：转轮每帧都要写，spawn 进程的开销在这个频率下很显眼
+    const res = await herdr.attachMetadataFast({
+      paneId,
+      targetSource: row.source,
+      tokens: payload,
+      seq: nextSeq(),
+    });
+    if (res.ok) {
+      for (const k of Object.keys(payload)) row.current[k] = payload[k];
+    } else {
+      log("debug", `转轮写 ${paneId} 失败：${res.error}`);
+    }
+  }
+}
 
 /**
  * pane 名里显示的 agent 名。
@@ -275,6 +378,17 @@ const runtime = {
   focusRedirecting: false,
   /** pane 全量列表的索引（目录 → workspace 解析、认领标签页、孤儿回收都要用），带 TTL 缓存。 */
   paneIndex: null,
+  /** 忙标记转轮：当前帧号。 */
+  busyFrame: 0,
+  /** 忙标记转轮：定时器句柄，空闲时为 null（停掉就是零开销）。 */
+  busyTimer: null,
+  /**
+   * 忙标记转轮：需要动画的行 pane_id -> { source, bases, current }。
+   *
+   * `bases` 是带 {@link BUSY_PLACEHOLDER} 的槽位骨架，`current` 是各 token 实际
+   * 写进去的值，用来比对「这一帧真的变了吗」。
+   */
+  busyRows: new Map(),
   shuttingDown: false,
 };
 
@@ -431,6 +545,7 @@ async function modeOnce() {
   // 只要它还挂着，事件循环就永远排不空。实测 `CODEX_ENABLED=true` 时自检跑完
   // 全部活儿之后不退出、得靠 timeout 杀掉；`CODEX_ENABLED=false` 时 3 秒就退。
   closeCodexClient();
+  stopBusySpinner();
   runtime.shuttingDown = true;
   runtime.client = null;
   return undefined;
@@ -509,6 +624,7 @@ function installSignalHandlers() {
       for (const timer of runtime.timers) clearInterval(timer);
       stopFocusRedirect();
       closeCodexClient();
+      stopBusySpinner();
       void (async () => {
         persistState();
         await releaseBoardLock();
@@ -1296,7 +1412,10 @@ async function applySessionState({ client, roots, activeStates, polledPermission
       },
     ]);
     runtime.lastAttachSeq = nextSeq();
-    log("debug", `内联挂载本轮动了 ${attached} 行`);
+    // 有行在转就起 ticker，没有就停 —— 空闲期零开销。
+    if (runtime.busyRows.size > 0) startBusySpinner();
+    else stopBusySpinner();
+    log("debug", `内联挂载本轮动了 ${attached} 行（转轮行 ${runtime.busyRows.size}）`);
   }
 
   // --- 4. 写镜像 pane 的显示状态 ------------------------------------------
@@ -1596,6 +1715,7 @@ async function publishInlineSessions(providers) {
     }
     if (provider.disabled) {
       closeCodexClient();
+      stopBusySpinner();
       log("debug", `${agentName} 支持已被 ${provider.failedReason || "关闭"}，撤掉 ${rows.length} 行上的旧 token`);
     }
 
@@ -1732,6 +1852,7 @@ async function publishInlineSessions(providers) {
       const legacy = legacyTokens.filter((t) => actualTokens[t] != null);
 
       if (!want) {
+        runtime.busyRows.delete(paneId);
         if (stale.length === 0 && legacy.length === 0) continue;
         const res = await herdr.attachMetadata({
           paneId,
@@ -1748,18 +1869,35 @@ async function publishInlineSessions(providers) {
         continue;
       }
 
+      // formatParallelSlots 吐的是带占位符的「骨架」，这里换成当前帧的真字符。
+      // 骨架本身留着，等转轮 tick 时只要换占位符就行，不用重跑整条渲染链。
+      const glyph = busyGlyph();
+      const rendered = want.slots.map((s) => s.replaceAll(BUSY_PLACEHOLDER, glyph));
+      const animated = want.slots.some((s) => s.includes(BUSY_PLACEHOLDER));
+
       // 只写「值不同」的槽位；用不到的槽位显式置空（attachMetadata 用空串覆盖）
       const payload = {};
       const toClear = [...legacy];
       for (let i = 0; i < tokens.length; i += 1) {
         const name = tokens[i];
-        const next = want.slots[i] ?? "";
+        const next = rendered[i] ?? "";
         const cur = actualTokens[name];
         if (next) {
           if (cur !== next) payload[name] = next;
         } else if (cur != null) {
           toClear.push(name);
         }
+      }
+
+      // 转轮缓存：只留「确实有忙标记」的行，空闲的行下一轮自然被移除
+      if (animated) {
+        runtime.busyRows.set(paneId, {
+          source: want.agent.agent_session.source,
+          bases: want.slots.slice(),
+          current: { ...actualTokens },
+        });
+      } else {
+        runtime.busyRows.delete(paneId);
       }
       if (Object.keys(payload).length === 0 && toClear.length === 0) continue;
 
@@ -1774,7 +1912,7 @@ async function publishInlineSessions(providers) {
         attached += 1;
         log(
           "debug",
-          `并行信息已挂到 ${paneId}：${want.slots.filter(Boolean).join(" / ")}` +
+          `并行信息已挂到 ${paneId}：${rendered.filter(Boolean).join(" / ")}` +
             (toClear.length ? `（清掉 ${toClear.join(",")}）` : ""),
         );
       } else {
@@ -1976,7 +2114,7 @@ export function formatParallelSlots(sessions) {
     const st = s.state || "";
     const mark =
       st === "working"
-        ? config.busyMark
+        ? BUSY_PLACEHOLDER
         : st === "blocked"
           ? "▲"
           : st === "idle"
@@ -2131,6 +2269,7 @@ function dropClient() {
   // codex 是另一条独立连接，一起收掉：留在那儿会让 board 进程永远不退出，
   // 也可能在 codex 重启时占着那个 socket。
   closeCodexClient();
+  stopBusySpinner();
   failDiscovery("opencode 连接中断");
 }
 
@@ -3571,6 +3710,7 @@ process.on("unhandledRejection", (err) => {
 process.on("uncaughtException", (err) => {
   log("error", `未捕获异常，退出以免留下坏状态: ${err?.message || err}`);
   closeCodexClient();
+  stopBusySpinner();
   void (async () => {
     await store.writeState(STATE_DIR, runtime.state).catch(() => {});
     await releaseBoardLock().catch(() => {});

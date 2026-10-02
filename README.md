@@ -167,6 +167,8 @@ command = "opencode.session-mirror.board"
 | `MIRROR_PANE_DIRECTION` | `down` | 排列方向 `down` / `right` |
 | `MIRROR_INLINE` | `true` | **内联模式**：完全不建镜像 pane / `oc-sessions` 标签页，见下。`false` = 回到「每个 session 一个镜像行」的旧模型 |
 | `PARALLEL_TOKEN_MAX` | `78` | `oc_par` token 的值上限。Herdr 侧对单个 token 值硬截断在 80 字符 |
+| `PARALLEL_TRUNK` | 空 | session 行树状前缀里的父级竖线（`│`）。默认空 —— 想加回来设成 `│` 之类的非空白字符（空格存不住，Herdr 会 trim） |
+| `INLINE_ALWAYS_LIST` | `true` | 该 agent 的工作区里没有并行 session 时，**官方 session 自己那一行**还要不要写。模板里已经没有 `terminal_title_stripped` 了，关掉就等于官方标题消失 |
 | `REBALANCE_INTERVAL_MS` | `30000` | 常规重平衡巡检间隔。建行/回收时是即时的，这里只负责把别人（sidebar 插件、用户手动拖动）改乱的布局纠回来 |
 | `FOCUS_REDIRECT` | `true` | 焦点落到镜像行时，自动转到同目录真正的前台 agent，见下 |
 | `FOCUS_REDIRECT_COOLDOWN_MS` | `2500` | 同一个镜像行的重定向冷却，防抖 |
@@ -415,11 +417,31 @@ v2 的两个坑插件都处理了：SSE 会发 `: heartbeat` 注释行、事件�
 **先看插件日志：**
 
 ```bash
-herdr plugin log list --plugin opencode.session-mirror
+# 看板面板的输出不进 plugin log，要走 pane read —— 先找到看板那个 pane：
+herdr pane list --json | jq -r '.result.panes[] | select(.label=="OpenCode Sessions") | .pane_id'
+herdr pane read <看板pane_id> --lines 200
 ```
 
 调不出细节就把 `LOG_LEVEL=debug` 写进 `.env` 再重启看板。debug 级别会打出每个
 session 为什么建行 / 不建行（是让给真实 TUI 了，还是它是子 agent）。
+`.env` 里写了插件不认识的键时，启动日志会明确列出来（拼错的键同样会）——
+**看到这个 warn 就别再怀疑时序了，那个键根本没被读**。
+
+**侧边栏上的会话列表不更新了（关了看板标签页 / Herdr 重启之后最常见）：**
+
+管理器就是那个看板标签页里的常驻进程。**它不在跑的时候插件什么都不做**，
+侧边栏上留下的是最后一次成功重算时的内容，看起来完全正常 —— 这就是最难认的
+一种「坏了」。确认与恢复：
+
+```bash
+# 1) 看板在不在（看板标签页里那个 node 进程）
+ps -ef | grep 'board\.mjs --mode pane' | grep -v grep
+
+# 2) 不在就拉起来。sync 动作会自己检查并重启它
+herdr plugin action invoke opencode.session-mirror.sync
+```
+
+想让 Herdr 重启后自动拉起，把 `.env` 里的 `AUTO_START` 设成 `true`。
 
 **Agents 视图里一行都没有：**
 

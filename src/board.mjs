@@ -147,6 +147,29 @@ function safeJson(value) {
   }
 }
 
+/**
+ * `.env` 里写了插件不认识的键时必须说出来。
+ *
+ * ## 为什么这条不能省
+ *
+ * `loadConfig` 只把 `KNOWN_KEYS`（由 `CONFIG_DEFAULTS` 派生）里的键收进
+ * `raw`，所以**不在名单里的键会被静默丢弃**：`.env` 写了、README 也承诺了，
+ * 但插件读到的一直是默认值。表现是「改了配置没反应」，而且没有任何提示 ——
+ * 排查时只会怀疑时序、怀疑缓存，绝不会想到配置根本没被读。
+ *
+ * 这个函数就是那个提示。它同时覆盖「拼错了」和「插件还不支持」两种情况，
+ * 因为对用户来说它们的症状完全一样。
+ */
+function warnUnknownConfigKeys() {
+  const unknown = loaded.unknownFileKeys || [];
+  if (unknown.length === 0) return;
+  log(
+    "warn",
+    `${loaded.filePath} 里的 ${unknown.join("、")} 不是本插件认识的配置键，已按默认值处理` +
+      `（拼错的键和「这个键还不支持」都会落到这里，别以为它生效了）`,
+  );
+}
+
 // ---------------------------------------------------------------------------
 // seq：跨进程重启单调递增
 // ---------------------------------------------------------------------------
@@ -268,6 +291,7 @@ async function modeStartup() {
   primeSeq(state.lastSeq);
 
   log("info", `startup 钩子（配置目录 ${loaded.configDir || "无"}）`);
+  warnUnknownConfigKeys();
 
   // 1) 按当前 config 校准已安装的投影。
   //    这一段必须所有模式共用：投影是进程外的全局副作用，只在 startup 里处理的话，
@@ -371,6 +395,11 @@ async function modeOnce() {
   // 一次性模式不常驻：跑完就断开 SSE 并封住后续重算。
   // 只 stop SSE 是不够的 —— session 一忙 SSE 就会持续触发 scheduleReconcile，
   // 进程会一直重算下去、永远不退出（自检模式必须是「跑一轮就退出」）。
+  //
+  // **codex 那条连接也必须断**：app-server 是我们自己 connect 出来的裸 socket，
+  // 只要它还挂着，事件循环就永远排不空。实测 `CODEX_ENABLED=true` 时自检跑完
+  // 全部活儿之后不退出、得靠 timeout 杀掉；`CODEX_ENABLED=false` 时 3 秒就退。
+  closeCodexClient();
   runtime.shuttingDown = true;
   runtime.client = null;
   return undefined;
@@ -387,6 +416,8 @@ async function modePane() {
     log("info", "已有一个管理器在运行，这个面板退出");
     return;
   }
+
+  warnUnknownConfigKeys();
 
   runtime.state = await store.readState(STATE_DIR);
   primeSeq(runtime.state.lastSeq);
@@ -886,11 +917,20 @@ async function adoptCodexSessions(wanted, statesById) {
         dir: normalizeDir(a.foreground_cwd || a.cwd),
       })),
     );
-  if (rows.length === 0) return 0;
+  if (rows.length === 0) {
+    log("debug", "codex 补报：没有「缺 agent_session」的官方行（要么没有 codex 行，要么官方已上报）");
+    return 0;
+  }
 
   let adopted = 0;
   for (const row of rows) {
-    if (!row.paneId || !row.dir) continue;
+    if (!row.paneId) continue;
+    if (!row.dir) {
+      // 这一行连自己跑在哪个目录都读不到，就没有任何匹配的依据。与其默默跳过，
+      // 不如说出来 —— 「补报没生效」最怕的就是这种一句日志都不打的情况。
+      log("warn", `codex 补报：${row.paneId} 没有 foreground_cwd/cwd，无法判断它是哪个会话，跳过`);
+      continue;
+    }
     const candidates = wanted
       .filter((w) => normalizeDir(w.directory) === row.dir)
       .sort((a, b) => {
@@ -902,7 +942,17 @@ async function adoptCodexSessions(wanted, statesById) {
         if (runningA !== runningB) return runningA - runningB;
         return (b.updatedAt || 0) - (a.updatedAt || 0);
       });
-    if (candidates.length === 0) continue;
+    if (candidates.length === 0) {
+      // 采到了会话但这个目录下没有 —— 通常是 codex TUI 刚起、thread 还没落盘，
+      // 或者 TUI 是用 `--cd` 在别的目录跑的。必须说出来，否则这个函数在日志里
+      // 完全是隐形的，排查只能靠猜。
+      log(
+        "debug",
+        `codex 补报：${row.paneId} 所在目录 ${row.dir} 下没有本轮采到的会话` +
+          `（采到 ${wanted.length} 个，目录：${[...new Set(wanted.map((w) => normalizeDir(w.directory)))].join("、") || "无"}）`,
+      );
+      continue;
+    }
 
     const pick = candidates[0];
     if (runtime.codex.adopted.get(row.paneId) === pick.id) continue;
@@ -919,11 +969,13 @@ async function adoptCodexSessions(wanted, statesById) {
       log(
         "info",
         `已为 ${row.paneId}（${row.dir}）补报 codex 会话身份 ${shortId(pick.id)}` +
-          `「${pick.title.slice(0, 24)}」—— 该行的 SessionStart hook 尚未上报` +
+          `「${String(pick.title || "").slice(0, 24)}」—— 该行的 SessionStart hook 尚未上报` +
           `（CODEX_ADOPT_SESSION=false 可关闭此行为）`,
       );
     } else {
-      log("warn", `为 ${row.paneId} 补报 codex 会话身份失败：${res.error || res.stderr}`);
+      // 失败也可能是**下一轮就好**的暂态（守护进程正在退出、herdr 正忙），
+      // 所以不记账 —— 下一轮会无条件重试，这里只负责别让失败无声无息。
+      log("warn", `为 ${row.paneId} 补报 codex 会话身份失败（下一轮重试）：${res.error || res.stderr}`);
     }
   }
   return adopted;
@@ -1567,6 +1619,22 @@ async function publishInlineSessions(providers) {
       return candidates[0];
     };
 
+    /**
+     * 一行「只有自己那一个 session」的列表。
+     *
+     * 官方 session 优先用会话自己的名字（id 精确匹配时），退回终端标题 ——
+     * opencode 侧走的就是后一条，因为它的会话在进 `wanted` 之前就被 claimed 剔掉了。
+     */
+    const officialOnly = (row, slot) => [
+      slot
+        ? { title: slot.title, state: slot.state, official: true }
+        : {
+            title: stripAgentPrefix(row.terminal_title_stripped || row.title || row.pane_id),
+            state: row.agent_status,
+            official: true,
+          },
+    ];
+
     const desired = new Map();
     // **遍历这个 agent 所有有官方行的工作区**，而不是只遍历有并行 session 的那些。
     // 模板里已经没有 terminal_title_stripped 了，官方 session 的标题现在也靠
@@ -1589,20 +1657,37 @@ async function publishInlineSessions(providers) {
       const states = provider.statesById instanceof Map ? provider.statesById : new Map();
       // **官方 session 排第一**：它是用户 TUI 里正在用的那个，用 ▸ 点出来，
       // 下面的并行 session 是「切走但还在跑」的。
-      const list = matched
-        ? [{ title: matched.title, state: matched.state, official: true }]
-        : [
-            {
-              // 退回终端标题（id 没匹配上时的老路，opencode 侧走的就是这条）
-              title: stripAgentPrefix(host.terminal_title_stripped || host.title || host.pane_id),
-              state: host.agent_status,
-              official: true,
-            },
-          ];
+      const list = officialOnly(host, matched);
       for (const i of infos) {
         list.push({ title: i.title, state: states.get(i.id) || "", official: false });
       }
       desired.set(paneId, { agent: host, slots: formatParallelSlots(list) });
+
+      // 同一工作区里**其它**同 agent 官方行：不挂这个目录的会话树（挂载点唯一，
+      // 见 SPEC 12.9），但必须让它们显示自己那一个 session。
+      //
+      // 不写的话，下面那个写/清循环会把它们判成「本轮不需要」→ 清空全部槽位；
+      // 而模板里已经没有 terminal_title_stripped 了，于是**那一行渲染成空白**，
+      // 只剩状态图标和 agent 名。实测同工作区开第二个 codex 窗口时就是这样：
+      // agent_session 在、oc_sess* 一个都没有，看上去和「挂载失败」完全一样。
+      if (!config.inlineAlwaysList) continue;
+      const siblings = rows.filter(
+        (a) => str(a.pane_id) !== paneId && str(a.workspace_id) === workspaceId,
+      );
+      if (siblings.length === 0) continue;
+      log(
+        "debug",
+        `${agentName}：工作区 ${workspaceId} 有 ${siblings.length + 1} 行官方行，` +
+          `会话树只挂 ${paneId}，其余各写自己那一个 session`,
+      );
+      for (const other of siblings) {
+        const otherPane = str(other.pane_id);
+        if (!otherPane) continue;
+        desired.set(otherPane, {
+          agent: other,
+          slots: formatParallelSlots(officialOnly(other, officialSlots.get(otherPane))),
+        });
+      }
     }
 
     // --- 写 / 清 ----------------------------------------------------------

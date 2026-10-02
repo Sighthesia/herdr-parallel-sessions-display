@@ -527,17 +527,36 @@ hook 将来真跑起来时写的是同一个值。而不补报的后果是「因
 **A/B 实测**：同一个工作区开两个 codex pane，一个开着补报、一个关着。开着的那行
 `agent_session` 有值且挂上了树，关着的没有——确认是插件补的，不是官方 hook。
 
-### 12.9 每个工作区只挑一个挂载点
+### 12.9 每个工作区只挑一个挂载点，但每行都要显示自己
 
 同工作区有多个同 agent 的官方行时，按「正在忙 → 正在聚焦 → 空闲」的顺序只挑**一个**
-挂载点。所以同一工作区开三个 codex 窗口时，只有其中一行下面会出现会话树，另外两行是
-正常的原生行。与 opencode 侧行为一致。
+挂载点。所以同一工作区开三个 codex 窗口时，只有其中一行下面会出现完整的会话树。
 
-### 12.10 token 命名
+**但没被挑中的那几行也必须显示自己的那一个 session**，不能留成空白行：模板里已经
+没有 `terminal_title_stripped`，写/清循环对「本轮不需要」的行会清掉全部槽位，于
+是那一行只剩状态图标和 agent 名。这个状态和「挂载失败」在 `agent list` 里长得一模一样
+（`agent_session` 有值、`oc_sess*` 一个都没有），排查时极易误判，所以必须写。
+
+与 opencode 侧行为一致。
+
+### 12.10 配置键必须登记进 `CONFIG_DEFAULTS`
+
+`loadConfig` 的 `KNOWN_KEYS` 是从 `CONFIG_DEFAULTS` 派生的，**不在名单里的键会被静默
+丢弃** —— `.env` 里写了、README 里也承诺了，但 `board.mjs` 读到的一直是硬编码默认值，
+且没有任何提示。实测踩过：`MIRROR_INLINE`、`INLINE_ALWAYS_LIST`、`PARALLEL_TOKEN_MAX`、
+`PARALLEL_TRUNK`、`REBALANCE_INTERVAL_MS`、`FOCUS_REDIRECT`、
+`FOCUS_REDIRECT_COOLDOWN_MS` 共 7 个键都属于这一类（`board.mjs` 读它们，`KNOWN_KEYS`
+里却没有）。表现是「改了配置没反应」，排查时只会怀疑时序和缓存。
+
+两条约束：① `board.mjs` 读的任何配置键都必须列进 `CONFIG_DEFAULTS`；② `.env` 里出现
+陌生键时启动必须打一条 warn —— 对用户来说「拼错了」和「还不支持」的症状完全一样，
+不能让他以为它生效了。
+
+### 12.11 token 命名
 
 沿用 `oc_sess1..oc_sess6`，**不因为支持多 agent 就改名**。token 挂在**具体某个 agent 行**上，不同 agent 的行本来就是不同的 pane，天然不冲突。改 token 名要动 `config.toml` 的 rows、README、SPEC，收益不抵风险。
 
-### 12.11 已知边界（codex）
+### 12.12 已知边界（codex）
 
 - **`thread/read` 补查回来的 thread 可能没有标题**（`preview` 为空串，实测碰到过），只能显示 `(无标题)`。
 - **codex 的官方行拿不到 id 精确匹配时**会退回按 `foreground_cwd` 解析（和 opencode 侧同一条路）。走补报（12.8）时 `agent_session.value` 与 thread id 天然相等，所以走的是精确匹配那条；只有官方 hook 自己上报、而我们没补报时才可能落到退回路径。

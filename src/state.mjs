@@ -26,6 +26,12 @@ export const CONFIG_DEFAULTS = Object.freeze({
   RESUME_MODE: "",
   MIRROR_PANE_RATIO: "0.5",
   MIRROR_PANE_DIRECTION: "down",
+  // 常规重平衡巡检间隔。建行/回收时是即时的，这里只负责把别人改乱的布局纠回来。
+  REBALANCE_INTERVAL_MS: "30000",
+  // 焦点落到镜像 pane 时转到同目录真正的前台 agent（只在 MIRROR_INLINE=false 时生效）。
+  FOCUS_REDIRECT: "true",
+  // 同一个镜像行的重定向冷却，防抖。
+  FOCUS_REDIRECT_COOLDOWN_MS: "2500",
   SESSION_LIST_LIMIT: "200",
   SESSION_PAGE_LIMIT: "8",
   RETRY_DETECTION: "true",
@@ -33,6 +39,20 @@ export const CONFIG_DEFAULTS = Object.freeze({
   AUTO_AUTH_SERVICE_JSON: "true",
   DISCOVERY_BACKOFF_MAX_MS: "60000",
   LOG_LEVEL: "info",
+  // --- 内联模式（SPEC 第 11 节）---
+  // **这一段的每个键都必须列在这里。** KNOWN_KEYS 是从 CONFIG_DEFAULTS 派生的，
+  // 不在这里的键会被 loadConfig 静默丢弃 —— .env 里写了、README 里也承诺了，
+  // 但永远读不到，表现就是「改了配置没反应」，而且没有任何提示。踩过：
+  // MIRROR_INLINE / INLINE_ALWAYS_LIST / PARALLEL_TOKEN_MAX / PARALLEL_TRUNK /
+  // REBALANCE_INTERVAL_MS / FOCUS_REDIRECT / FOCUS_REDIRECT_COOLDOWN_MS
+  // 这 7 个键就是这样白写了很久（board.mjs 读它们，KNOWN_KEYS 里却没有）。
+  MIRROR_INLINE: "true",
+  // 没有并行 session 时，官方 session 自己那一行还要不要写（默认要）。
+  INLINE_ALWAYS_LIST: "true",
+  // 单个 token 值的上限。Herdr 侧硬截断在 80 字符，插件先自己截好。
+  PARALLEL_TOKEN_MAX: "78",
+  // 树状前缀里的父级竖线，默认空（用户反馈多余）。
+  PARALLEL_TRUNK: "",
   // --- codex（SPEC 第 11 节）---
   CODEX_ENABLED: "true",
   CODEX_SOCKET: "",

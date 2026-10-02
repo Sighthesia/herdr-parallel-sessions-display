@@ -1,6 +1,9 @@
 # opencode-session-mirror
 
-把同一个 opencode server 里**所有正在运行的根 session**，镜像成 Herdr Agents 视图里的独立行。
+把 **opencode** 和 **codex** 里正在运行的会话，按工作区分组显示在 Herdr Agents 视图里。
+
+默认走**内联模式**：不创建任何 pane、不创建任何标签页，session 列表以 token 的形式挂在
+该目录的官方 agent 行下面，画成 ASCII 树状图。
 
 ## 它解决什么问题
 
@@ -174,6 +177,12 @@ command = "opencode.session-mirror.board"
 | `AUTO_AUTH_SERVICE_JSON` | `true` | 允许自动读 `~/.config/opencode/service.json` 的密码 |
 | `DISCOVERY_BACKOFF_MAX_MS` | `60000` | 服务端不可达时的退避上限 |
 | `LOG_LEVEL` | `info` | `debug` 适合排查问题 |
+| `CODEX_ENABLED` | `true` | 是否采集 codex 的 session。关掉就完全不连 codex 的 app-server |
+| `CODEX_SOCKET` | 空 | codex app-server 控制 socket 路径。留空用默认 `~/.codex/app-server-control/app-server-control.sock` |
+| `CODEX_CLIENT_NAME` | `herdr-session-mirror` | `initialize` 握手里上报的客户端名 |
+| `CODEX_SOURCE_KINDS` | 空 | 留空 = 内置 `cli,exec,appServer,vscode`（排除法滤掉子 agent）。**不要只填 `cli`**，实测会把 vscode 源的会话全滤掉且不报错 |
+| `CODEX_SESSION_LIMIT` | `100` | 每页拉多少条 thread |
+| `CODEX_TIMEOUT_MS` | `8000` | 单次 app-server 请求超时 |
 
 改完 `.env` 需要重启看板面板（关掉标签页再打开）才生效。
 
@@ -197,14 +206,43 @@ command = "opencode.session-mirror.board"
 ### 内联模式（默认）：不建任何 pane
 
 `MIRROR_INLINE=true` 时插件**不创建任何镜像 pane，也不创建 `oc-sessions` 标签页**。
-它用 `pane.report_metadata` 的 `--applies-to-source` 把并行 session 的信息作为
-`$oc_par` token 挂到该目录**官方 agent 行**上，而**不接管那一行**：
+它用 `pane.report_metadata` 的 `--applies-to-source` 把 session 列表作为
+`$oc_sess*` token 挂到该目录**官方 agent 行**上，而**不接管那一行**：
 
 - 实测 `agent` 字段和 `agent_session.source` 都不受影响
 - 官方集成随后重报（`working` → `idle`）token 照样存活
 - 侧边栏里因此**只有官方行**，点击天然就跳到真正的前台 agent
 
-侧边栏模板要加一行 `["$oc_par"]`（没有并行 session 的行没有这个 token，渲染成空）。
+`~/.config/herdr/config.toml` 的侧边栏模板：
+
+```toml
+[ui.sidebar.agents]
+rows = [
+  ["workspace"],
+  ["state_icon", "agent"],
+  ["$oc_sess1"], ["$oc_sess2"], ["$oc_sess3"],
+  ["$oc_sess4"], ["$oc_sess5"], ["$oc_sess6"],
+]
+```
+
+效果是 ASCII 树状图，**官方 session 也在里面**（用 `▸` 点出）：
+
+```
+[1] afloat
+◐ opencode
+├─ ▸ ● 排查 Shell 重载启动初始化卡顿      ← 官方 TUI 当前选中的
+├─ ● 排查Shell启动时壁纸揭露过渡卡顿       ← 切走但还在跑的
+└─ ● Tray hover二级菜单点击收起无退场效果…
+```
+
+官方那一行也由插件生成，是因为内置 `terminal_title_stripped` 拿不到树形连接线
+（内置 token 内容不可改，`rules` 只能改样式），两种格式混在一起会因为缩进不一致而
+读不出层级 —— 插件行反而比它 supposed 的父节点更靠左。
+
+**为什么缩进用 `├─` 而不是空格**：Herdr 会 **trim 自定义 token 的前导空白**
+（实测传 `"  └─ x"` 存下来是 `"└─ x"`），Unicode 空白字符（U+00A0、U+2000–200A、
+U+3000）同样会被 trim。所以连接线只能自己写进 token 值里。想去掉 `├─` 换成别的写法，
+改插件的 `PARALLEL_TRUNK`。
 
 **挂载点怎么选**：优先用官方 agent 行的 `foreground_cwd` 精确匹配——那个 pane 里跑着
 opencode TUI，前台进程的 cwd 就是它那个 session 的目录，实测每一行都对得上。匹配不
@@ -212,16 +250,60 @@ opencode TUI，前台进程的 cwd 就是它那个 session 的目录，实测每
 `Software/herdr` 在 `w19` 里有 7 个 pane 的 cwd 指向它（用户在那儿跑了一堆
 herdr-sidebar 实例）、在 `w1J` 里只有 4 个，光按数量会挂到不相干的工作区。
 
-**两个硬限制**（实测，不是保守估计）：
+**四个硬限制**（实测，不是保守估计）：
 
-- Herdr 对单个 token 值**硬截断在 80 字符**。插件自己先算好，放不下就用 `+N`
-  收尾，不会让你看到被拦腰截断的半句话。
-- 值里的**换行会被去掉**，所以多个 session 只能挤在一行用 `·` 分隔。侧边栏本身也不
-  宽，实际能看到的更少。
+- 单个 token 值**硬截断在 80 字符**。插件自己先算好，放不下就用 `+N` 收尾。
+- 值里的**换行会被去掉**，所以一个 token 只能渲染一行 → N 个 session 必须 N 个
+  token、N 个 row。
+- **前导空白被 trim**，所以空格缩进存不住。
+- **空槽位不渲染成空白行**，所以槽位可以放心加。现在 6 个（上限是 `rows` 共 16 行）。
 
 **已知的功能损失**：session 在用户没开 TUI 的目录下（典型是 `/tmp` 下的临时工程）时，
 那个工作区里没有可挂载的官方行，这条信息就**不显示**（日志里会说明是哪个 session、
 哪个目录）。想让这类 session 也可见，把 `MIRROR_INLINE` 设成 `false` 回到建 pane 模式。
+
+### codex 支持
+
+除了 opencode，插件也会读 **codex 正在跑的会话**，用同样方式挂到 codex 的官方 agent 行上。
+侧边栏里每个 agent 各显示自己那份列表，不会串。
+
+**怎么读到的**：走 codex 的 **app-server**（JSON-RPC over WebSocket），不是读 sqlite。
+实测 `~/.codex/state_5.sqlite` 的 `threads` 表直接读是 **0 行**（数据在 `-wal` 里），
+而 app-server 直接返回真实数据。
+
+用的是**共享 app-server 守护进程**（`~/.codex/app-server-control/app-server-control.sock`），
+因为只有连它才拿得到**实时状态**（`active` / `idle` / `notLoaded` / `systemError`）——
+自起一个实例虽然也能列出会话，但状态全是 `notLoaded`，分不出「正在跑」和「历史遗留」。
+守护进程本来就常驻，我们只是多一个客户端连接，不增加常驻成本。
+
+**前置条件**：需要先装 herdr 的 codex 集成，它靠 hook 向 herdr 上报 agent 行：
+
+```bash
+herdr integration install codex
+herdr integration status        # 确认 codex: current
+```
+
+**没装的话 codex 的会话一行都不显示**——内联模式只往官方行上挂 token，没有官方行就
+无处可挂。插件采集到会话但找不到对应官方行时会打一条 info 日志说明这件事（只说一次）。
+注意这个命令会往 `~/.codex/hooks.json` 注入 hook，如果那文件里已有别的 hook（比如
+`dcg`），确认合并没有覆盖。
+
+装完之后，开一个 codex 会话就能在侧边栏看到：
+
+```
+[1] afloat
+◐ codex
+├─ ▸ ● 你正在做的那个任务
+└─ ● 另一个还在跑的会话
+```
+
+**调优**：`CODEX_SOURCE_KINDS` 留空就是对的（内置 `cli,exec,appServer,vscode`，用排除法
+滤掉子 agent）。**不要只填 `cli`** —— 实测会把 vscode 源的会话全部滤掉，而且不报错，
+表现是列表凭空消失。子 agent 不单列。
+
+**还没验证的**：codex 官方行的 `agent_session.value` 理论上就是 codex 的 thread id，
+匹配上就能直接用会话自己的标题（比终端标题可靠）。这条路径要装完集成再开一个真实
+codex 会话才能验证，目前走的是「按 `foreground_cwd` 匹配 + 读终端标题」的退回路径。
 
 ### 关于 `FOCUS_REDIRECT`（只在 `MIRROR_INLINE=false` 时生效）
 

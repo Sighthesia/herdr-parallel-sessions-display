@@ -442,6 +442,16 @@ export const PARALLEL_TOKEN = "oc_par";
  * **已实测空的槽位不会渲染成空白行**，所以槽位可以放心加。`rows` 最多 16 行，
  * 现在用 2 + 6 = 8 行，余量充足。要增减就同时改这里和 config.toml 的 `rows`。
  *
+ * ## 这组 token 与 agent 无关
+ *
+ * `oc_sess1..6` **不绑定某个 agent**：它挂在哪个 agent 行上，就显示那个 agent 的
+ * session 列表（`opencode` 行显示 opencode 的会话，`codex` 行显示 codex 的）。
+ * 侧边栏模板对所有 agent 通用，rows 里写一次 `["$oc_sess1"]` 就够了。
+ *
+ * 也不会互相冲突：token 是挂在**具体某个 agent 行**上的，不同 agent 的行本来
+ * 就是不同的 pane，Herdr 的 metadata 按 pane 存。这就是多 agent 支持不需要新
+ * token 名、也不需要 `rows_by_agent` 的原因。
+ *
  * 侧边栏模板里对应写：
  *   rows = [["workspace"], ["state_icon","agent"],
  *           ["$oc_sess1"], …, ["$oc_sess6"]]

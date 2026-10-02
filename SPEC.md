@@ -291,6 +291,7 @@ src/
   mirror.mjs             # 镜像 pane 内的驻留进程
   herdr.mjs              # Herdr CLI / socket 调用封装
   opencode.mjs           # OpenCode server 客户端（health / session / status / SSE）
+  codex.mjs              # Codex app-server 客户端（WebSocket over unix socket + JSON-RPC，见第 12 节）
   state.mjs              # HERDR_PLUGIN_STATE_DIR 下的映射持久化
 config/.env.example
 README.md
@@ -331,3 +332,179 @@ README.md
 - `RESUME_MODE=opencode` 的重启恢复未端到端验证（会真的拉起 opencode），`resume_argv` 的格式规则已按官方文档核对。
 - **central 兜底工作区按 label 找回**。理论上会认错用户自己取名 `Sessions` 的工作区 —— 但这只发生在「有目录匹配不上任何工作区」的兜底路径上，且里面有别人的 agent 行时不会关掉它。
 - 面板命令的输出不会进入 `herdr plugin log list`，排障需走 `herdr pane read`。
+---
+
+## 11. 内联模式（当前默认，`MIRROR_INLINE=true`）
+
+第 4~10 节描述的是「每个 session 一个镜像 pane」的原始模型。它能跑，但**代价太大**：每个涉及的目录多一个标签页、每个 session 一个真实终端 pane。实测发现有个更好的支点，于是默认切到内联模式。
+
+### 11.1 支点：`--applies-to-source`
+
+`pane.report_metadata` 有个 `--applies-to-source`：用它可以往**别的 source 上报的 agent 行**上附加自己的 token，而**不接管那一行**。
+
+实测（herdr 0.9.3 + 官方 opencode 集成 v13）：
+
+- `agent` 字段和 `agent_session.source` 都不受影响
+- 官方集成随后重报（`working` → `idle`）后，token 照样存活
+- 挂上 token 的行**依然是官方行**：点击跳官方 pane，`agent` 名仍是 `opencode`
+
+于是并行 session 的信息**不需要自己的 pane**，挂在官方行上即可。直接消灭了镜像标签页和镜像 pane 整套机制。
+
+### 11.2 渲染：ASCII 树状图
+
+侧边栏模板（`~/.config/herdr/config.toml` 的 `[ui.sidebar.agents]`）：
+
+```toml
+rows = [
+  ["workspace"],
+  ["state_icon", "agent"],
+  ["$oc_sess1"], ["$oc_sess2"], ["$oc_sess3"],
+  ["$oc_sess4"], ["$oc_sess5"], ["$oc_sess6"],
+]
+```
+
+效果：
+
+```
+[1] afloat
+◐ opencode
+├─ ▸ ● 排查 Shell 重载启动初始化卡顿      ← 官方 TUI 当前选中的
+├─ ● 排查Shell启动时壁纸揭露过渡卡顿       ← 切走但还在跑的
+└─ ● Tray hover二级菜单点击收起无退场效果…
+```
+
+### 11.3 Herdr 侧边栏的硬限制（全部实测，决定了上面这个模板长这样）
+
+| 限制 | 实测结果 | 对设计的影响 |
+| --- | --- | --- |
+| 自定义 token 会被 trim 前导空白 | 传 `"  └─ x"` 存下来是 `"└─ x"` | 空格缩进存不住；Unicode 空白（U+00A0、U+2000–200A、U+3000）同样被 trim，只能自己把连接线写进值里 |
+| token 值里的换行会被去掉 | 传 `"a\nb\nc"` 存下来是 `"abc"` | 一个 token 只能渲染一行 → N 个 session 必须 N 个 token、N 个 row |
+| 单个 token 值硬截断 80 字符 | 请求 82 字符存下来是 80 | 插件自己先截到 78 并用「+N」收尾 |
+| 空槽位不渲染成空白行 | `$oc_sess4..6` 无值时那三行不出现 | 槽位可以放心加 |
+| `ui.sidebar.agents.rows` 最多 16 行 | — | 现在用 2 + 6 = 8 行 |
+| 合法内置 token 只有 8 个 | `workspace` `machine` `tab` `agent` `state_icon` `terminal_title` `terminal_title_stripped` `pane` | 带 `$` 的是自定义 token，herdr 不校验存在性 |
+| 每 agent 条目各渲染一遍，无分组头去重 | 两个 agent 同工作区时 `[1] afloat` 会重复 | 分组只能靠 workspace 行，**做不到「每个工作区一个头」** |
+| `rules` 只能匹配该 token 自己的值 | 不能按行条件化样式 | — |
+
+### 11.4 为什么官方 session 也由插件生成
+
+一开始官方那行用内置 `terminal_title_stripped`，只有并行 session 用插件 token。实测渲染出来是：
+
+```
+[1] afloat
+◐ opencode
+  OC | 实现 Hover 菜单式 Mod 键 Window Hint    ← 内置行：缩进 2 格、无连接线
+│ └─ ● 排查 Shell 重载启动…                     ← 插件行：顶格、带连接线
+```
+
+插件行反而比它 supposed 的父节点**更靠左**，读不出层级。官方那行拿不到连接线，是因为 `terminal_title_stripped` 是内置 token、内容不可改（`rules` 只能改样式）。
+
+改成官方 session 也由插件写进 `$oc_sess1`，所有 session 行同一格式，官方那个用 `▸` 点出。官方 session 的标题直接取官方行的 `terminal_title_stripped`，**不额外查 opencode**（实测那个字段就是该 session 的标题）。另外用 `stripAgentPrefix` 砍掉开头的 agent 标识前缀（`OC | ` 这类）——树状图里每行都是 opencode，重复它既占宽度又没有信息量。
+
+### 11.5 挂载点解析
+
+内联模式要挂的是**官方 agent 行本身**，所以目录 → 工作区的解析规则和建 pane 模式不同：
+
+- 建 pane 模式挑「该目录里 pane 最多的工作区」（要的是一个放镜像 pane 的容器）
+- 内联模式必须用官方行的 `foreground_cwd` **精确匹配**
+
+实测踩到的坑：`Software/herdr` 这个目录在 w19 里有 **7 个** pane 的 cwd（用户跑了一堆 herdr-sidebar 实例），在 w1J 里只有 4 个。按数量会选 w19 —— 信息就挂到不相干的分组下面了。
+
+### 11.6 无状态清理
+
+清理逻辑**以 `agent.list` 的实际值为准**，不依赖进程内记账。踩过的坑：原本遍历 `runtime.attachedParallel`，而那个 Map 随进程生死；board 重启后它空了，于是上一轮挂在别人工作区上的过期 token 再也没人清，一直挂在侧边栏上（实测 session 都跑完了，`oc_par` 还显示着旧的标题）。
+
+### 11.7 内联模式的功能损失
+
+session 在用户没开 TUI 的目录（典型是 `/tmp` 下的临时工程）时，这个工作区里没有可挂载的官方行，那条信息**直接不显示**并记日志。想让这类 session 也可见，把 `MIRROR_INLINE` 设成 false 回到建 pane 模型。
+
+---
+
+## 12. 多 agent 支持
+
+第 4~11 节都只讲 opencode。挂载机制（`--applies-to-source`）和渲染（`$oc_sess*`）**本来就是 agent 无关的**，只有「去哪儿找正在跑的 session」这一层每个 agent 各写一个探测器。
+
+### 12.1 分层
+
+```
+publishInlineSessions(providers)          ← agent 无关：分组、挑挂载点、写/清 token
+  ├─ fetchCodexSessions()  → codex.mjs   ← codex 专用
+  └─ (opencode 侧)        → opencode.mjs
+```
+
+`publishInlineSessions` 接受一组 `{ agent, wanted, statesById, failed }`，**把官方 agent 行按 `a.agent` 分桶**，每个 provider 只碰自己桶里的行。
+
+这里最容易踩的坑：**挂载点解析必须限定在该 provider 自己的行里**。一个 workspace 里 opencode 行和 codex 行的目录可能一样，用全局集合解析挂载点必然串味 —— codex 的 session 会挂到 opencode 行上，显示在错误的分组下。清理循环同理。
+
+### 12.2 codex 的数据源：app-server over WebSocket
+
+**不用 sqlite。** 实测 `~/.codex/state_5.sqlite` 的 `threads` 表直接读得到 **0 行**（数据在 `-wal` 里），而 app-server 直接返回真实数据。走网络同时省掉了「复制 `db`+`-wal`、不能复制 `-shm`」这一套处理。
+
+Codex 0.160 的协议：
+
+| 项 | 值 |
+| --- | --- |
+| 传输 | JSON-RPC 2.0 over **WebSocket**（unix socket 或 TCP 都行） |
+| 握手 | 必须先 `initialize`，否则任何请求返回 `{"code":-32600,"message":"Not initialized"}` |
+| 列会话 | `thread/list`，支持 `cwd`（字符串或数组，**服务端直接按目录过滤**）、`sourceKinds`、`archived`、`searchTerm`、游标翻页 |
+| 谁在跑 | `thread/loaded/list`，返回**字符串数组**（thread id），语义是「在内存里加载着的」 |
+| 状态推送 | 通知 `thread/status/changed`（本插件 5 秒轮询，用不上，保持实现简单） |
+
+### 12.3 传输层：共享守护进程 vs 自起实例
+
+`codex app-server --listen` 支持 `stdio://`（默认）、`unix://`、`unix://PATH`、`ws://IP:PORT`、`off`。两条路都实测过：
+
+| | 共享守护进程 | 自起实例 |
+| --- | --- | --- |
+| 连法 | `http.request({socketPath})` + 手动 WS 握手 | `spawn` + Node 内置 `WebSocket` |
+| 拿得到 thread 列表 | 能 | 能 |
+| **拿得到实时状态** | **能**（`status.type` 有 `active`/`idle`） | **不能**，全 `notLoaded` |
+| 前置 | 守护进程要在跑 | 无 |
+
+选**共享守护进程**。理由：这个插件的全部价值就是「区分正在跑的 session」，而状态是进程内运行时状态，别处看不到。守护进程本来就常驻，我们只是多一个客户端连接，不增加任何常驻成本。
+
+守护进程 socket 路径：`~/.codex/app-server-control/app-server-control.sock`（符号链接指向 `/tmp/codex-daemon-1000/<hash>`）。可用 `codex app-server daemon version` 查（输出是 JSON，含 `status` 和 `socketPath`）。
+
+### 12.4 帧层：为什么手写 WebSocket
+
+Node 内置 `WebSocket` **不支持 unix socket**，所以帧编解码要自己写。两个实测踩到的坑：
+
+- **客户端发往服务端的帧必须掩码**，掩码密钥 4 字节，**掩码从「帧头长度 + 4」开始异或**。帧头 2 字节时负载从第 6 字节开始 —— 写成固定偏移 4，服务端会一直不回包（表现为所有请求超时）。
+- `http.request` 走 `upgrade` 握手**必须调 `req.end()`**，否则请求根本不发出去，`upgrade` 事件永远不来。
+
+服务端发来的帧不掩码。解码要处理 ping（回 pong）和 close。
+
+### 12.5 状态映射
+
+| codex `status.type` | 插件状态 | 侧边栏标记 |
+| --- | --- | --- |
+| `active` | `working` | `●` |
+| `idle` | `idle` | `○` |
+| `systemError` | `blocked` | `▲` |
+| `notLoaded` | `null` | **不显示**（历史遗留，不在内存里） |
+
+「正在跑」用**两条证据**判定，避免单边误判：`thread/loaded/list` 的 id 集合，以及 `status.type !== "notLoaded"`。两个证据都说不在内存里才丢弃。`loaded` 里有但 `thread/list` 没给的，按 id 补查 `thread/read`（上限 8 条）。
+
+### 12.6 子 agent 不单列
+
+`sourceKinds` 枚举共 10 种：`cli` `vscode` `exec` `appServer` `subAgent` `subAgentReview` `subAgentCompact` `subAgentThreadSpawn` `subAgentOther` `unknown`。
+
+默认取 `["cli","exec","appServer","vscode"]`，即**用排除法**滤掉 `subAgent*`。
+
+**坑**：不要只填 `["cli"]`。实测那两条 thread 的 kind 是 `vscode`，只填 `cli` 会返回 0 条 —— 整份列表凭空消失，而且不报错。
+
+### 12.7 前置条件
+
+`herdr integration status` 显示 **`codex: not installed`** —— herdr 的 codex 集成靠 hook 上报（注入 `~/.codex/herdr-agent-state.sh`），没装的话 `herdr agent list` 里一个 `agent === "codex"` 的行都没有。
+
+内联模式只往官方行上挂 token，所以**没装集成时 codex 的 session 一行都不显示**。插件会在采集到会话但找不到对应官方行时打一条 info 级日志说明这件事（只说一次，之后降级 debug）。
+
+### 12.8 token 命名
+
+沿用 `oc_sess1..oc_sess6`，**不因为支持多 agent 就改名**。token 挂在**具体某个 agent 行**上，不同 agent 的行本来就是不同的 pane，天然不冲突。改 token 名要动 `config.toml` 的 rows、README、SPEC，收益不抵风险。
+
+### 12.9 已知边界（codex）
+
+- **`thread/read` 补查回来的 thread 可能没有标题**（`preview` 为空串，实测碰到过），只能显示 `(无标题)`。
+- **codex 的官方行拿不到 id 精确匹配时**会退回按 `foreground_cwd` 解析（和 opencode 侧同一条路）。理论上 `agent_session.value` 就是 codex 的 thread id（herdr 的 codex hook 取 hook 输入的 `session_id`，而 codex thread id 是 UUIDv7），但**这条路径还没有真机验证** —— 需要先 `herdr integration install codex` 再开一个 codex 会话。
+- **codex 的终端标题未必有信息量**，所以 id 匹配成功时用 thread 自己的 `name`/`preview`，匹配不上才退回终端标题。

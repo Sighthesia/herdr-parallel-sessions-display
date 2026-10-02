@@ -33,6 +33,15 @@ export const CONFIG_DEFAULTS = Object.freeze({
   AUTO_AUTH_SERVICE_JSON: "true",
   DISCOVERY_BACKOFF_MAX_MS: "60000",
   LOG_LEVEL: "info",
+  // --- codex（SPEC 第 11 节）---
+  CODEX_ENABLED: "true",
+  CODEX_SOCKET: "",
+  CODEX_CLIENT_NAME: "herdr-session-mirror",
+  // 空 = 用 codex.mjs 里的默认集合（cli,exec,appServer,vscode，靠排除 subAgent* 实现
+  // 「子 agent 不单列」）。不要只填 cli：实测 kind 是 vscode 的 thread 会被过滤掉。
+  CODEX_SOURCE_KINDS: "",
+  CODEX_SESSION_LIMIT: "100",
+  CODEX_TIMEOUT_MS: "8000",
 });
 
 const KNOWN_KEYS = new Set(Object.keys(CONFIG_DEFAULTS));

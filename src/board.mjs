@@ -23,6 +23,7 @@ import {
   discoverCandidateUrls,
   normalizeBaseUrl,
 } from "./opencode.mjs";
+import { CodexClient, CodexError, normalizeThread, parseSourceKinds } from "./codex.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PLUGIN_ROOT = process.env.HERDR_PLUGIN_ROOT || path.resolve(HERE, "..");
@@ -77,6 +78,28 @@ const config = {
   retryCheckLimit: store.asInt(raw, "RETRY_CHECK_LIMIT", 8, 0, 64),
   autoAuth: store.asBool(raw, "AUTO_AUTH_SERVICE_JSON", true),
   backoffMaxMs: store.asInt(raw, "DISCOVERY_BACKOFF_MAX_MS", 60_000, 5_000, 600_000),
+
+  // --- codex（第 11 节）-------------------------------------------------
+  // codex 那边只要一个总开关。默认开：没有 codex 官方 agent 行时这一整条路径
+  // 只会打一条 debug 日志然后安静下来，不连也不会刷屏。
+  codexEnabled: store.asBool(raw, "CODEX_ENABLED", true),
+  // 留空 = 走 ~/.codex/app-server-control/app-server-control.sock。调试时守护
+  // 进程可能起在别处（`codex app-server daemon version` 会报真实路径），指过来最省事。
+  codexSocket: store.asString(raw, "CODEX_SOCKET", ""),
+  // clientInfo 会拼进 app-server 自己的 user-agent 串里（实测形如
+  // `codex-tui/0.160.0 … herdr/0.9.3 (herdr-session-mirror; 1)`），
+  // 出问题时 codex 那边能一眼看出这条连接是谁。
+  codexClientName: store.asString(raw, "CODEX_CLIENT_NAME", "herdr-session-mirror"),
+  // 默认取「人开的」四种来源，**靠排除 subAgent\* 实现「子 agent 不单列」**。
+  // 不能只填 `cli`：实测本机那两条 thread 的 kind 是 `vscode`，
+  // `sourceKinds:["cli"]` 直接返回 0 条（会话凭空消失）。
+  codexSourceKinds: parseSourceKinds(store.asString(raw, "CODEX_SOURCE_KINDS", "")),
+  // thread/list 一页拉多少。会话多的机器上活跃 thread 可能不在第一页，
+  // 所以还会带着 `thread/loaded/list` 的 id 当提前停止翻页的信号。
+  codexSessionLimit: store.asInt(raw, "CODEX_SESSION_LIMIT", 100, 10, 1_000),
+  // 守护进程在**同一个 app-server 上**（用户自己在跑 codex），连接不该长时间挂着
+  // 不放，否则 codex 重启时要等我们的 socket 断开才起得来。
+  codexTimeoutMs: store.asInt(raw, "CODEX_TIMEOUT_MS", 8_000, 500, 60_000),
   logLevel: store.asEnum(raw, "LOG_LEVEL", ["debug", "info", "warn", "error", "silent"], "info"),
 };
 
@@ -156,6 +179,20 @@ const runtime = {
   inFlight: false,
   queued: false,
   sse: null,
+  /**
+   * codex app-server 的连接状态。独立于 opencode 那套：两个守护进程互不相干，
+   * 退避也各算各的（codex 挂了不该让 opencode 的发现一起退避）。
+   */
+  codex: {
+    client: null,
+    /** 距离下次允许再连的时间戳 */
+    nextAttemptAt: 0,
+    backoffMs: 1_000,
+    consecutiveFailures: 0,
+    lastError: "",
+    /** 「采到会话但没有对应官方行」的前置条件提示是否已经 info 说过一次。 */
+    missingRowsHinted: "",
+  },
   timers: [],
   /** 一轮重算里已经重平衡过没有。回收一批行时不必每个都重算一次布局。 */
   balancedThisPass: false,
@@ -396,6 +433,7 @@ function installSignalHandlers() {
       log("info", `收到 ${signal}，退出管理器（镜像行保留，下次启动会恢复）`);
       for (const timer of runtime.timers) clearInterval(timer);
       stopFocusRedirect();
+      closeCodexClient();
       void (async () => {
         persistState();
         await releaseBoardLock();
@@ -619,6 +657,170 @@ async function readServicePassword() {
     return typeof password === "string" && password.length > 0 ? password : null;
   } catch {
     return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// codex app-server 采集
+// ---------------------------------------------------------------------------
+
+/**
+ * `thread/loaded/list` 给出的「在内存里加载着」但 `thread/list` 一次都没出现的
+ * thread，最多补查多少条。
+ *
+ * 实测本机守护进程里 loaded 有 3 个 id，`thread/list` 只给出 1 个（另外两个是
+ * 刚建、还没有任何消息的 thread，`preview` 是空串）。这类 thread **确实在跑**，
+ * 只是列表接口不吐它们，所以必须按 id 补查一次 `thread/read` 才能拿到 cwd。
+ *
+ * 补查是**按需**的：数量通常只有个位数，且只在「loaded 集合没被列表覆盖」时才发。
+ * 设上限是为了防「loaded 列表很长」时把守护进程问烦。
+ */
+const CODEX_READ_BACKFILL_MAX = 8;
+
+/**
+ * 拿到一个可用的 CodexClient，失败时按退避静默重试。
+ *
+ * 和 {@link getClient} 同构，但**故意独立**：codex 的守护进程由 codex 自己管生命周期，
+ * 它没起来 / 正在重启都不代表 opencode 那边出了任何问题，两边的退避不该联动。
+ *
+ * @returns {Promise<CodexClient|null>}
+ */
+async function getCodexClient() {
+  if (!config.codexEnabled) return null;
+  const now = Date.now();
+
+  // 已连上的直接复用。真的断了会在 fetchCodexSessions 的 catch 里被丢弃。
+  if (runtime.codex.client) return runtime.codex.client;
+  if (now < runtime.codex.nextAttemptAt) return null;
+
+  const client = new CodexClient({
+    socketPath: config.codexSocket || undefined,
+    clientName: config.codexClientName,
+    timeoutMs: config.codexTimeoutMs,
+  });
+
+  try {
+    const info = await client.connect();
+    runtime.codex.client = client;
+    runtime.codex.consecutiveFailures = 0;
+    runtime.codex.backoffMs = 1_000;
+    runtime.codex.nextAttemptAt = 0;
+    runtime.codex.lastError = "";
+    const ver = info?.appServerVersion || info?.userAgent || "?";
+    log("info", `已连接 codex app-server @ ${client.socketPath}（${String(ver).slice(0, 80)}）`);
+    return client;
+  } catch (err) {
+    // connect() 失败时 client 可能已经持有半开的 socket，必须关掉，
+    // 否则它会一直挂着直到进程退出。
+    try {
+      client.close();
+    } catch {
+      /* ignore */
+    }
+    failCodex(err?.message || String(err));
+    return null;
+  }
+}
+
+function failCodex(reason) {
+  const d = runtime.codex;
+  d.client = null;
+  d.consecutiveFailures += 1;
+  if (d.consecutiveFailures === 1 || d.consecutiveFailures % 5 === 0) {
+    // 跟 opencode 侧一样：第一次和每五次失败才说一句，避免每 5 秒刷一行
+    log("debug", `codex 采集不可用（${reason}），${Math.round(d.backoffMs / 1000)}s 后重试`);
+  }
+  d.lastError = reason;
+  d.backoffMs = Math.min(config.backoffMaxMs, Math.round(d.backoffMs * 2));
+  d.nextAttemptAt = Date.now() + d.backoffMs;
+}
+
+/**
+ * 采一轮 codex 的运行中 thread。
+ *
+ * ## 「运行中」怎么判定
+ *
+ * codex 没有 opencode 那种 `/session/status`；能区分「正在跑」和「历史遗留」的是
+ * `status.type`：`active` / `idle` / `systemError` / `notLoaded`。实测同一台机器上
+ * `thread/list` 返回的两条里，一条 `active`、一条 `notLoaded` —— `notLoaded` 就是
+ * 「没加载进 app-server 内存的历史对话」，不显示。
+ *
+ * `thread/loaded/list` 是第二条独立证据（它返回**字符串数组**，不是对象数组）。
+ * 两条证据怎么用：
+ *   - `loaded` 里有 → 一定显示，哪怕 `thread/list` 说它 `notLoaded`（双保险，
+ *     防状态字段和服务端内存不一致）。
+ *   - `loaded` 里没有且 `notLoaded` → 不显示。
+ *   - `loaded` 里有但 `thread/list` 压根没列（实测就有这种，见
+ *     {@link CODEX_READ_BACKFILL_MAX}）→ 按 id 补查 `thread/read` 拿 cwd。
+ *
+ * 子 agent 靠 `sourceKinds` 排除（默认集不含任何 `subAgent*`），和 opencode 侧
+ * 「子 agent 不单列」的产品决策一致。
+ *
+ * @returns {Promise<{ok:true, wanted:{id:string,title:string,directory:string}[], statesById:Map<string,string>}
+ *                 | {ok:false, reason:string}>}
+ */
+async function fetchCodexSessions() {
+  if (!config.codexEnabled) return { ok: false, reason: "CODEX_ENABLED=false" };
+
+  const client = await getCodexClient();
+  if (!client) return { ok: false, reason: runtime.codex.lastError || "codex 退避中" };
+
+  try {
+    const loaded = await client.loadedThreadIds();
+    const loadedSet = new Set(loaded);
+
+    const { threads } = await client.listThreads({
+      limit: config.codexSessionLimit,
+      sourceKinds: config.codexSourceKinds,
+      // loaded 里的 id 全都命中就可以停止翻页 —— 会话多的机器上活跃 thread
+      // 未必在第一页。
+      wantIds: loaded,
+    });
+
+    const wanted = [];
+    const statesById = new Map();
+    const seen = new Set();
+
+    const take = (raw) => {
+      const t = normalizeThread(raw);
+      if (!t.id || seen.has(t.id)) return;
+      const inMemory = loadedSet.has(t.id);
+      // 两个证据都说「不在内存里」→ 历史遗留，不显示
+      if (!inMemory && t.state === null) return;
+      // 只有一条证据说「在内存里」时以它为准（双保险的另一半）
+      seen.add(t.id);
+      wanted.push({ id: t.id, title: t.title, directory: t.directory });
+      statesById.set(t.id, t.state || "idle");
+    };
+
+    for (const raw of threads) take(raw);
+
+    // loaded 里那些列表压根没给的：补查一次 cwd，否则挂不到任何工作区上。
+    let backfilled = 0;
+    for (const id of loaded) {
+      if (seen.has(id) || backfilled >= CODEX_READ_BACKFILL_MAX) continue;
+      backfilled += 1;
+      try {
+        const raw = await client.readThread(id);
+        if (raw) take(raw);
+      } catch (err) {
+        log("debug", `codex 补查 ${shortId(id)} 失败：${err?.message || err}`);
+      }
+    }
+
+    if (backfilled > 0) {
+      log("debug", `codex: loaded 里 ${backfilled} 条不在 thread/list 中，已按 id 补查`);
+    }
+    log(
+      "debug",
+      `codex: loaded ${loaded.length} / 列出 ${threads.length} / 采纳 ${wanted.length}` +
+        `（sourceKinds=${config.codexSourceKinds.join(",")}）`,
+    );
+    return { ok: true, wanted, statesById };
+  } catch (err) {
+    failCodex(err?.message || String(err));
+    if (err instanceof CodexError) log("debug", `codex 请求失败：${err.message}`);
+    return { ok: false, reason: err?.message || String(err) };
   }
 }
 
@@ -883,9 +1085,26 @@ async function applySessionState({ client, roots, activeStates, polledPermission
     parallelStates.set(info.id, state);
   }
 
-  // --- 3b. 内联模式：并行 session 信息挂到官方 agent 行 ------------------------
+  // --- 3b. 内联模式：各 agent 的 session 列表挂到各自的官方 agent 行 ----------
   // 完全不建 pane，也就不需要镜像标签页、不需要镜像行、不会被官方集成接管。
-  if (config.mirrorInline) await publishInlineParallel(wanted, parallelStates);
+  //
+  // codex 的采集**放在这个判断之内**：非内联模式下 session 信息挂在镜像 pane 上，
+  // 根本不经过 publishInlineSessions，没必要为此去连 codex 的守护进程。
+  if (config.mirrorInline) {
+    const codex = await fetchCodexSessions();
+    const attached = await publishInlineSessions([
+      { agent: "opencode", wanted, statesById: parallelStates },
+      {
+        agent: "codex",
+        wanted: codex.ok ? codex.wanted : [],
+        statesById: codex.ok ? codex.statesById : new Map(),
+        failed: !codex.ok,
+        failedReason: codex.ok ? "" : codex.reason,
+      },
+    ]);
+    runtime.lastAttachSeq = nextSeq();
+    log("debug", `内联挂载本轮动了 ${attached} 行`);
+  }
 
   // --- 4. 写镜像 pane 的显示状态 ------------------------------------------
   await publishMirrorSnapshots();
@@ -1071,8 +1290,40 @@ function stopFocusRedirect() {
  * `agent` 字段和 `agent_session.source` 都不受影响。
  *
  * 于是并行 session 的信息不需要自己的 pane —— 挂在官方行上就行，侧边栏模板引用
- * `$oc_par` 即可。顺带白送一件事：点击那行本来就跳官方 pane，所以
+ * `$oc_sess*` 即可。顺带白送一件事：点击那行本来就跳官方 pane，所以
  * 「点镜像信息只跳到真正的前台 agent」不再需要 FOCUS_REDIRECT。
+ *
+ * ## 多 agent：一个 workspace 里的 session 列表（SPEC 第 11 节）
+ *
+ * 一个 provider = 一个 agent（`opencode` / `codex`）+ 它自己那批 session。
+ *
+ * **每个 provider 只能碰自己 `agent` 名下的官方行。** 挂载点解析也必须限定在
+ * provider 自己的行里（`resolveInlineHostWorkspace` 传的 `officialRowsForThisAgentOnly`）：
+ * 目录是跨 agent 共用的，同一个目录下 opencode 行和 codex 行的 `foreground_cwd`
+ * 可能完全一样。全局解析会把 codex 的 session 挂到 opencode 行上 —— 侧边栏里
+ * codex 的会话出现在 opencode 分组下面。这是本函数最容易犯的错。
+ *
+ * ## 官方 session 优先用 id 精确匹配
+ *
+ * `agent_session.value` 就是官方集成上报的 session id。拿它和 thread/session 的
+ * id 一比就知道「这一行对应哪个会话」，标题直接用**会话自己的名字**而不是终端标题
+ * —— codex 的终端标题未必有信息量（实测两个 thread 的终端标题都是同一个）。
+ *
+ * 匹配不上才退回「按 `foreground_cwd` 分组 + 取 `terminal_title_stripped`」那条老路。
+ * 两条都得留：opencode 侧的会话在进 `wanted` 之前就被 `claimed` 剔掉了
+ * （用户 TUI 选中的那个），所以它**只能**靠终端标题那一路补回来。
+ *
+ * ## 采集失败时既不写也不清
+ *
+ * provider 的 `failed` 为 true（守护进程临时掉了、正在退避）时，这个 agent 的行
+ * **一个字都不动**。反过来写的话就是「守护进程抖一下 → 侧边栏上的 session 行全部
+ * 空掉 → 下一轮又全回来」地闪。
+ *
+ * ## 过期 token 的清理以 agent list 的实际值为准
+ *
+ * 刻意**不**依赖进程内记账（曾经踩过：board 重启后 `runtime.attachedParallel`
+ * 是空的，于是过期 token 永远清不掉）。每轮直接读 `agent.tokens` 里哪些槽位还有值，
+ * 本轮不需要就显式置空 —— board 重启后的第一轮就能把上次的残留收干净。
  *
  * ## 值格式与硬限制
  *
@@ -1090,58 +1341,16 @@ function stopFocusRedirect() {
  * 里没有可挂载的官方行，那条信息就无处可放 —— 内联模式下**直接不显示**并记日志。
  * 想让这类 session 也可见，把 `MIRROR_INLINE` 设成 false 回到建 pane 的旧模型。
  *
- * @param {object[]} wanted     本轮要镜像的活跃根 session（已被官方占用的已剔除）
- * @param {Map<string,string>} statesById  session id -> 展示用状态
+ * @param {Array<{agent:string, wanted:{id:string,title:string,directory:string}[], statesById:Map<string,string>, failed?:boolean, failedReason?:string}>} providers
+ * @returns {Promise<number>} 实际写入/清除的行数
  */
-async function publishInlineParallel(wanted, statesById) {
+async function publishInlineSessions(providers) {
   const agents = await herdr.agentList();
 
   // 官方行：不是我们上报的、且带 agent_session 的
   const official = agents.filter(
     (a) => !herdr.isMirrorRow(a) && a.agent && typeof a.agent_session?.source === "string",
   );
-  if (official.length === 0) {
-    log("debug", "内联模式：当前没有官方 agent 行，无处挂载 session 列表");
-    return 0;
-  }
-
-  // 并行 session 按工作区分组：目录 → workspace
-  const index = await paneIndex({ force: true });
-  const byWorkspace = new Map();
-  const orphans = [];
-  for (const info of wanted) {
-    const hit = resolveInlineHostWorkspace(info.directory, index, official);
-    if (!hit?.workspaceId) {
-      orphans.push(info);
-      continue;
-    }
-    if (!byWorkspace.has(hit.workspaceId)) byWorkspace.set(hit.workspaceId, []);
-    byWorkspace.get(hit.workspaceId).push(info);
-  }
-  for (const o of orphans) {
-    log(
-      "info",
-      `${shortId(o.id)}「${(o.title || "").slice(0, 24)}」所在目录没有对应的 Herdr 工作区` +
-        `（或那个工作区里没有 opencode 的 agent 行），内联模式下无处显示。` +
-        `把 MIRROR_INLINE 设成 false 可回到建 pane 模式。`,
-    );
-  }
-
-  /** 工作区里挑一个官方行作为挂载点：优先正在忙的，其次当前聚焦的。 */
-  const pickHost = (workspaceId) => {
-    const rows = official.filter((a) => str(a.workspace_id) === str(workspaceId));
-    if (rows.length === 0) return null;
-    const rank = (a) => {
-      if (a.agent_status === "working") return 0;
-      if (a.agent_status === "blocked") return 1;
-      if (a.focused) return 2;
-      if (a.agent_status === "idle") return 3;
-      if (a.agent_status === "done") return 4;
-      return 5;
-    };
-    rows.sort((a, b) => rank(a) - rank(b) || str(a.pane_id).localeCompare(str(b.pane_id)));
-    return rows[0];
-  };
 
   const tokens = herdr.SESSION_TOKENS;
   // 历史版本用过的 token 名，早已不在模板里，顺手清掉免得白占 metadata 配额：
@@ -1149,95 +1358,212 @@ async function publishInlineParallel(wanted, statesById) {
   //   oc_par1..4 = 多行版但只放并行 session，官方那行还是内置 terminal_title
   const legacyTokens = [herdr.PARALLEL_TOKEN, "oc_par1", "oc_par2", "oc_par3", "oc_par4"];
 
-  // **遍历所有有官方行的工作区**，而不是只遍历有并行 session 的那些。
-  // 模板里已经没有 terminal_title_stripped 了，官方 session 的标题现在也靠
-  // $oc_sess1 —— 只遍历 byWorkspace 的话，「没有并行 session」的工作区会一个
-  // token 都不写，那一行就彻底空了（实测官方标题直接消失）。
-  const desired = new Map();
-  const hostWorkspaces = new Set(official.map((a) => str(a.workspace_id)));
-  for (const workspaceId of hostWorkspaces) {
-    const host = pickHost(workspaceId);
-    if (!host) continue;
-    const infos = byWorkspace.get(workspaceId) || [];
-    if (infos.length === 0 && !config.inlineAlwaysList) continue;
-
-    // **官方 session 排第一**：它是用户 TUI 里正在用的那个，用 ▸ 点出来，
-    // 下面的并行 session 是「切走但还在跑」的。标题直接取官方行的终端标题，
-    // 不额外查 opencode —— 实测 `terminal_title_stripped` 就是那个 session 的标题。
-    const list = [
-      {
-        title: stripAgentPrefix(host.terminal_title_stripped || host.title || host.pane_id),
-        state: host.agent_status,
-        official: true,
-      },
-      ...infos.map((i) => ({ title: i.title, state: statesById.get(i.id) || "", official: false })),
-    ];
-    desired.set(str(host.pane_id), { agent: host, slots: formatParallelSlots(list) });
+  // 官方行按 agent 名分桶。跨 agent 分组是**绝对不能**的：一个 workspace 里
+  // opencode 行和 codex 行的目录可能一样，用全局集合解析挂载点必然串味。
+  const rowsByAgent = new Map();
+  for (const a of official) {
+    const key = str(a.agent);
+    if (!key) continue;
+    if (!rowsByAgent.has(key)) rowsByAgent.set(key, []);
+    rowsByAgent.get(key).push(a);
   }
+
+  // 只有确实要解析目录时才拉 pane 列表；index 跨 provider 共用一次就够了。
+  const index = await paneIndex({ force: true });
 
   let attached = 0;
   let cleared = 0;
 
-  for (const agent of official) {
-    const paneId = str(agent.pane_id);
-    const want = desired.get(paneId);
-    const actualTokens = agent.tokens || {};
-    // 本轮该有值的槽位 + 本轮该为空但实际有值的槽位
-    const stale = tokens.filter((t) => actualTokens[t] != null);
-    const legacy = legacyTokens.filter((t) => actualTokens[t] != null);
+  for (const provider of providers || []) {
+    const agentName = str(provider?.agent);
+    const rows = rowsByAgent.get(agentName) || [];
+    const wanted = Array.isArray(provider?.wanted) ? provider.wanted : [];
 
-    if (!want) {
-      if (stale.length === 0 && legacy.length === 0) continue;
-      const res = await herdr.attachMetadata({
-        paneId,
-        targetSource: agent.agent_session.source,
-        clear: [...stale, ...legacy],
-        seq: nextSeq(),
-      });
-      if (res.ok) {
-        cleared += 1;
-        log("debug", `清除 ${paneId} 上过期的 ${stale.join(",")}`);
-      } else {
-        log("warn", `清除 ${paneId} 的 ${stale.join(",")} 失败：${res.error}`);
-      }
+    if (rows.length === 0) {
+      if (wanted.length > 0) noteMissingRows(agentName, wanted.length);
       continue;
     }
 
-    // 只写「值不同」的槽位；用不到的槽位显式置空（attachMetadata 用空串覆盖）
-    const payload = {};
-    const toClear = [...legacy];
-    for (let i = 0; i < tokens.length; i += 1) {
-      const name = tokens[i];
-      const next = want.slots[i] ?? "";
-      const cur = actualTokens[name];
-      if (next) {
-        if (cur !== next) payload[name] = next;
-      } else if (cur != null) {
-        toClear.push(name);
-      }
-    }
-    if (Object.keys(payload).length === 0 && toClear.length === 0) continue;
-
-    const res = await herdr.attachMetadata({
-      paneId,
-      targetSource: want.agent.agent_session.source,
-      tokens: payload,
-      clear: toClear,
-      seq: nextSeq(),
-    });
-    if (res.ok) {
-      attached += 1;
+    if (provider.failed) {
+      // 既不写也不清：守护进程抖一下不该让侧边栏上的 session 行全空掉再全回来。
       log(
         "debug",
-        `并行信息已挂到 ${paneId}：${want.slots.filter(Boolean).join(" / ")}` +
-          (toClear.length ? `（清掉 ${toClear.join(",")}）` : ""),
+        `${agentName} 采集本轮失败（${provider.failedReason || "未知"}），` +
+          `保持 ${rows.length} 行现有 token 不动`,
       );
-    } else {
-      log("warn", `并行信息挂载失败（${paneId}）：${res.error}`);
+      continue;
+    }
+
+    // --- 官方 session：id 精确匹配 --------------------------------------
+    // 匹配上的从并行集合里拿走 —— 它已经是「官方那一行」，再列一次就是重复。
+    const officialSlots = new Map(); // paneId -> {title, state}
+    const parallel = [];
+    for (const info of wanted) {
+      const row = rows.find((a) => str(a.agent_session?.value) === str(info.id));
+      if (row) {
+        // 标题用会话自己的名字，比终端标题可靠（codex 的终端标题没信息量）
+        officialSlots.set(str(row.pane_id), { title: info.title, state: str(row.agent_status) });
+        continue;
+      }
+      parallel.push(info);
+    }
+
+    // --- 并行 session 按工作区分组 ----------------------------------------
+    const byWorkspace = new Map();
+    const orphans = [];
+    for (const info of parallel) {
+      const hit = resolveInlineHostWorkspace(info.directory, index, rows);
+      if (!hit?.workspaceId) {
+        orphans.push(info);
+        continue;
+      }
+      if (!byWorkspace.has(hit.workspaceId)) byWorkspace.set(hit.workspaceId, []);
+      byWorkspace.get(hit.workspaceId).push(info);
+    }
+    for (const o of orphans) {
+      log(
+        "info",
+        `[${agentName}] ${shortId(o.id)}「${(o.title || "").slice(0, 24)}」所在目录没有对应的 Herdr 工作区` +
+          `（或那个工作区里没有 ${agentName} 的 agent 行），内联模式下无处显示。` +
+          `把 MIRROR_INLINE 设成 false 可回到建 pane 模式。`,
+      );
+    }
+
+    /** 工作区里挑一个官方行作为挂载点：优先正在忙的，其次当前聚焦的。 */
+    const pickHost = (workspaceId) => {
+      const candidates = rows.filter((a) => str(a.workspace_id) === str(workspaceId));
+      if (candidates.length === 0) return null;
+      const rank = (a) => {
+        if (a.agent_status === "working") return 0;
+        if (a.agent_status === "blocked") return 1;
+        if (a.focused) return 2;
+        if (a.agent_status === "idle") return 3;
+        if (a.agent_status === "done") return 4;
+        return 5;
+      };
+      candidates.sort((a, b) => rank(a) - rank(b) || str(a.pane_id).localeCompare(str(b.pane_id)));
+      return candidates[0];
+    };
+
+    const desired = new Map();
+    // **遍历这个 agent 所有有官方行的工作区**，而不是只遍历有并行 session 的那些。
+    // 模板里已经没有 terminal_title_stripped 了，官方 session 的标题现在也靠
+    // $oc_sess1 —— 只遍历 byWorkspace 的话，「没有并行 session」的工作区会一个
+    // token 都不写，那一行就彻底空了（实测官方标题直接消失）。
+    for (const workspaceId of new Set(rows.map((a) => str(a.workspace_id)))) {
+      const host = pickHost(workspaceId);
+      if (!host) continue;
+      const paneId = str(host.pane_id);
+      const infos = byWorkspace.get(workspaceId) || [];
+      const matched = officialSlots.get(paneId);
+      if (infos.length === 0 && !matched && !config.inlineAlwaysList) continue;
+
+      const states = provider.statesById instanceof Map ? provider.statesById : new Map();
+      // **官方 session 排第一**：它是用户 TUI 里正在用的那个，用 ▸ 点出来，
+      // 下面的并行 session 是「切走但还在跑」的。
+      const list = matched
+        ? [{ title: matched.title, state: matched.state, official: true }]
+        : [
+            {
+              // 退回终端标题（id 没匹配上时的老路，opencode 侧走的就是这条）
+              title: stripAgentPrefix(host.terminal_title_stripped || host.title || host.pane_id),
+              state: host.agent_status,
+              official: true,
+            },
+          ];
+      for (const i of infos) {
+        list.push({ title: i.title, state: states.get(i.id) || "", official: false });
+      }
+      desired.set(paneId, { agent: host, slots: formatParallelSlots(list) });
+    }
+
+    // --- 写 / 清 ----------------------------------------------------------
+    for (const agent of rows) {
+      const paneId = str(agent.pane_id);
+      const want = desired.get(paneId);
+      const actualTokens = agent.tokens || {};
+      // 本轮该有值的槽位 + 本轮该为空但实际有值的槽位
+      const stale = tokens.filter((t) => actualTokens[t] != null);
+      const legacy = legacyTokens.filter((t) => actualTokens[t] != null);
+
+      if (!want) {
+        if (stale.length === 0 && legacy.length === 0) continue;
+        const res = await herdr.attachMetadata({
+          paneId,
+          targetSource: agent.agent_session.source,
+          clear: [...stale, ...legacy],
+          seq: nextSeq(),
+        });
+        if (res.ok) {
+          cleared += 1;
+          log("debug", `清除 ${paneId} 上过期的 ${stale.join(",")}`);
+        } else {
+          log("warn", `清除 ${paneId} 的 ${stale.join(",")} 失败：${res.error}`);
+        }
+        continue;
+      }
+
+      // 只写「值不同」的槽位；用不到的槽位显式置空（attachMetadata 用空串覆盖）
+      const payload = {};
+      const toClear = [...legacy];
+      for (let i = 0; i < tokens.length; i += 1) {
+        const name = tokens[i];
+        const next = want.slots[i] ?? "";
+        const cur = actualTokens[name];
+        if (next) {
+          if (cur !== next) payload[name] = next;
+        } else if (cur != null) {
+          toClear.push(name);
+        }
+      }
+      if (Object.keys(payload).length === 0 && toClear.length === 0) continue;
+
+      const res = await herdr.attachMetadata({
+        paneId,
+        targetSource: want.agent.agent_session.source,
+        tokens: payload,
+        clear: toClear,
+        seq: nextSeq(),
+      });
+      if (res.ok) {
+        attached += 1;
+        log(
+          "debug",
+          `并行信息已挂到 ${paneId}：${want.slots.filter(Boolean).join(" / ")}` +
+            (toClear.length ? `（清掉 ${toClear.join(",")}）` : ""),
+        );
+      } else {
+        log("warn", `并行信息挂载失败（${paneId}）：${res.error}`);
+      }
     }
   }
 
+  if (official.length === 0) {
+    log("debug", "内联模式：当前没有官方 agent 行，无处挂载 session 列表");
+  }
   return attached + cleared;
+}
+
+/**
+ * 「采集到会话了，但 Herdr 里一个对应 agent 的官方行都没有」时的提示。
+ *
+ * 这就是「装了 herdr 的 codex 集成之前，codex session 一行都不显示」的成因：
+ * 内联模式的信息必须挂在官方 agent 行上，而官方行由 `herdr integration install
+ * <agent>` 建立的 hook 上报。所以第一轮用 info 说清楚前置条件（每轮都 info 会刷屏），
+ * 之后降级成 debug。
+ */
+function noteMissingRows(agentName, count) {
+  const hinted = runtime.codex.missingRowsHinted;
+  const msg =
+    `${agentName} 采集到 ${count} 个会话，但 Herdr 里没有 agent === "${agentName}" 的官方行，` +
+    `无处挂载（内联模式只往官方行上挂 token）。` +
+    `需要先装对应的官方集成：herdr integration install ${agentName}。`;
+  if (hinted === undefined || agentName !== hinted) {
+    log("info", msg);
+    runtime.codex.missingRowsHinted = agentName;
+    return;
+  }
+  log("debug", msg);
 }
 
 /**
@@ -1505,7 +1831,27 @@ function dropClient() {
   }
   runtime.client = null;
   runtime.sseUp = false;
+  // codex 是另一条独立连接，一起收掉：留在那儿会让 board 进程永远不退出，
+  // 也可能在 codex 重启时占着那个 socket。
+  closeCodexClient();
   failDiscovery("opencode 连接中断");
+}
+
+/**
+ * 关掉 codex 的 app-server 连接。
+ *
+ * 必须在退出路径上调用：那是用户自己启动的 app-server，我们的 socket 挂着不放手，
+ * 它重启时要多等一次 socket 超时。
+ */
+function closeCodexClient() {
+  const client = runtime.codex.client;
+  runtime.codex.client = null;
+  if (!client) return;
+  try {
+    client.close();
+  } catch {
+    /* ignore */
+  }
 }
 
 function shortId(id) {
@@ -2927,6 +3273,7 @@ process.on("unhandledRejection", (err) => {
 });
 process.on("uncaughtException", (err) => {
   log("error", `未捕获异常，退出以免留下坏状态: ${err?.message || err}`);
+  closeCodexClient();
   void (async () => {
     await store.writeState(STATE_DIR, runtime.state).catch(() => {});
     await releaseBoardLock().catch(() => {});

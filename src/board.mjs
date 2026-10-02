@@ -73,8 +73,11 @@ const SYNC_FLAG = path.join(STATE_DIR, "sync.request");
 const REAP_FLAG = path.join(STATE_DIR, "reap.request");
 const MIRROR_PREFIX = "oc_";
 
-/** 镜像 pane 名上限。侧边栏一行放不下更多，留点余量给状态符号和项目名。 */
+/** 镜像 pane 名上限。侧边栏一行放不下更多，留点余量给状态符号。 */
 const MIRROR_LABEL_MAX = 40;
+
+/** 侧边栏第 2 行显示的 agent 名。和官方 opencode 行同名，看起来才一致。 */
+const MIRROR_AGENT_LABEL = herdr.AGENT_LABEL;
 
 function log(level, ...args) {
   if (LEVELS[level] < LEVELS[config.logLevel]) return;
@@ -2175,7 +2178,12 @@ async function reportMirror(sessionID, rec) {
 export function mirrorLabel(state, project, title) {
   const mark =
     state === "working" ? "●" : state === "blocked" ? "▲" : state === "idle" ? "○" : "·";
-  return store.sanitizeText([mark, project, title].filter(Boolean).join(" "), MIRROR_LABEL_MAX);
+  // pane 的 label 会出现在侧边栏第 2 行（`state_icon` + `agent` 那一行）。
+  // 只放 **agent 名 + 状态符号**，不要项目和标题 ——
+  //   · 状态已经有 state_icon 在画了，重复一个 ● 只是噪音
+  //   · 项目名已经在分组头（`[1] afloat`）里
+  //   · 标题在下一行的 terminal_title_stripped 里
+  return store.sanitizeText([mark, MIRROR_AGENT_LABEL].filter(Boolean).join(" "), MIRROR_LABEL_MAX);
 }
 
 /**
@@ -2268,6 +2276,14 @@ async function validateTrackedPanes() {
       dropped += 1;
       continue;
     }
+    // 强制刷新展示层：label / token 的渲染规则可能随插件升级变了，而
+    // fingerprint 只由「状态 + 标题 + 目录」构成，规则变化时它纹丝不动，
+    // 于是新规则永远等不到触发条件（实测改完 mirrorLabel 重启 board 后
+    // label 仍是旧的）。启动时无条件清一次，下一轮必定重写一遍。
+    rec.fingerprint = "";
+    rec.lastState = "";
+    rec.reportedAt = 0;
+
     // pane 还在、但 `oc_mirror` 标记没了 → 这一行已经被**别的来源接管**。
     //
     // 真实事故：`RESUME_MODE=opencode` 让 Herdr 重启时在镜像 pane 里拉起 opencode

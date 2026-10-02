@@ -82,9 +82,14 @@ function paint() {
   const body = `${lines.join("\n")}\n`;
   if (body === lastRender) return;
   lastRender = body;
-  // 标题与 board 侧 pane.rename 的规则保持一致：状态符号 + 项目 + 标题。
+  // OSC 标题 = **纯 session 标题**。
+  //
+  // 它会变成侧边栏的 `terminal_title_stripped`，所以格式必须和官方 opencode 行
+  // 一致才好看。官方行是 `OC | <标题>`，前缀由 opencode TUI 自己设；我们这里
+  // 只放标题，多余的状态符号和项目名不要 —— 项目名已经在分组头（`[1] afloat`）
+  // 里了，状态在第 2 行的 state_icon 里，两处都重复就没意义了。
   // 控制字符已经由 board 在写快照前清过，这里只做长度兜底。
-  const oscTitle = `${badge.split(" ")[0]} ${basename(dir)} ${title}`.replace(/\s+/g, " ").trim();
+  const oscTitle = String(title).replace(/\s+/g, " ").trim();
   // 清屏 + 归位再整块重画。状态行很短，重画成本可以忽略，
   // 比用光标上移做原地更新可靠得多。
   out.write(SET_TITLE(oscTitle.slice(0, 120)) + CLEAR_SCREEN + body);

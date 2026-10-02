@@ -8,7 +8,7 @@ id = "opencode.session-mirror"
 name = "OpenCode Session Mirror"
 version = "0.1.0"
 min_herdr_version = "0.9.3"
-description = "把同一个 opencode server 内所有运行中的根 session 镜像成 Herdr Agents 视图里的独立行"
+description = "把 opencode、codex、Claude Code 里所有运行中的会话按工作目录挂到 Herdr Agents 视图的官方 agent 行上，显示成 ASCII 树状会话列表"
 platforms = ["linux", "macos"]
 
 # 一次性初始化钩子：Herdr 恢复会话后运行一次。

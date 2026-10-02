@@ -292,6 +292,7 @@ src/
   herdr.mjs              # Herdr CLI / socket 调用封装
   opencode.mjs           # OpenCode server 客户端（health / session / status / SSE）
   codex.mjs              # Codex app-server 客户端（WebSocket over unix socket + JSON-RPC，见第 12 节）
+  claude.mjs             # Claude Code 会话发现（spawn `claude agents --json` + 纯字段映射，见第 13 节）
   state.mjs              # HERDR_PLUGIN_STATE_DIR 下的映射持久化
 config/.env.example
 README.md
@@ -435,6 +436,7 @@ session 在用户没开 TUI 的目录（典型是 `/tmp` 下的临时工程）�
 ```
 publishInlineSessions(providers)          ← agent 无关：分组、挑挂载点、写/清 token
   ├─ fetchCodexSessions()  → codex.mjs   ← codex 专用
+  ├─ fetchClaudeSessions() → claude.mjs  ← Claude Code 专用
   └─ (opencode 侧)        → opencode.mjs
 ```
 
@@ -598,3 +600,182 @@ hook 将来真跑起来时写的是同一个值。而不补报的后果是「因
 - **同工作区多个 codex 窗口时只有一个会显示会话树**（12.10），这是挂载点唯一决定的，不是 bug。
 - **本机 codex 侧网络不通**（`moai.top` DNS 解析失败），所以 codex TUI 发消息会失败。但这不影响插件：会话数据全部来自本地 app-server，不联网。
 - **codex 的终端标题未必有信息量**，所以 id 匹配成功时用 thread 自己的 `name`/`preview`，匹配不上才退回终端标题。
+
+---
+
+## 13. Claude Code 支持
+
+第 12 节的多 agent 框架对 Claude Code 同样成立：**挂载机制和渲染一个字都没改**，只多了一个
+provider（`fetchClaudeSessions()` → `claude.mjs`）。这一节只记 Claude 自己的数据源、字段映射、
+匹配方式和成本 —— 结构上的异同才是读代码时真正要知道的。
+
+### 13.1 发现方式：只有 `claude agents --json`
+
+官方文档明说这是「**the supported way** to read session state from outside Claude Code」，
+同时点名 `~/.claude/jobs/<id>/state.json` 与 `~/.claude/daemon/roster.json` 是
+**非稳定接口、不要解析**。所以只用 CLI。
+
+- **不需要 supervisor 守护进程。** 实测 `claude daemon status` 是 `not running` 时，两个活着的
+  交互式会话照样列得出来（实时进程组信息走 `/proc`，不经过 daemon）。所以没有「拿不到
+  supervisor 就算失败」这回事，也不要去管 `claude daemon`。
+- **不要加 `--all`。** 默认语义已经是「every live session, plus background sessions that are
+  still working or blocked even when their process has exited」，正好是我们要的「正在跑」；
+  加 `--all` 反而把已完成的会话全列进来。
+- 单次调用实测约 **260ms**（`time` 跑 5 次共 1.28s），stderr 干净，stdout 是纯 JSON 数组。
+
+### 13.2 与 codex 侧的结构性差异
+
+| | codex（第 12 节） | Claude Code |
+| --- | --- | --- |
+| 数据通道 | app-server 长连接（WebSocket over unix socket） | 每次一个短命 `spawn` |
+| 连接生命周期 | connect / 重连 / 退出前 `closeCodexClient()` | 无连接可断 |
+| 采集失败形态 | 「守护进程连不上」，退避重连 | 「这一轮没拿到结果」，退避后重来 |
+| 状态粒度 | app-server 内存（实时） | 进程实时状态 |
+
+差异直接决定了两件事：
+
+1. **board 里没有 `runtime.claude.client`** —— 只有退避、节流、缓存。
+2. **每一次 spawn 都必须自带超时并回收子进程**，否则 board 进程永远排不空事件循环，
+   `--mode once` 挂着不退出（`AGENTS.md` 记过 codex 那条长连接的同款事故）。具体做法：
+   超时后 SIGKILL **并 destroy 掉 stdio 流** —— 只杀进程不够，孙进程继承的管道端点会把
+   本进程吊住（实测一个超时的 `sh` 包装脚本，+500ms 时仍有 4 个 PipeWrap 在活跃资源里）。
+
+### 13.3 字段映射
+
+实测输出（Claude Code 2.1.287）里每一项都可能缺，所以全部按可选处理：
+
+| 字段 | interactive | background | 用途 |
+| --- | --- | --- | --- |
+| `sessionId` | 有 | 有 | **唯一稳定身份**：去重、transcript 路径、补报都用它 |
+| `cwd` | 有 | 有 | 目录匹配与挂载 |
+| `kind` | `interactive` | `background` | 仅日志 |
+| `startedAt` | 有 | 有 | Unix **毫秒**（codex 那边是秒）；降级匹配时排「最近起的」 |
+| `pid` | 有 | **可能没有**（worker 刚起来时实测缺） | pid 精确匹配 |
+| `status` | 有 | **可能没有** | `busy`/`waiting`/`idle` |
+| `state` | **没有** | 有 | `working`/`blocked`/`done`/`failed`/`stopped` |
+| `id` | **没有** | 有 | 短 id，`claude attach/stop/logs` 用 |
+| `name` | 有 | 有 | 标题（常常是默认值，见 13.5） |
+| `waitingFor` | 有状态时 | 有状态时 | `permission prompt` / `input needed` / … |
+
+没有 `sessionId` 的条目直接丢弃：既无法去重也无法 resume。
+
+### 13.4 状态映射
+
+| claude | 插件状态 | 侧边栏标记 |
+| --- | --- | --- |
+| `state:"working"` / `status:"busy"` | working | `●` |
+| `state:"blocked"` / `status:"waiting"` | blocked | `▲` |
+| `state:"done"` / `status:"idle"` | idle | `○` |
+| `state:"failed"` / `"stopped"` | `null` | **不显示**（回合已结束） |
+| 都没有 | idle | `○` |
+
+**「都没有」当 idle 的理由**：在列表里就意味着进程还活着（只有 `--all` 才带已完成的），
+宁可报 idle 也不要把它藏起来。这与 codex 的 `notLoaded → null` 语义不同 —— 后者是
+「不在 app-server 内存里」的历史遗留，claude 没有这个概念。
+
+### 13.5 标题：默认显示名毫无信息量
+
+交互式会话在用户 `/rename` 之前，`name` 是 `<cwd 的 basename>-<两个字符>`（本机实测
+`herdr-fe` / `herdr-99`）；后台 job 暂时拿不到标题时，`name` 会是**自己的短 id**（实测
+`id:"fca468d9"`、`name:"fca468d9"`、`sessionId:"fca468d9-…"`）。两种都当默认名处理。
+
+兜底读 transcript 的首条用户消息，路径实测规则是
+`<CLAUDE_CONFIG_DIR 或 ~/.claude>/projects/<encoded-cwd>/<sessionId>.jsonl`，其中
+`encoded-cwd` = 目录里每个非字母数字字符换成 `-`（`_` 也变 `-`）。超过 200 字符会截断
+并加路径哈希 —— **不实现那个哈希**，官方没给算法，猜出来的路径只会读不到，于是退回
+`(无标题)`：一个可接受的降级好过某天悄悄读错文件。
+
+判据全宽容（`type==="user"` + `message.role==="user"` + `isSidechain!==true`，`origin`
+存在时要求 `origin.kind==="human"`，数组 content 只取 `text` 块），**任何异常都退回占位符，
+绝不抛** —— 官方明说 transcript 的行格式是 internal 的、随版本变。
+
+**只读头部 64KB 且按 sessionId 记忆化**（上限 200 条）：整个 transcript 实测 47KB 且会一直
+长下去，每轮重读纯属浪费。**只缓存成功的解析** —— 缓存「没找到」会让标题在用户发出第一句话
+之后仍然停在 `(无标题)`，直到 board 重启。
+
+### 13.6 匹配：pid 精确命中，比 codex 准
+
+`herdr pane process-info --pane <id>` 的 `foreground_process_group_id` 与
+`claude agents --json` 条目的 `pid` **逐字节相等**（本机实测 `w1J:p12` → 2440557 →
+session `333dcd0a…`，`w1J:p14` → 2441496 → session `71ad425d…`）。`pane process-info`
+实测 5ms/次，很便宜。
+
+所以 claude 的补报（13.7）**不退化成 codex 那套「目录 + 排序去猜」**，只在下面这些情况才降级：
+
+- 该会话没有 `pid`（后台 worker 刚起来时实测缺）；
+- pane 里跑的根本不是 claude；
+- **那个会话压根没出现在 `claude agents` 里** —— 实测踩到过：交互式 TUI 被 fork 成后台 job
+  之后，交互式那个会话就从列表里消失了（进程还在、transcript 还在），此时 pane 的前台 pid
+  对不上任何条目。
+
+另外还有一条更直接的信号：后台 worker 的进程命令行里带 `--session-id <uuid>`（实测
+`claude --session-id fca468d9-… --agent claude …`，herdr 原样返回 argv/cmdline），命中它
+就不用对齐 pid。
+
+### 13.7 补报会话身份（`CLAUDE_ADOPT_SESSION`）
+
+`publishInlineSessions` 判定官方行的条件要求 `agent_session.source` 是字符串，而本机装好
+Claude Code、官方集成未装时，`herdr agent list` 给的 claude 行**没有 `agent_session` 字段**
+（实测字段只有 agent / agent_status / cwd / foreground_cwd / name / pane_id / tab_id /
+terminal_id / terminal_title / workspace_id）—— 于是一条都进不了官方行集合，内联模式
+无处可挂。
+
+herdr 的 claude 集成是 hook 驱动的（`~/.claude/hooks/herdr-agent-state.sh`，本机未装）。
+所以插件以 `herdr:claude` 的身份补报一次 `agent_session`，写进去的 session id 是
+`claude agents --json` 里的真值，将来官方 hook 真跑起来写的是同一个值。补报与挂载的顺序
+不能颠倒 —— `--applies-to-source` 要求目标 source 在该 pane 上**已有记录**，所以必须先补报
+再挂载，否则写完即消失（实测 `tokens` 变 null）。
+
+实测确认：补报之后 `agent_session` 变成 `{agent:"claude", kind:"id", source:"herdr:claude",
+value:"fca468d9-…"}`，`pane.report_metadata --applies-to-source herdr:claude` 也就能挂上
+`$oc_sess*`。
+
+### 13.8 踩坑：TUI 刚起来时列表是空的
+
+本机实测两个 pane 卡在首次运行的 "Press Enter to continue…" 安全提示时，
+`claude agents --json` 返回 `[]`；过掉信任对话和渲染器询问之后才列出。所以**「采不到会话」
+不等于「采集坏了」**，不要因此报错或进退避。
+
+### 13.9 成本：两条对策都要做
+
+主轮询 `POLL_INTERVAL_MS` 默认 5000ms，每次 spawn 约 260ms —— 每 5 秒一次就是每 20 秒白花
+260ms 常驻开销（约 5% 单核）。而这个项目对 CPU 很敏感（12.9：转轮开 12% vs 关 4%）。
+
+1. `CLAUDE_POLL_MS` 独立节奏，默认 **10000**（想追平主循环设 5000，代价自己认）。
+2. **零行门控**：Herdr 里一个 `agent === "claude"` 的行都没有时连 spawn 都跳过，直接
+   `agent list()` 判（实测 4ms，而 `publishInlineSessions` 每轮本来就要拉一次）。用户没在
+   Herdr 里跑 claude 时零成本。
+
+另外两条实现细节也是为了省：
+
+- **节流命中时返回上一次的好结果，不报失败。** 主循环 5 秒、claude 10 秒，每两轮必然命中一次
+  节流；若命中时报 `failed`，`publishInlineSessions` 会走「既不写也不清」，表现就是「claude 的
+  状态永远停在 10 秒前那一版而且被冻住」。
+- **门控时不动节流时间戳**，否则用户新起的 claude 要再等一整个 `CLAUDE_POLL_MS` 才出现。
+
+**这两条对策的实测收益**（同一台机器、同样两个 claude 会话在跑，读 `/proc/<pid>/stat` 的
+utime+stime，各测 30 秒）：
+
+| | 单核占用 |
+| --- | --- |
+| 改动前（只有 opencode + codex） | 3.9% |
+| 改动后（加上 claude，默认 10s 节奏 + 零行门控） | **2.5%** |
+
+反常但实测如此：新代码那一档更低。两份数据各有 10 余个会话在采集、机器负载也在动，30 秒
+窗口的噪声足以盖过几百毫秒的 spawn 差值，所以**只能当量级参考，不能当精确基准**。真正的
+结论是上面那两条机制本身：spawn 有独立节奏（不会变成每 5 秒一次），且一个 claude 行都没有时
+连 spawn 都不做。要精确对比得停掉其它 agent、跑更长窗口。
+
+### 13.10 已知边界（Claude Code）
+
+- **补报可能挑错会话**：13.6 那三种降级情况下（同目录多个会话、其中一个没出现在列表里），
+  目录匹配只能按「已绑定 → 正在跑 → 最近起」排序取一个。降级时日志里会写明
+  「目录匹配（降级，pid 没对上）」，看到它就知道这一行是猜的。
+- **补报出来的身份会一直留在 herdr 里**：插件不会主动撤销（撤销等于把官方集成也一起抹掉）。
+  关掉支持请用 `CLAUDE_ENABLED=false`，它会撤掉 token，但补报过的 `agent_session` 保持原样
+  —— 那本来就是真值。
+- **`MIRROR_INLINE=false`（建 pane 模式）不支持 claude**：那条路径挂的是自己的镜像 pane，
+  本来就不支持 codex，claude 与 codex 对齐即可。
+- **旧看板进程不认识 claude 行，会把它当成孤儿清扫**：`--mode once` 与常驻管理器并存时，
+  常驻进程（改动前启动的那一份）的兜底清扫会把 claude 行上的 `$oc_sess*` 清掉。改了代码要
+  重启看板标签页才生效，这是既有机制（改完 `.env` 也一样），不是 claude 特有的问题。

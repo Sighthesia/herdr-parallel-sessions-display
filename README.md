@@ -1,6 +1,7 @@
 # opencode-session-mirror
 
-把 **opencode** 和 **codex** 里正在运行的会话，按工作区分组显示在 Herdr Agents 视图里。
+把 **opencode**、**codex** 和 **Claude Code** 里正在运行的会话，按工作区分组显示在 Herdr
+Agents 视图里。
 
 默认走**内联模式**：不创建任何 pane、不创建任何标签页，session 列表以 token 的形式挂在
 该目录的官方 agent 行下面，画成 ASCII 树状图。
@@ -190,6 +191,13 @@ command = "opencode.session-mirror.board"
 | `CODEX_SESSION_LIMIT` | `100` | 每页拉多少条 thread |
 | `CODEX_TIMEOUT_MS` | `8000` | 单次 app-server 请求超时 |
 | `CODEX_ADOPT_SESSION` | `true` | 官方行没有 `agent_session` 时，由插件以 `herdr:codex` 的身份补报一次（读的是 codex 自己的 app-server，写的是真实 thread id）。**不补的话 codex 在 TUI 刚启动、还没跑过一轮对话时完全不可见**，见下 |
+| `CLAUDE_ENABLED` | `true` | 是否采集 Claude Code 的 session。关掉会撤掉 claude 行上已挂的列表 |
+| `CLAUDE_BIN` | 空 | `claude` 可执行文件的路径，留空用 PATH 上的。**GUI 起的 Herdr 进程的 PATH 未必和你终端一样**，终端里 `claude` 能跑、看板面板里 spawn 不到时就填绝对路径 |
+| `CLAUDE_TIMEOUT_MS` | `8000` | 单次 `claude agents --json` 超时。实测正常调用约 260ms |
+| `CLAUDE_POLL_MS` | `10000` | claude 的采集节奏（**与主循环的 5 秒独立**）。每次采集要 spawn 一次，按 5 秒就是每 20 秒白花 260ms 常驻开销 |
+| `CLAUDE_SESSION_LIMIT` | `50` | 最多认多少个会话（新的优先） |
+| `CLAUDE_ADOPT_SESSION` | `true` | 官方行没有 `agent_session` 时，由插件以 `herdr:claude` 的身份补报一次（写的是真实 session id）。**不补的话 claude 的会话一条都不显示**，见下 |
+| `CLAUDE_READ_TITLES` | `true` | 标题是默认显示名时，读 transcript 的首条用户消息来兜底。只读文件头部 64KB 且按会话记忆化 |
 
 改完 `.env` 需要重启看板面板（关掉标签页再打开）才生效。
 
@@ -377,6 +385,40 @@ codex 这边会真的缺：**Codex 0.160 的 `SessionStart` hook 在 TUI 启动�
 
 > 顺带说明：`--applies-to-source herdr:codex` 猜一个 source 去挂是**挂不上**的，
 > token 写完再查就是 null。所以「补报」和「挂载」必须都做，缺一不可。
+
+### Claude Code 支持
+
+同样把 **Claude Code 正在跑的会话**挂到 claude 的官方 agent 行上，显示方式和 codex 完全一致。
+**前置条件不一样**：不需要先 `herdr integration install claude` —— 在 Herdr 的某个 pane 里跑起
+claude 就有官方行了，而会话身份由插件自己补（见下）。
+
+**怎么读到的**：`claude agents --json`。官方文档明说这是唯一受支持的程序化接口（`~/.claude/jobs/`
+和 `roster.json` 是非稳定接口、不要解析）。单次约 260ms，每 10 秒跑一次（`CLAUDE_POLL_MS`）；
+Herdr 里一个 claude 行都没有时连 spawn 都跳过。
+
+**不用装守护进程**：`claude daemon status` 是 `not running` 时，正在跑的会话照样列得出来。
+
+**标题**：Claude 默认给的显示名是 `herdr-fe` 这种（目录名 + 两个字符），没有信息量；后台任务
+还没拿到标题时甚至会拿自己的短 id 当名字。插件会去读该会话 transcript 的**首条用户消息**
+当标题（只读文件头部，按会话记忆化）。想关掉读盘设 `CLAUDE_READ_TITLES=false`，代价是那些
+会话显示成 `(无标题)`。
+
+### 为什么需要 `CLAUDE_ADOPT_SESSION`
+
+和 codex 同款问题，但原因不同：Herdr 0.9.3 的 claude 集成靠 hook 上报
+（`~/.claude/hooks/herdr-agent-state.sh`），**没装集成时 `herdr agent list` 给的 claude 行
+根本没有 `agent_session` 字段**。而内联模式只往「官方行」上挂 token，于是那些行一条都进不了，
+会话完全不可见。
+
+所以插件会自己补报一次：以 `herdr:claude` 的身份把 `claude agents --json` 里的真实
+session id 写进那一行的 `agent_session`。写的是真值，官方 hook 将来真跑起来写的是同一个值。
+关掉它（`CLAUDE_ADOPT_SESSION=false`）就回到纯被动，代价是 claude 的会话一条都不显示。
+
+**挑哪个会话当「官方那个」**：这一步 claude 比 codex 准 —— Herdr 报的
+`foreground_process_group_id` 与 `claude agents` 里的 `pid` **逐字节相等**（实测
+`w1J:p12` → 2440557 → 某个 session id），所以是**精确匹配**而不是猜；后台任务的进程命令行里
+还直接带着 `--session-id <uuid>`。只有「那个会话压根没出现在列表里」这类情况才会退回按目录
+匹配（退回时日志里会写明「目录匹配（降级，pid 没对上）」）。
 
 ### 关于 `FOCUS_REDIRECT`（只在 `MIRROR_INLINE=false` 时生效）
 
@@ -576,6 +618,39 @@ workspace/tab）。看板日志里会有一行：
 
 镜像标签页内部的排列由平衡 BSP 树决定，等分空间。哪个 session 先跑就先建哪个，
 顺序不保证稳定 —— 分组是对的就行。
+
+**claude 的会话一行都不显示：**
+
+按顺序确认这三件事：
+
+```bash
+# 1) Herdr 里到底有没有 claude 行？（内联模式只能挂在官方行上，没有行就无处可挂）
+herdr agent list | grep -o '"agent":"claude"' | head -1
+
+# 2) Claude Code 自己认不认这些会话？
+claude agents --json
+
+# 3) claude 那个可执行文件在**看板进程**的 PATH 里吗？Herdr 是 GUI 起的，
+#    它的 PATH 未必和你终端一样。终端里能跑、插件里 spawn 不到就填 CLAUDE_BIN。
+herdr plugin config-dir opencode.session-mirror   # 把绝对路径写进 CLAUDE_BIN
+```
+
+- 第 1 步为空 = 没有 claude 跑在 Herdr 的 pane 里（后台 `claude -p` 的会话就属于这种，
+  没有 pane 就没有可挂载的行）。日志里会有
+  「Herdr 里没有 claude 的 agent 行（= 没有 claude 跑在 Herdr 的 pane 里），无处挂载」。
+- 有 claude 行但没补上身份 = 补报没成功。日志搜「补报 claude 会话身份」。
+  `pane.report_metadata --applies-to-source herdr:claude` 要求那个 pane 上已经有
+  `herdr:claude` 的记录，所以**补报必须排在挂载之前**。
+- 改完配置**必须重启看板标签页**才生效。
+
+**claude 会话标题显示成 `(无标题)`：**
+
+说明那个会话的 transcript 里还没写出第一条用户消息（Claude Code 刚起、或用户还没发过话）。
+发一句话就会更新 —— 插件**不缓存**失败的解析就是为了这个。
+
+**claude 的状态停在十分钟前不动：**
+
+`CLAUDE_POLL_MS` 默认 10000 采一次。这是设计如此（省 CPU），不是卡住。想跟手设成 `5000`。
 
 **Herdr 重启后行没了：**
 

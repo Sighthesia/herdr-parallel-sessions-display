@@ -24,6 +24,15 @@ import {
   normalizeBaseUrl,
 } from "./opencode.mjs";
 import { CodexClient, CodexError, normalizeThread, parseSourceKinds } from "./codex.mjs";
+import {
+  ClaudeError,
+  NO_TITLE,
+  claudeBin,
+  claudeConfigDir,
+  listClaudeSessions,
+  normalizeClaudeSession,
+  resolveClaudeTitle,
+} from "./claude.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PLUGIN_ROOT = process.env.HERDR_PLUGIN_ROOT || path.resolve(HERE, "..");
@@ -144,8 +153,49 @@ const config = {
   // 还没跑过一轮对话时完全不可见，而这个插件的全部价值就是「显示正在跑的会话」。
   // 设成 false 回到纯被动：只显示官方集成已经报上来的，绝不代替它写。
   codexAdoptSession: store.asBool(raw, "CODEX_ADOPT_SESSION", true),
+
+  // --- Claude Code（SPEC 第 13 节）----------------------------------------
+  // 与 codex 的结构差异：那边是一条常驻连接，这边每轮 spawn 一个 `claude agents --json`
+  // 短命进程。所以没有 client / 重连 / 断连接，取而代之的是「每次 spawn 都自带超时
+  // 且回收」—— 否则自检模式会挂着不退出。
+  //
+  // 默认开：Herdr 里一个 `agent === "claude"` 的行都没有时会走**零行门控**跳过 spawn，
+  // 用户没在 Herdr 里跑 claude 时零成本（只多一次 `agent list`，实测 4ms）。
+  claudeEnabled: store.asBool(raw, "CLAUDE_ENABLED", true),
+  // 空 = PATH 上的 claude。本机实测装在 /opt/claude-code/bin/claude，而 Herdr 是 GUI
+  // 进程、PATH 未必一样 —— 终端里能跑、看板面板里 spawn 不到就是这个形态。
+  claudeBin: store.asString(raw, "CLAUDE_BIN", ""),
+  // 单次 spawn 的超时。本机实测正常调用约 260ms，8s 是留给机器慢的情况。
+  claudeTimeoutMs: store.asInt(raw, "CLAUDE_TIMEOUT_MS", 8_000, 500, 120_000),
+  // claude 侧的独立节奏。**默认 10000 而不是跟着主循环的 5000**：每次 spawn 约 260ms，
+  // 每 5 秒一次就是每 20 秒白花 260ms 常驻开销（约 5% 单核），而 busy/blocked 的状态
+  // 变化本来也不需要秒级跟手。想追平设 5000，代价自己认。
+  claudePollMs: store.asInt(raw, "CLAUDE_POLL_MS", 10_000, 1_000, 600_000),
+  // 认多少个会话（新的优先）。防御性上限，见 state.mjs 的注释。
+  claudeSessionLimit: store.asInt(raw, "CLAUDE_SESSION_LIMIT", 50, 1, 1_000),
+  // 官方行没有 agent_session 时由插件补报一次（写的是 claude 自己的 sessionId）。
+  // claude 这边值得默认开：herdr 的 claude 集成是 hook 驱动的，没装集成时**一条官方行
+  // 都进不了 publishInlineSessions 的官方行集合**，会话就彻底不可见；而补报用的 pid
+  // 是精确匹配（herdr 的 foreground_process_group_id == claude 的 pid，实测逐字节相等），
+  // 比 codex 侧的目录猜测准得多。
+  claudeAdoptSession: store.asBool(raw, "CLAUDE_ADOPT_SESSION", true),
+  // 标题是默认显示名时要不要读 transcript 兜底。只读头部 64KB 且按 sessionId 记忆化。
+  claudeReadTitles: store.asBool(raw, "CLAUDE_READ_TITLES", true),
+
   logLevel: store.asEnum(raw, "LOG_LEVEL", ["debug", "info", "warn", "error", "silent"], "info"),
 };
+
+/**
+ * 「采到会话但 Herdr 里没有对应官方行」时给 **claude** 用的提示文案。
+ *
+ * 默认文案（{@link noteMissingRows} 里的那句）对 claude **不成立**：它写着「需要先装
+ * 官方集成 herdr integration install claude」，但 claude 的信息恰恰是靠**补报**
+ * （CLAUDE_ADOPT_SESSION）自己造出来的 agent_session —— 也就是说「没装集成」在开启
+ * 补报时**不是**一条有效建议，指过去只会把用户引到一条改了也没用的路上。
+ */
+const CLAUDE_MISSING_ROWS_HINT =
+  "Herdr 里没有 claude 的 agent 行（= 没有 claude 跑在 Herdr 的 pane 里），无处挂载。" +
+  "在 Herdr 的 pane 里跑起 claude 即可；补报（CLAUDE_ADOPT_SESSION）需要那一行存在。";
 
 const LEVELS = { debug: 10, info: 20, warn: 30, error: 40, silent: 99 };
 const STATE_DIR = process.env.HERDR_PLUGIN_STATE_DIR || path.join(PLUGIN_ROOT, ".state");
@@ -363,8 +413,6 @@ const runtime = {
     backoffMs: 1_000,
     consecutiveFailures: 0,
     lastError: "",
-    /** 「采到会话但没有对应官方行」的前置条件提示是否已经 info 说过一次。 */
-    missingRowsHinted: "",
     /**
      * 我们补报过的会话：pane_id -> thread id。
      *
@@ -374,6 +422,54 @@ const runtime = {
      */
     adopted: new Map(),
   },
+  /**
+   * Claude Code 的采集状态。
+   *
+   * **和 codex 那边结构上不同：没有 `client`。** codex 是一条常驻的 app-server 连接，
+   * 所以有 connect / 重连 / 退出前 `closeCodexClient` 那一套；claude 每轮都是一次
+   * 自洽的短命 spawn（`claude agents --json`），没有连接可断，也没有「连接烂了」这种
+   * 失败模式 —— 失败只有「这一轮没拿到结果」。
+   *
+   * 代价换成了另一个必须做的事：**每一次 spawn 都必须自己带超时并回收子进程**，
+   * 否则进程里会留下等 close 的 handle，`--mode once` 就永远不退出（`AGENTS.md` 记过
+   * codex 那条长连接的同款事故）。
+   */
+  claude: {
+    /** 连续失败次数 + 指数退避，和 codex 侧同构。 */
+    consecutiveFailures: 0,
+    backoffMs: 1_000,
+    nextAttemptAt: 0,
+    lastError: "",
+    /** 距下次允许 spawn 的时间戳。成功之后也会写 —— 它就是 CLAUDE_POLL_MS 节流。 */
+    nextFetchAt: 0,
+    /**
+     * 在途采集的 Promise。
+     *
+     * 主循环 5 秒、claude 10 秒，正常节奏下不会撞上；但 sync action 和 SSE 去抖会让
+     * reconcile 连着跑，撞上时**等它**而不是叠第二次 spawn（并发 spawn 会让耗时翻倍、
+     * 两个结果还可能交错写缓存）。
+     */
+    inflight: null,
+    /**
+     * 上一次**好**结果。
+     *
+     * 命中节流时返回它而不是报失败 —— 见 {@link fetchClaudeSessions} 里那条
+     * 「节流命中就报 failed」的后果分析。
+     */
+    cache: null,
+    /** sessionId -> 标题。transcript 只在首次解析时读盘，这里就是它的记忆。 */
+    titleCache: new Map(),
+    /** 我们补报过的会话：pane_id -> claude session id。理由同 {@link runtime.codex.adopted}。 */
+    adopted: new Map(),
+  },
+  /**
+   * 「采集到会话但没有对应官方行」的 info 提示，每个 agent 各记一次。
+   *
+   * **必须是按 agent 分开的**：早先这里是单个字符串（`runtime.codex.missingRowsHinted`），
+   * 两个 provider 一起来就会互相覆盖 —— 先 codex 提示过，claude 的第一次提示就被压成
+   * debug 了，于是「没装集成 → 一行都不显示」这个最该被说清楚的事，在日志里完全隐形。
+   */
+  missingRowsHinted: new Map(),
   timers: [],
   /** 一轮重算里已经重平衡过没有。回收一批行时不必每个都重算一次布局。 */
   balancedThisPass: false,
@@ -556,6 +652,12 @@ async function modeOnce() {
   // 只要它还挂着，事件循环就永远排不空。实测 `CODEX_ENABLED=true` 时自检跑完
   // 全部活儿之后不退出、得靠 timeout 杀掉；`CODEX_ENABLED=false` 时 3 秒就退。
   closeCodexClient();
+  // **claude 这边没有对应动作，而且这正是它与 codex 的结构差异**：claude 每轮都是
+  // 一次自洽的短命 spawn（`claude agents --json`），没有连接可断。它的等价保证在
+  // claude.mjs 里 —— 每个 spawn 都自带超时、超时 SIGKILL 并 destroy 掉 stdio 流，
+  // 所以既不会留下僵尸子进程，也不会留下吊住事件循环的管道（只杀进程不 destroy
+  // 流的话，孙进程继承的管道端点会让本进程一直排不空，自检就会挂着不退出）。
+  // 所以这里什么都不用做，但别把这个 `closeCodexClient()` 顺手改名成「关掉所有连接」。
   stopBusySpinner();
   runtime.shuttingDown = true;
   runtime.client = null;
@@ -1140,6 +1242,396 @@ async function adoptCodexSessions(wanted, statesById) {
 }
 
 // ---------------------------------------------------------------------------
+// Claude Code 采集
+// ---------------------------------------------------------------------------
+
+/**
+ * 采一轮 Claude Code 的运行中会话。
+ *
+ * ## 与 codex 侧三处结构性差异（决定了下面每一段为什么这么写）
+ *
+ * 1. **没有连接，只有 spawn。** 所以没有 client / 重连 / 退出前断连接，取而代之的是
+ *    「每次 spawn 自带超时 + 回收」。子进程没被回收的话 `--mode once` 永远不退出
+ *    （`AGENTS.md` 记过 codex 那条长连接的同款事故）。
+ * 2. **节流必须返回上一次的好结果，不能报失败。** 主循环 5 秒、claude 10 秒，所以每两轮
+ *    就必然命中一次节流。如果命中时报 `failed`，`publishInlineSessions` 会走「既不写也不清」，
+ *    表现就是「claude 的状态永远停在 10 秒前那一版、而且被冻住」—— 连 idle→working 都
+ *    传不上去了。报成功并返回缓存才是对的。
+ * 3. **有零行门控。** Herdr 里一个 `agent === "claude"` 的行都没有时，连 spawn 都跳过
+ *    （直接 `agentList()` 判，实测 4ms）：用户没在 Herdr 里跑 claude 时零成本。
+ *
+ * ## 「采不到会话」不等于「采集坏了」
+ *
+ * 交互式会话在 TUI 刚起来、还卡在首次运行的 "Press Enter to continue…" 安全提示时，
+ * `claude agents --json` 返回 `[]`（本机实测）。那是正常状态，不要因此报错或退避。
+ *
+ * @returns {Promise<{ok:true, wanted:object[], statesById:Map<string,string>, rows?:object[], gated?:boolean}
+ *                 | {ok:false, reason:string, disabled?:true}>}
+ */
+async function fetchClaudeSessions() {
+  // 主动关掉和采集失败必须分开标记，理由与 codex 侧完全相同：`disabled` 要**撤掉**之前
+  // 挂上去的 token，而失败必须**保留**（踩过的坑：两者共用 `ok:false` 时，
+  // CODEX_ENABLED=false 之后残留永远清不掉）。
+  if (!config.claudeEnabled) return { ok: false, disabled: true, reason: "CLAUDE_ENABLED=false" };
+
+  // 在途去重：等上一次的结果，而不是叠第二次 spawn。
+  if (runtime.claude.inflight) {
+    log("debug", "claude: 上一次采集还在跑，这一轮等它（不叠第二次 spawn）");
+    return runtime.claude.inflight;
+  }
+
+  const now = Date.now();
+
+  // 节流命中 → 返回上一次的好结果（见函数头第 2 条）。
+  if (runtime.claude.cache && now < runtime.claude.nextFetchAt) {
+    log(
+      "debug",
+      `claude: 命中 CLAUDE_POLL_MS=${config.claudePollMs} 节流（还有 ${Math.round((runtime.claude.nextFetchAt - now) / 1000)}s），` +
+        `复用上一次结果（${runtime.claude.cache.wanted.length} 个会话）`,
+    );
+    return runtime.claude.cache;
+  }
+
+  // 失败退避中：报失败，让下游「既不写也不清」。
+  if (now < runtime.claude.nextAttemptAt) {
+    return { ok: false, reason: runtime.claude.lastError || "claude 退避中" };
+  }
+
+  const task = (async () => {
+    try {
+      // --- 零行门控 ------------------------------------------------------
+      // 内联模式只能挂到官方 agent 行上，一个 claude 行都没有时采了也无处可挂，
+      // 不如连 spawn 都省掉。
+      //
+      // 门控**不动 cache / nextFetchAt**：用户随时可能在下一个 Herdr pane 里起一个
+      // claude，如果把节流时间也顺带推后，那个会话要再等一整个 CLAUDE_POLL_MS 才出现。
+      // 而门控本身只是一次 `agent list`（4ms），`publishInlineSessions` 每轮本来就要拉一次。
+      const agents = await herdr.agentList();
+      const rows = agents.filter((a) => str(a.agent) === "claude");
+      if (rows.length === 0) {
+        log("debug", 'claude: Herdr 里没有 agent === "claude" 的行，跳过采集（无处挂载）');
+        return { ok: true, wanted: [], statesById: new Map(), gated: true };
+      }
+
+      // --- spawn ----------------------------------------------------------
+      // bin 取 config（.env 里也能设）优先，其次才是环境变量 —— `claudeBin()` 只读
+      // process.env，直接用它的话写在 `.env` 里的 CLAUDE_BIN 会被静默忽略。
+      const entries = await listClaudeSessions({
+        bin: config.claudeBin || claudeBin(),
+        timeoutMs: config.claudeTimeoutMs,
+      });
+
+      // 按开始时间新的优先，然后砍到 CLAUDE_SESSION_LIMIT。
+      const ordered = [...entries].sort((a, b) => Number(b?.startedAt || 0) - Number(a?.startedAt || 0));
+      const kept = ordered.slice(0, config.claudeSessionLimit);
+      const overflow = ordered.length - kept.length;
+
+      const wanted = [];
+      const statesById = new Map();
+      let dropped = 0;
+      let titled = 0;
+      /** 占位符回退（连 transcript 都没读出首条用户消息）。和 titled 分开记。 */
+      let untitled = 0;
+
+      for (const entry of kept) {
+        // 默认显示名（`herdr-fe`、或后台 job 拿自己的短 id 当名字）没有信息量，
+        // 从 transcript 的首条用户消息兜底。已解析过的走 titleCache，不再读盘。
+        const name = await resolveClaudeTitle(entry, {
+          cache: runtime.claude.titleCache,
+          configDir: claudeConfigDir(),
+          readTitles: config.claudeReadTitles,
+        });
+        const session = normalizeClaudeSession(entry, { name });
+        // 没有 sessionId 的条目无法去重也无法 resume，挡掉（数出来打 debug：
+        // 「一条都不显示」最怕的就是连挡掉几条都没有日志）。
+        if (!session) {
+          dropped += 1;
+          continue;
+        }
+        // state 为 null = 已结束（failed/stopped），不显示；对位 codex 的 notLoaded。
+        if (session.state === null) continue;
+
+        // 三个桶分开数，别混成一句日志：
+        //   titled   = 默认显示名被 transcript 的首条用户消息换掉了（真的有信息量）
+        //   untitled = 连 transcript 都读不出首条消息，只能挂占位符
+        // 早先这里只有一个 `name !== entry.name` 的判断，占位符回退也被算成
+        // 「标题来自 transcript」—— 日志说 3 条来自 transcript、实际只有 1 条，
+        // 排查「为什么标题是 (无标题)」时会被这条日志直接带偏。
+        if (name === NO_TITLE) untitled += 1;
+        else if (name !== String(entry?.name || "").trim()) titled += 1;
+        wanted.push({
+          id: session.id,
+          title: session.title,
+          directory: session.directory,
+          // pid 是 pid 精确匹配的唯一依据（{@link adoptClaudeSessions}）；state 是
+          // 降级到目录匹配时的排序键（「正在跑的」优先）。这两个字段
+          // publishInlineSessions 都不用（它认 statesById），带上只是为了补报那
+          // 一段不必再传一次 statesById。
+          pid: session.pid,
+          state: session.state,
+          updatedAt: session.updatedAt,
+        });
+        statesById.set(session.id, session.state);
+      }
+
+      runtime.claude.consecutiveFailures = 0;
+      runtime.claude.backoffMs = 1_000;
+      runtime.claude.nextAttemptAt = 0;
+      runtime.claude.lastError = "";
+      runtime.claude.nextFetchAt = Date.now() + config.claudePollMs;
+
+      const result = { ok: true, wanted, statesById, rows };
+      runtime.claude.cache = result;
+      const titleNote =
+        untitled > 0 ? `标题来自 transcript ${titled} / 只能挂占位符 ${untitled}` : `标题来自 transcript ${titled}`;
+      log(
+        "debug",
+        `claude: 列出 ${entries.length} / 采纳 ${wanted.length} / 挡掉无 id ${dropped} / ` +
+          `${titleNote}${overflow > 0 ? ` / 超上限丢弃 ${overflow}` : ""}`,
+      );
+      return result;
+    } catch (err) {
+      // **这里就是「采集失败绝不能掀掉主循环」的兑现处**：task 本身永不 reject，
+      // 失败一律变成 `{ok:false}`。所以第二个撞上在途的调用方直接 await 同一个
+      // Promise 也不会把异常掀到 reconcile 外面。
+      failClaude(err?.message || String(err), {
+        missingBinary: err instanceof ClaudeError && err.missingBinary,
+      });
+      return { ok: false, reason: runtime.claude.lastError || "claude 采集失败" };
+    }
+  })();
+
+  runtime.claude.inflight = task;
+  try {
+    return await task;
+  } finally {
+    runtime.claude.inflight = null;
+  }
+}
+
+function failClaude(reason, { missingBinary = false } = {}) {
+  const d = runtime.claude;
+  d.consecutiveFailures += 1;
+  // 与 failCodex 同构：第一次和每五次失败才说一句，避免每 10 秒刷一行。
+  if (d.consecutiveFailures === 1 || d.consecutiveFailures % 5 === 0) {
+    // 「PATH 里没有 claude」要说成 info 而不是 debug：它不是暂时故障，而是需要用户
+    // 去装 / 改 CLAUDE_BIN 的配置问题（和「采集失败」给用户的下一步完全不同）。
+    if (missingBinary) {
+      log(
+        "info",
+        `PATH 里没有 claude（${reason}）。装 Claude Code，或用 CLAUDE_BIN 指向它的绝对路径。`,
+      );
+    } else {
+      log("debug", `claude 采集不可用（${reason}），${Math.round(d.backoffMs / 1000)}s 后重试`);
+    }
+  }
+  d.lastError = reason;
+  d.backoffMs = Math.min(config.backoffMaxMs, Math.round(d.backoffMs * 2));
+  d.nextAttemptAt = Date.now() + d.backoffMs;
+}
+
+/**
+ * 为「有 claude 官方行、但还没有 agent_session」的行补报一次会话身份。
+ *
+ * ## 为什么必须有这一步
+ *
+ * `publishInlineSessions` 判定官方行的条件是
+ * `!isMirrorRow(a) && a.agent && typeof a.agent_session?.source === "string"`。
+ * herdr 0.9.3 的 claude 集成是 **hook 驱动**的（`~/.claude/hooks/herdr-agent-state.sh`），
+ * 本机没装（`herdr integration status` → `claude: not installed`），于是 claude 的官方行
+ * **一个 `agent_session` 字段都没有**（实测那条行长这样：agent/agent_status/cwd/
+ * foreground_cwd/name/pane_id/tab_id/terminal_id/terminal_title/workspace_id）——
+ * 于是一条都进不了官方行集合，内联模式无处可挂。
+ *
+ * 为什么不算抢官方集成的归属：写进去的 session id 是 `claude agents --json` 里的真值，
+ * 官方 hook 将来真跑起来时写的是同一个值。而不补报的后果是「因为官方还没上报，所以什么
+ * 都不显示」。仍然保留了关闭开关（`CLAUDE_ADOPT_SESSION=false`）回到纯被动。
+ *
+ * ## 挑哪个会话当「官方那个」：pid / 命令行精确匹配，再降级到目录
+ *
+ * 精确匹配靠的是 `pane.process-info` 的 `foreground_process_group_id` 与 claude 条目的
+ * `pid` **逐字节相等**（本机实测 w1J:p12 → 2440557 → sessionId 333dcd0a…，
+ * w1J:p14 → 2441496 → 71ad425d…）。这比 codex 侧的「同目录里按 已绑定/正在跑/最近
+ * 动过 排序去猜」准得多 —— 同目录开三个 claude 窗口时，猜的会认错，pid 不会。
+ *
+ * 另有第二条命令行兜底（见 tier 1b 的注释）：前台进程的 argv 里带 `--session-id` 时，
+ * session id 直接写在命令行里，连 pid 都不用对齐。
+ *
+ * 只有这三种情况才降级到目录匹配：会话没有 pid（后台 worker 刚起来时实测缺）、pane 里
+ * 跑的根本不是 claude、或者那个会话压根没出现在 `claude agents` 里（交互式 TUI 被
+ * fork 成后台 job 后就会这样 —— 实测 p12 里那个交互式会话已经从列表里消失，它的
+ * transcript 还在）。**降级必须打 debug**：不打招呼的话这段代码在日志里完全隐形，
+ * 将来出现「补到了错的会话」根本查不出来。
+ *
+ * @param {object[]} wanted 本轮采到的 claude 会话（带 pid）
+ * @param {object[]} [preloadedRows] 复用本轮已拉到的 claude 行（省一次 `agent list`）
+ * @returns {Promise<number>} 补报成功的行数
+ */
+async function adoptClaudeSessions(wanted, preloadedRows) {
+  if (!config.claudeAdoptSession) return 0;
+
+  // 复用采集阶段为了「零行门控」已经拉过的那份行，省一次 `agent list`（实测 4ms，
+  // 而一轮 reconcile 里本来就已经有两次了）。没传就自己拉一份。
+  const list = Array.isArray(preloadedRows) ? preloadedRows : await herdr.agentList();
+  // 只处理「是 claude 行、但还没 agent_session」的：已经有 id 的行补报既没必要，
+  // 也会覆盖官方集成写的值。`preloadedRows` 只过滤过 agent 名，这里再过一遍是幂等的。
+  const rows = list
+    .filter((a) => str(a.agent) === "claude" && !a.agent_session?.value)
+    .map((a) => ({ paneId: str(a.pane_id), dir: normalizeDir(a.foreground_cwd || a.cwd) }));
+
+  if (rows.length === 0) {
+    log("debug", 'claude 补报：没有「缺 agent_session」的 claude 行（要么没有 claude 行，要么官方已上报）');
+    return 0;
+  }
+
+  let adopted = 0;
+  for (const row of rows) {
+    if (!row.paneId) continue;
+    if (!row.dir) {
+      // 连这一行跑在哪个目录都读不到，就没有降级匹配的依据。必须说出来 —— 目录匹配是
+      // 降级路径的唯一依据，缺了它这个函数在该行上必然无声无息。
+      log("warn", `claude 补报：${row.paneId} 没有 foreground_cwd/cwd，无法判断它是哪个会话，跳过`);
+      continue;
+    }
+
+    // --- tier 1：pid 精确匹配 ------------------------------------------------
+    let pick = null;
+    let how = "";
+    const info = await herdr.paneProcessInfo(row.paneId);
+    if (info.ok) {
+      // tier 1a：pid 精确匹配（SPEC 第 13 节实测：foreground_process_group_id 与
+      // claude 条目的 pid 逐字节相等）。
+      const pids = foregroundPids(info.processInfo);
+      if (pids.size > 0) {
+        pick = wanted.find((w) => w.pid && pids.has(w.pid)) || null;
+        if (pick) how = "pid 精确匹配";
+      }
+      // tier 1b：命令行里带 --session-id（比 pid 还直接，session id 就写在 argv 里）。
+      // 本机实测后台 worker 的进程是
+      //   `claude --session-id fca468d9-… --agent claude --inherit-permission-mode auto`，
+      // herdr 的 process-info 把 argv / cmdline 原样给了出来，于是这种 pane 能一步
+      // 认准，不需要猜。交互式 TUI 的 argv 只有 `/opt/claude-code/bin/claude`（没有
+      // --session-id），走不到这一层 —— 那正是 tier 1a 覆盖的场景。
+      if (!pick) {
+        const ids = foregroundSessionIds(info.processInfo);
+        if (ids.size > 0) {
+          pick = wanted.find((w) => ids.has(w.id)) || null;
+          if (pick) how = "命令行 --session-id 精确匹配";
+        }
+      }
+      if (!pick) {
+        log(
+          "debug",
+          `claude 补报：${row.paneId} 的前台进程 ${[...pids].join(",") || "（读不到 pid）"}` +
+            `／session-id ${[...foregroundSessionIds(info.processInfo)].join(",") || "（命令行里没有）"}` +
+            `都对不上本轮会话，降级按目录匹配`,
+        );
+      }
+    } else {
+      log("debug", `claude 补报：读 ${row.paneId} 的进程信息失败（${info.error}），降级按目录匹配`);
+    }
+
+    // --- tier 2：目录匹配（降级，规则与 codex 侧一致）-------------------------
+    if (!pick) {
+      const candidates = wanted
+        .filter((w) => normalizeDir(w.directory) === row.dir)
+        .sort((a, b) => {
+          const alreadyA = runtime.claude.adopted.get(row.paneId) === a.id ? 0 : 1;
+          const alreadyB = runtime.claude.adopted.get(row.paneId) === b.id ? 0 : 1;
+          if (alreadyA !== alreadyB) return alreadyA - alreadyB;
+          const runningA = a.state === "working" ? 0 : 1;
+          const runningB = b.state === "working" ? 0 : 1;
+          if (runningA !== runningB) return runningA - runningB;
+          return (b.updatedAt || 0) - (a.updatedAt || 0);
+        });
+      if (candidates.length === 0) {
+        // 每一行匹配不到都要说，并把「本轮采到的会话各自在哪个目录」写进去（照抄
+        // adoptCodexSessions 的教训：静默跳过最难查 —— 用户看到的是「claude 在跑但
+        // 侧边栏没有」，日志里却一条相关记录都没有）。
+        log(
+          "debug",
+          `claude 补报：${row.paneId} 所在目录 ${row.dir} 下没有本轮采到的会话` +
+            `（采到 ${wanted.length} 个，目录：${[...new Set(wanted.map((w) => normalizeDir(w.directory)))].join("、") || "无"}）`,
+        );
+        continue;
+      }
+      pick = candidates[0];
+      how = "目录匹配（降级，pid 没对上）";
+    }
+
+    if (runtime.claude.adopted.get(row.paneId) === pick.id) continue;
+
+    const res = await herdr.reportBuiltinAgentSession({
+      paneId: row.paneId,
+      agent: "claude",
+      sessionId: pick.id,
+      seq: nextSeq(),
+    });
+    if (res.ok) {
+      runtime.claude.adopted.set(row.paneId, pick.id);
+      adopted += 1;
+      log(
+        "info",
+        `已为 ${row.paneId}（${row.dir}）补报 claude 会话身份 ${shortId(pick.id)}` +
+          `「${String(pick.title || "").slice(0, 24)}」（${how}）—— 该行的官方 hook 尚未上报` +
+          `（CLAUDE_ADOPT_SESSION=false 可关闭此行为）`,
+      );
+    } else {
+      // 失败不记账，下一轮无条件重试（herdr 正忙 / pane 刚关都是暂态）。
+      log("warn", `为 ${row.paneId} 补报 claude 会话身份失败（下一轮重试）：${res.error || res.stderr}`);
+    }
+  }
+  return adopted;
+}
+
+/**
+ * 一个 pane 进程信息里的全部 pid：进程组 id + 每个前台进程。
+ *
+ * 包装脚本 / `sh -c claude` 这类情况下 pgid 与 claude 的 pid 不相等，所以两组都要收，
+ * 命中任何一个都算对上。
+ */
+function foregroundPids(processInfo) {
+  const out = new Set();
+  const add = (v) => {
+    const n = Number(v);
+    if (Number.isInteger(n) && n > 0) out.add(n);
+  };
+  add(processInfo?.foreground_process_group_id);
+  for (const p of processInfo?.foreground_processes || []) add(p?.pid);
+  return out;
+}
+
+/**
+ * 前台进程命令行里 `--session-id <uuid>` 给出的会话 id 集合。
+ *
+ * 比 pid 还直接：session id 本身写在 argv 里，不用和 `claude agents` 的 pid 列对齐。
+ * 只认「下一个参数就是值」的写法（`--session-id X` / `--session-id=X`），且值必须长得
+ * 像 session id（hex + 短横）—— 不猜别的形式：猜错的代价是补报一个错的身份，比不补更糟。
+ */
+function foregroundSessionIds(processInfo) {
+  const out = new Set();
+  const scan = (args) => {
+    const list = Array.isArray(args) ? args.map((a) => String(a)) : String(args || "").split(/\s+/);
+    const push = (value) => {
+      const id = String(value || "").trim();
+      // 形如 `--session-id --fork-session` 这种「下一个参数不是值」的写法会捞到垃圾，
+      // 过滤掉而不是当成 id（错的 id 比没有 id 更糟：会让补报去认一个不存在的会话）。
+      if (/^[0-9a-f-]{8,}$/i.test(id)) out.add(id);
+    };
+    for (let i = 0; i < list.length; i += 1) {
+      const arg = list[i];
+      if (arg === "--session-id" && i + 1 < list.length) push(list[i + 1]);
+      else if (arg.startsWith("--session-id=")) push(arg.slice("--session-id=".length));
+    }
+  };
+  for (const p of processInfo?.foreground_processes || []) {
+    scan(p?.argv);
+    scan(p?.cmdline);
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
 // 重算主流程
 // ---------------------------------------------------------------------------
 
@@ -1403,13 +1895,23 @@ async function applySessionState({ client, roots, activeStates, polledPermission
   // --- 3b. 内联模式：各 agent 的 session 列表挂到各自的官方 agent 行 ----------
   // 完全不建 pane，也就不需要镜像标签页、不需要镜像行、不会被官方集成接管。
   //
-  // codex 的采集**放在这个判断之内**：非内联模式下 session 信息挂在镜像 pane 上，
-  // 根本不经过 publishInlineSessions，没必要为此去连 codex 的守护进程。
+  // codex / claude 的采集**放在这个判断之内**：非内联模式下 session 信息挂在镜像 pane 上，
+  // 根本不经过 publishInlineSessions，没必要为此去 spawn `claude` 或连 codex 的守护进程。
   if (config.mirrorInline) {
     const codex = await fetchCodexSessions();
+    // 「主动关掉 codex 就断掉它的连接」放在这里，而不是 publishInlineSessions 里：
+    // 那是 codex 自己的生命周期（那是一条常驻 socket），而通用函数只知道「某个 provider
+    // 被关了」，它不知道该去断谁的连接 —— 早先那个隐式副作用在只有 codex 一个 provider
+    // 时恰好能工作，加进 claude 之后就成了「关掉 claude 顺手把 codex 的连接也断了」。
+    if (codex.disabled) closeCodexClient();
     // 补报必须在挂载**之前**：--applies-to-source 要求目标 source 在该 pane 上
     // 已有记录，而官方行的 agent_session 缺失时挂上去会立刻消失。
     if (codex.ok) await adoptCodexSessions(codex.wanted, codex.statesById);
+
+    const claude = await fetchClaudeSessions();
+    // claude 没有连接要断（每轮都是自洽的短命 spawn），所以没有 disabled 分支的清理动作。
+    if (claude.ok) await adoptClaudeSessions(claude.wanted, claude.rows);
+
     const attached = await publishInlineSessions([
       { agent: "opencode", wanted, statesById: parallelStates },
       {
@@ -1420,6 +1922,17 @@ async function applySessionState({ client, roots, activeStates, polledPermission
         // 主动关掉（CODEX_ENABLED=false）和采集失败要分开：前者要清残留，后者要保留。
         disabled: Boolean(codex.disabled),
         failedReason: codex.ok ? "" : codex.reason,
+      },
+      {
+        agent: "claude",
+        wanted: claude.ok ? claude.wanted : [],
+        statesById: claude.ok ? claude.statesById : new Map(),
+        failed: !claude.ok,
+        disabled: Boolean(claude.disabled),
+        failedReason: claude.ok ? "" : claude.reason,
+        // claude 的「没有官方行」含义与 codex 不同：补报本身就依赖那一行存在，
+        // 所以默认那句「去装官方集成」对它是错的路。覆盖文案。
+        missingHint: CLAUDE_MISSING_ROWS_HINT,
       },
     ]);
     runtime.lastAttachSeq = nextSeq();
@@ -1616,9 +2129,9 @@ function stopFocusRedirect() {
  * `$oc_sess*` 即可。顺带白送一件事：点击那行本来就跳官方 pane，所以
  * 「点镜像信息只跳到真正的前台 agent」不再需要 FOCUS_REDIRECT。
  *
- * ## 多 agent：一个 workspace 里的 session 列表（SPEC 第 11 节）
+ * ## 多 agent：一个 workspace 里的多个 session 列表（SPEC 第 11/12/13 节）
  *
- * 一个 provider = 一个 agent（`opencode` / `codex`）+ 它自己那批 session。
+ * 一个 provider = 一个 agent（`opencode` / `codex` / `claude`）+ 它自己那批 session。
  *
  * **每个 provider 只能碰自己 `agent` 名下的官方行。** 挂载点解析也必须限定在
  * provider 自己的行里（`resolveInlineHostWorkspace` 传的 `officialRowsForThisAgentOnly`）：
@@ -1664,7 +2177,7 @@ function stopFocusRedirect() {
  * 里没有可挂载的官方行，那条信息就无处可放 —— 内联模式下**直接不显示**并记日志。
  * 想让这类 session 也可见，把 `MIRROR_INLINE` 设成 false 回到建 pane 的旧模型。
  *
- * @param {Array<{agent:string, wanted:{id:string,title:string,directory:string}[], statesById:Map<string,string>, failed?:boolean, failedReason?:string}>} providers
+ * @param {Array<{agent:string, wanted:{id:string,title:string,directory:string}[], statesById:Map<string,string>, failed?:boolean, failedReason?:string, disabled?:boolean, missingHint?:string}>} providers
  * @returns {Promise<number>} 实际写入/清除的行数
  */
 async function publishInlineSessions(providers) {
@@ -1705,7 +2218,7 @@ async function publishInlineSessions(providers) {
     const wanted = Array.isArray(provider?.wanted) ? provider.wanted : [];
 
     if (rows.length === 0) {
-      if (wanted.length > 0) noteMissingRows(agentName, wanted.length);
+      if (wanted.length > 0) noteMissingRows(agentName, wanted.length, provider.missingHint);
       continue;
     }
 
@@ -1725,8 +2238,10 @@ async function publishInlineSessions(providers) {
       continue;
     }
     if (provider.disabled) {
-      closeCodexClient();
-      stopBusySpinner();
+      // **这里不做任何 provider 特有的清理**（早先这里调 closeCodexClient，是把
+      // 「codex 的连接该在它被关掉时断开」这个知识漏进了一个 agent 无关的函数）。
+      // 原因很实在：只有调用点知道是哪个 provider 被关了，也只有它知道该断谁。
+      // 转轮也一并由调用点按 busyRows 起停，不必在这里偷停 —— 那属于同一个错位。
       log("debug", `${agentName} 支持已被 ${provider.failedReason || "关闭"}，撤掉 ${rows.length} 行上的旧 token`);
     }
 
@@ -1977,16 +2492,30 @@ async function publishInlineSessions(providers) {
  * 内联模式的信息必须挂在官方 agent 行上，而官方行由 `herdr integration install
  * <agent>` 建立的 hook 上报。所以第一轮用 info 说清楚前置条件（每轮都 info 会刷屏），
  * 之后降级成 debug。
+ *
+ * ## 为什么状态要按 agent 分开记
+ *
+ * 早先这里只有一个字符串，于是两个 provider 会互相覆盖：codex 先提示过，claude 的第一次
+ * 提示就被压成 debug 了。而这恰恰是最该被说清楚的一种日志（「没装集成 → 一行都不显示」
+ * 完全看不出原因）。所以状态放在 `runtime.missingRowsHinted` 这个按 agent 名索引的 Map 里。
+ *
+ * ## `missingHint` 覆盖文案
+ *
+ * 默认文案里的「去装官方集成」**对 claude 不成立**（见 {@link CLAUDE_MISSING_ROWS_HINT}），
+ * 所以 provider 可以带一个 `missingHint` 覆盖它。
+ *
+ * @param {string} agentName
+ * @param {number} count 本轮采到的会话数
+ * @param {string} [hint] 覆盖默认文案的说明
  */
-function noteMissingRows(agentName, count) {
-  const hinted = runtime.codex.missingRowsHinted;
+function noteMissingRows(agentName, count, hint) {
   const msg =
     `${agentName} 采集到 ${count} 个会话，但 Herdr 里没有 agent === "${agentName}" 的官方行，` +
     `无处挂载（内联模式只往官方行上挂 token）。` +
-    `需要先装对应的官方集成：herdr integration install ${agentName}。`;
-  if (hinted === undefined || agentName !== hinted) {
+    (hint || `需要先装对应的官方集成：herdr integration install ${agentName}。`);
+  if (!runtime.missingRowsHinted.has(agentName)) {
     log("info", msg);
-    runtime.codex.missingRowsHinted = agentName;
+    runtime.missingRowsHinted.set(agentName, true);
     return;
   }
   log("debug", msg);

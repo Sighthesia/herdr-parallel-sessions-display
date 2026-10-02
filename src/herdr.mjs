@@ -445,6 +445,34 @@ export async function paneForegroundNames(paneId) {
   return list.map((p) => String(p?.name || "")).filter((n) => n.length > 0);
 }
 
+/**
+ * pane 的完整进程信息（`foreground_process_group_id` + 每个前台进程的 pid/name/cwd）。
+ *
+ * ## 为什么需要它
+ *
+ * Claude Code 的会话能和 pane **精确**对上：herdr 报的
+ * `foreground_process_group_id` 与 `claude agents --json` 那一条的 `pid` 逐字节相等
+ * （本机实测 w1J:p12 → 2440557 → sessionId 333dcd0a…，w1J:p14 → 2441496 → 71ad425d…）。
+ * codex 那边做不到这一点，只能靠目录 + 「谁在跑 / 最近动过」去猜（见 adoptCodexSessions），
+ * 所以 claude 的补报能比 codex 准得多 —— 但前提是能读到 pid。
+ *
+ * `foreground_processes[]` 里的 pid 也一并返回：同一个进程组里可能有多个进程，
+ * 命中任何一个都算对上（包装脚本 / `sh -c` 的情况下 pgid 与 pid 会不同）。
+ *
+ * 实测一次约 5ms。**永不抛错**：拿不到就返回 `{ok:false}`，上层降级到目录匹配。
+ *
+ * @returns {Promise<{ok:boolean, processInfo:object|null, error?:string}>}
+ */
+export async function paneProcessInfo(paneId) {
+  if (!paneId) return { ok: false, processInfo: null, error: "paneProcessInfo 需要 pane id" };
+  const res = await cli(["pane", "process-info", "--pane", paneId]);
+  const info = resultOf(res)?.process_info;
+  if (!info || typeof info !== "object") {
+    return { ok: false, processInfo: null, error: res.error || res.stderr || "没有 process_info" };
+  }
+  return { ok: true, processInfo: info };
+}
+
 /** @returns {Promise<object[]>} agents；失败返回 [] */
 export async function agentList() {
   const res = await cli(["agent", "list"]);

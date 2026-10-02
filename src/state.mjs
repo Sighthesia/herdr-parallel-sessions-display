@@ -75,6 +75,29 @@ export const CONFIG_DEFAULTS = Object.freeze({
   // 官方行没有 agent_session 时，由插件以 herdr:codex 的身份补报一次（读的是
   // codex 自己的 app-server，写的是真实 thread id）。设成 false 回到纯被动。
   CODEX_ADOPT_SESSION: "true",
+  // --- Claude Code（SPEC 第 13 节）---
+  // 同样每个键都必须列在这里，否则被 loadConfig 静默丢弃（见上面的历史事故）。
+  CLAUDE_ENABLED: "true",
+  // 空 = 用 PATH 上的 claude。本机实测 Claude Code 装在 /opt/claude-code/bin/claude，
+  // **未必在 GUI 起的 Herdr 进程的 PATH 里** —— 终端里 `claude` 能跑、看板面板里 spawn
+  // 不到就是这个形态。指绝对路径最省事。
+  CLAUDE_BIN: "",
+  // 单次 `claude agents --json` 的超时。本机实测正常调用约 260ms，8s 是留给机器慢的情况。
+  CLAUDE_TIMEOUT_MS: "8000",
+  // claude 侧的**独立**节奏，默认 10000：主轮询 5000ms，而每次 spawn 约 260ms，
+  // 按 5 秒追平主循环就是白花约 5% 单核（实测忙标记转轮开/关差 8%，这个量级不能忽略）。
+  // 想追平设 5000。
+  CLAUDE_POLL_MS: "10000",
+  // 最多认多少个会话（按 startedAt 新的优先）。防御性上限：正常机器上活跃会话只有个位数，
+  // 这个数主要是防「有人在同一台机器上跑一堆自动化 job」把侧边栏和 IO 一起冲垮。
+  CLAUDE_SESSION_LIMIT: "50",
+  // 官方行没有 agent_session 时，由插件以 herdr:claude 的身份补报一次（写的是
+  // `claude agents --json` 里的真实 sessionId）。设成 false 回到纯被动。
+  CLAUDE_ADOPT_SESSION: "true",
+  // 标题是默认显示名（`herdr-fe` 这类没信息量的）时，要不要读 transcript 的首条用户
+  // 消息来兜底。只读文件头部前 64KB，且按 sessionId 记忆化，所以代价很小；关掉的唯一
+  // 场景是 Claude Code 装在网络盘上、每次 stat 都很贵。
+  CLAUDE_READ_TITLES: "true",
 });
 
 const KNOWN_KEYS = new Set(Object.keys(CONFIG_DEFAULTS));

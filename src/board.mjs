@@ -64,10 +64,13 @@ const config = {
   // oc_par token 的值上限。实测 Herdr 对单个 token 值硬截断在 80 字符，
   // 插件自己先算好并用「+N」收尾，避免被拦腰截断在半句话上。
   parallelTokenMax: store.asInt(raw, "PARALLEL_TOKEN_MAX", 78, 8, 80),
-  // 并行 session 行的树状前缀。用 box-drawing 垂直线而不是空格：Herdr 会 trim
-  // token 值的前导空白（实测传 "  └─ x" 存下来是 "└─ x"），空格缩进存不住。
-  // 想换成别的（比如 ├─ 前缀或全角空格）改这里。
-  parallelTrunk: store.asString(raw, "PARALLEL_TRUNK", "│"),
+  // session 行树状前缀里的「父级竖线」。默认空 —— 用户反馈这条竖线是多余的。
+  // Herdr 会 trim 前导空白，所以想改成空格缩进是做不到的（传 "  └─ x" 存下来
+  // 是 "└─ x"）。要加回来就设成 "│" 或别的非空白字符。
+  parallelTrunk: store.asString(raw, "PARALLEL_TRUNK", ""),
+  // 没有并行 session 时，官方 session 自己那一行还要不要写。
+  // 默认要 —— 模板里已经没有 terminal_title_stripped 了，不写就等于官方标题消失。
+  inlineAlwaysList: store.asBool(raw, "INLINE_ALWAYS_LIST", true),
   sessionLimit: store.asInt(raw, "SESSION_LIST_LIMIT", 200, 10, 2_000),
   sessionPages: store.asInt(raw, "SESSION_PAGE_LIMIT", 8, 1, 50),
   retryDetection: store.asBool(raw, "RETRY_DETECTION", true),
@@ -1140,26 +1143,24 @@ async function publishInlineParallel(wanted, statesById) {
     return rows[0];
   };
 
-  // 先算出「每个官方行应得的槽位值」，再拿它跟实际值对比 —— **不依赖进程内的
-  // 记账**。踩过的坑：清理逻辑原本遍历 `runtime.attachedParallel`，而那个 Map
-  // 随进程生死；board 重启后它空了，于是上一轮挂在别人工作区上的过期 token
-  // 再也没人清，一直挂在侧边栏上（实测 session 都跑完了，oc_par 还显示着旧的
-  // 「内行验证-B」）。以 agent.list 的实际值为准才幂等。
   const tokens = herdr.SESSION_TOKENS;
   // 历史版本用过的 token 名，早已不在模板里，顺手清掉免得白占 metadata 配额：
   //   oc_par    = 单行版（多个 session 用 · 挤在一行）
   //   oc_par1..4 = 多行版但只放并行 session，官方那行还是内置 terminal_title
   const legacyTokens = [herdr.PARALLEL_TOKEN, "oc_par1", "oc_par2", "oc_par3", "oc_par4"];
+
+  // **遍历所有有官方行的工作区**，而不是只遍历有并行 session 的那些。
+  // 模板里已经没有 terminal_title_stripped 了，官方 session 的标题现在也靠
+  // $oc_sess1 —— 只遍历 byWorkspace 的话，「没有并行 session」的工作区会一个
+  // token 都不写，那一行就彻底空了（实测官方标题直接消失）。
   const desired = new Map();
-  for (const [workspaceId, infos] of byWorkspace) {
+  const hostWorkspaces = new Set(official.map((a) => str(a.workspace_id)));
+  for (const workspaceId of hostWorkspaces) {
     const host = pickHost(workspaceId);
-    if (!host) {
-      log(
-        "debug",
-        `工作区 ${workspaceId} 有 ${infos.length} 个并行 session，但没有官方 agent 行可挂载`,
-      );
-      continue;
-    }
+    if (!host) continue;
+    const infos = byWorkspace.get(workspaceId) || [];
+    if (infos.length === 0 && !config.inlineAlwaysList) continue;
+
     // **官方 session 排第一**：它是用户 TUI 里正在用的那个，用 ▸ 点出来，
     // 下面的并行 session 是「切走但还在跑」的。标题直接取官方行的终端标题，
     // 不额外查 opencode —— 实测 `terminal_title_stripped` 就是那个 session 的标题。
@@ -1309,7 +1310,7 @@ export function resolveInlineHostWorkspace(directory, index, official) {
  * [1] afloat
  * ◐ opencode
  *   OC | 实现 Hover 菜单式 Mod 键 Window Hint     ← 内置行，缩进 2 格、无连接线
- * │ └─ ● 排查 Shell 重载启动…                      ← 插件行，顶格
+ * └─ ● 排查 Shell 重载启动…                      ← 插件行，顶格
  * ```
  *
  * `│ └─` 反而比它 supposed 的父节点更靠左，完全读不出层级：官方行拿不到连接线
@@ -1321,20 +1322,33 @@ export function resolveInlineHostWorkspace(directory, index, official) {
  * ```
  * [1] afloat
  * ◐ opencode
- * │ ├─ ○ 实现 Hover 菜单式 Mod 键 Window Hint     ← 官方 TUI 当前选中的
- * │ ├─ ● 排查 Shell 重载启动初始化卡顿              ← 并行
- * │ └─ ● Tray hover二级菜单点击收起…                ← 并行
+ * ├─ ○ 实现 Hover 菜单式 Mod 键 Window Hint     ← 官方 TUI 当前选中的
+ * ├─ ● 排查 Shell 重载启动初始化卡顿              ← 并行
+ * └─ ● Tray hover二级菜单点击收起…                ← 并行
  * ```
  *
  * 模板里相应去掉 `terminal_title_stripped`，只留 `$oc_sess*`。
  *
- * ## 缩进为什么用 `│` 而不是空格
+ * ## 前缀为什么只能画在 token 值里
  *
- * 最直觉的做法是前导空格，但 **Herdr 会 trim token 值的前导空白**（实测传
- * `"  └─ ● 标题"` 存下来是 `"└─ ● 标题"`），所以空格缩进根本存不住。
+ * Herdr 只给**它自己认识的结构行**（`workspace` / `agent`）加缩进，
+ * `$oc_sess*` 这种自定义 token 会被渲染成顶格。而且 **它会 trim 前导空白**
+ * （实测传 `"  └─ ● 标题"` 存下来是 `"└─ ● 标题"`），所以空格缩进根本存不住
+ * —— Unicode 空白字符（U+00A0、U+2000–200A、U+3000 等）也都在 Rust `trim()`
+ * 的范围内，同样保不住。
  *
- * `│`（U+2502 box drawing）不是空白，不会被 trim；在等宽终端里和 `─` 同宽，
- * 正好当「子级的父级连接线」用 —— 这也是标准树状图的画法。
+ * 所以连接线只能自己写进值里。以前默认带一条 `│` 竖线当父级连接线，用户反馈
+ * 多余，改成默认不带（`PARALLEL_TRUNK=""`，想加回来设成 `"│"` 即可）。
+ *
+ * 目标效果：
+ *
+ * ```
+ * [1] afloat
+ * ◐ opencode
+ * ├─ ▸ ● 实现 Hover 菜单式…           ← 官方 TUI 当前选中的
+ * ├─ ● 排查 Shell 重载启动…            ← 并行
+ * └─ ● Tray hover二级菜单…              ← 并行
+ * ```
  *
  * ## 不能塞进一个 token
  *
@@ -1369,7 +1383,9 @@ export function formatParallelSlots(sessions) {
     const lastLine = i === shown - 1 && marked.length <= slots.length;
     // 官方 session 是「当前 TUI 里正在用的那个」，用 ▸ 点出它，比状态图标更好认
     const head = marked[i].official ? `▸ ${marked[i].mark}` : marked[i].mark;
-    out[i] = `${trunk} ${lastLine ? "└─" : "├─"} ${head} ${marked[i].title}`;
+    // trunk 为空时不要留下那个空格（Herdr 反正会 trim，但代码里就别制造）
+    const stem = trunk ? `${trunk} ` : "";
+    out[i] = `${stem}${lastLine ? "└─" : "├─"} ${head} ${marked[i].title}`;
   }
 
   // 溢出：把多出来的折进最后一行末尾的「+N」

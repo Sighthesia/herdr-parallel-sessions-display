@@ -375,11 +375,12 @@ export function normalizeState(raw) {
         state: str(rec.state),
         stateMessage: str(rec.stateMessage),
         idleSince: Number.isFinite(rec.idleSince) ? rec.idleSince : 0,
-        // 「用户已经把这个 session 切到前台看过」的起始时刻。看过的就不再占行。
-        // 官方集成上报 agent_session 会抖（实测同一个 pane 的 session 在几次轮询
-        // 间反复变），所以要等它稳住 IDLE_GRACE_MS 才认，见 board.mjs 的
-        // applySessionState。
-        acknowledgedAt: Number.isFinite(rec.acknowledgedAt) ? rec.acknowledgedAt : 0,
+        // opencode 自己报的两个时间戳：`time.idle`（最后一次停下来干活）和
+        // `time.viewed`（最后一次被用户打开）。`viewed > idle` 就是「跑完之后又被
+        // 看过」，见 board.mjs 的 hasBeenViewedSinceIdle。必须在白名单里，否则插件
+        // 一重启就丢，「看过才清除」每次重启都要重来一遍。
+        idleAt: Number.isFinite(rec.idleAt) ? rec.idleAt : 0,
+        viewedAt: Number.isFinite(rec.viewedAt) ? rec.viewedAt : 0,
         // 会话自己的 updatedAt。idle 排序和「超额丢弃谁」都要它。
         updatedAt: Number.isFinite(rec.updatedAt) ? rec.updatedAt : 0,
         reportedAt: Number.isFinite(rec.reportedAt) ? rec.reportedAt : 0,

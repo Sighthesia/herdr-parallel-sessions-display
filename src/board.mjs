@@ -1822,42 +1822,23 @@ async function applySessionState({ client, roots, activeStates, polledPermission
     }
   }
 
-  // 1c. 内联模式：记住「用户已经查看过」的 session，随后不再列它。
+  // 1c. 内联模式：把「跑完之后已经被打开看过」的记录删掉。
   //
-  // 判据是**官方集成把这个 session 报成了某个 pane 的当前 session**（claimed），
-  // 即用户真的把它切到了前台、看到了结果 —— 这就是用户说的「查看过就可以清除」。
+  // 判据不是 herdr 报的 `agent_session`，而是 opencode 自己的 `time.idle` /
+//  `time.viewed`（见 {@link hasBeenViewedSinceIdle}）。herdr 那条路走不通：它的
+  // opencode 集成 hook 只处理 session.created/updated/status/compacted/error/idle/
+  // deleted，**没有 `session.viewed`** —— 而「切到跑完的 session 看看结果」只产生
+  // 这一个事件，hook 不理，`agent_session` 就一直停在几百小时前的那个 session。
+  // 拿它当「用户看过」的信号，功能等于从来没生效过（实测报的是「15 秒以上仍然存在」）。
   //
-  // 要连续 claimed 满 IDLE_GRACE_MS 才认：实测官方集成会在两次轮询之间反复改
-  // agent_session（同一个 pane 的 session 变过三次），照单全收的话会在切走
-  // 的一瞬间把行误删，用户根本没看过。
-  //
-  // ## 「看过」这件事必须活得比「它现在在前台」更久
-  //
-  // 早先写成「不再 claimed 就把 acknowledgedAt 清零」，错得正好砸在唯一要紧的场景
-  // 上：用户查看 A → 切到 B → A 不再是当前 session → 清零 → **A 立刻以 `○` 回到
-  // 列表里**。整个功能等于没做（用户实测报的就是这个：「15 秒以上仍然存在」）。
-  //
-  // 所以 `acknowledgedAt` 的语义收紧成「**当前这一段连续**在前台的起点」：不再
-  // claimed 就重新计（官方集成会抖动，累计时长不能算数），而「确实查看过」这个
-  // 永久结论靠**删掉记录**来表达 —— 记录没了就再也不会从 2c 冒出来，state.json
-  // 也不会随着看过的 session 一直涨。
-  //
-  // 删记录不会让 session 在侧边栏上凭空消失：它还在前台时官方行本来就显示着它
-  // （INLINE_ALWAYS_LIST），而插件不能也不该动 Herdr 自己的行。
-  //
-  // 唯一能让它重新出现的路径是「又开始跑了」—— 有新输出，用户需要重新看到。
-  // 那条由步骤 3 在状态变成非 idle 时清零。
+  // 删掉而不是「标记为已看过」：这类记录永远不会再被列（2c 直接跳过），留着只会让
+  // state.json 随你看过的 session 一直涨。它还在跑的时候不能删 —— 新输出要重新看到。
   if (config.mirrorInline) {
     for (const [sessionID, rec] of Object.entries(runtime.state.panes)) {
-      if (!claimed.has(sessionID)) {
-        rec.acknowledgedAt = 0; // 断了连续，重新计
-        continue;
-      }
-      if (!rec.acknowledgedAt) rec.acknowledgedAt = now;
-      if (now - rec.acknowledgedAt >= config.idleGraceMs) {
-        delete runtime.state.panes[sessionID];
-        log("debug", `${shortId(sessionID)} 连续在前台满 ${config.idleGraceMs}ms，视为已查看，不再列`);
-      }
+      if (activeStates.has(sessionID) || pending.has(sessionID)) continue;
+      if (!hasBeenViewedSinceIdle(rec)) continue;
+      delete runtime.state.panes[sessionID];
+      log("debug", `${shortId(sessionID)} 跑完后已被打开看过，不再列`);
     }
   }
 
@@ -1904,11 +1885,12 @@ async function applySessionState({ client, roots, activeStates, polledPermission
     if (probed && !probed.parentID) wanted.push(probed);
   }
 
-  // 2c. 停下来了但用户还没在前台查看过的行：保留，让用户知道「这个跑完了」。
+  // 2c. 停下来了但用户还没打开看过的行：保留，让用户知道「这个跑完了」。
   //
   // 内联模式下这一段不再受 IDLE_GRACE_MS 约束（1b 已经不走回收了），只受两件事
-  // 约束：用户在前台看过它（1c 的 acknowledgedAt），或者每个目录的条数上限
-  // （IDLE_KEEP）。这就是用户要的「完成了要能看见，看过了才清除」。
+  // 约束：跑完之后又被打开过（hasBeenViewedSinceIdle，用的是 opencode 自己的
+  // `time.viewed`），或者每个目录的条数上限（IDLE_KEEP）。这就是用户要的
+  // 「完成了要能看见，看过了才清除」。
   //
   // 非内联模式下 rec 没有 idleSince 就说明它还活跃，这里保持原样。
   if (config.mirrorInline) {
@@ -1918,8 +1900,6 @@ async function applySessionState({ client, roots, activeStates, polledPermission
       // 官方 TUI 当前选中的那个 session 由 publishInlineSessions 渲染成 `▸`
       // 那一行，不能在这里再列一遍（它也已经不算「并行」了）。
       alsoSkip: claimed,
-      now,
-      idleGraceMs: config.idleGraceMs,
       idleKeep: config.idleKeep,
       // 兜底：正常情况下记录里不会有子 agent（2a 在建记录之前就把它们挡掉了），
       // 所以这里只是防「opencode 改了 parentID=null 的过滤语义」或旧版本写的 state。
@@ -1927,12 +1907,19 @@ async function applySessionState({ client, roots, activeStates, polledPermission
     });
     for (const id of decision.keep) {
       const rec = runtime.state.panes[id];
+      // **必须优先取 infoById 里的新鲜值。** 这些 session 不在 `activeStates` 里，
+      // 所以每轮 `listRootSessions` 拉回来的列表是它们唯一的刷新来源；只从 rec 抄
+      // 的话 `time.idle` / `time.viewed` 永远停在「刚跑完那一刻」，用户后来打开看过
+      // 也看不出来 —— 结果就是该清的清不掉（这正是实测到的现象）。
+      const fresh = infoById.get(id);
       wanted.push({
         id,
-        title: rec.title,
-        directory: rec.directory,
-        projectID: "",
-        updatedAt: rec.updatedAt,
+        title: fresh?.title || rec.title,
+        directory: fresh?.directory || rec.directory,
+        projectID: fresh?.projectID || "",
+        updatedAt: fresh?.updatedAt || rec.updatedAt,
+        idleAt: Number.isFinite(fresh?.idleAt) ? fresh.idleAt : rec.idleAt,
+        viewedAt: Number.isFinite(fresh?.viewedAt) ? fresh.viewedAt : rec.viewedAt,
       });
     }
     for (const d of decision.dropped) {
@@ -1997,7 +1984,8 @@ async function applySessionState({ client, roots, activeStates, polledPermission
         state: "",
         stateMessage: "",
         idleSince: 0,
-        acknowledgedAt: 0,
+        idleAt: 0,
+        viewedAt: 0,
         updatedAt: 0,
         reportedAt: 0,
         fingerprint: "",
@@ -2038,14 +2026,15 @@ async function applySessionState({ client, roots, activeStates, polledPermission
     // 2d 的「每目录保留最近的 N 条」靠它排序。opencode 的 updatedAt 只在会话
     // 列表里有（1a/2b 的 info 带 updatedAt）；2c 从 rec 兜底回填的 info 也带。
     if (Number.isFinite(info.updatedAt) && info.updatedAt > 0) rec.updatedAt = info.updatedAt;
+    // 「跑完了 / 有没有被打开看过」的两个时间戳，全靠 session 自己报（见
+    // hasBeenViewedSinceIdle）。每轮都刷，因为 `viewed` 会在用户打开时随时变。
+    if (Number.isFinite(info.idleAt)) rec.idleAt = info.idleAt;
+    if (Number.isFinite(info.viewedAt)) rec.viewedAt = info.viewedAt;
 
     if (state === "idle") {
       if (!rec.idleSince) rec.idleSince = now;
     } else {
       rec.idleSince = 0;
-      // 又开始跑了 = 有新输出，用户需要重新看到它，抹掉「已查看」。
-      // （这是唯一能让 1c 那个标记失效的地方；切走**不能**抹，理由见 1c。）
-      rec.acknowledgedAt = 0;
     }
 
     // 内联模式不需要自己的 agent 行，只把状态记进 rec 供 token 拼接用
@@ -2775,6 +2764,40 @@ export function resolveInlineHostWorkspace(directory, index, official) {
 }
 
 /**
+ * 这个跑完的 session 是不是已经被用户打开看过了？
+ *
+ * ## 判据是 opencode 自己的两个时间戳
+ *
+ * `time.idle` = 它最后一次停下来干活的时刻，`time.viewed` = 用户最后一次在 TUI 里看到
+ * 它的时刻。**`viewed > idle` 就是「跑完之后又被打开过」** —— 结果你看过了。
+ *
+ * ## 为什么不能拿 herdr 的 `agent_session` 当判据
+ *
+ * 实测 herdr 的 opencode 集成 hook 只处理 `session.created / updated / status /
+ * compacted / error / idle / deleted`，**没有 `session.viewed`**。而「切到一个跑完的
+ * session 看看结果」只产生 `session.viewed` 这一个事件，hook 不理，于是 `agent_session`
+ * 一直停在几百小时前的那个 session（实测 w18:p14 报的是 `自动化测试弹窗`，而该 session
+ * 的 `viewed` 已经是八小时前）。拿它当「用户看过」的信号，功能等于从来没生效过 ——
+ * 这正是用户报的「15 秒以上仍然存在」。
+ *
+ * ## 两个边界
+ *
+ * - `idleAt` 必须有值。没停过的 session（`time.idle` 缺失）不参与这个判据，否则
+ *   `viewed > 0` 会把所有还没跑完的当成「看过」。
+ * - 边看边跑（一边读一边继续干活）不算：那种情况 `idle` 会跟着往后推，`viewed`
+ *   落在 `idle` 前面。
+ *
+ * @param {{idleAt?:number, viewedAt?:number}} rec
+ * @returns {boolean}
+ */
+export function hasBeenViewedSinceIdle(rec) {
+  const idleAt = Number(rec?.idleAt) || 0;
+  const viewedAt = Number(rec?.viewedAt) || 0;
+  if (idleAt <= 0) return false;
+  return viewedAt > idleAt;
+}
+
+/**
  * 内联模式：决定「已经停下来」的 session 里哪些还留在侧边栏上。
  *
  * ## 为什么要留
@@ -2784,16 +2807,25 @@ export function resolveInlineHostWorkspace(directory, index, official) {
  * 消失**，标题也跟着消失（模板里已经没有内置标题行了）。用户没法区分「跑完了」和
  * 「插件把它弄丢了」。
  *
- * 新规则：**停下来的先留着（`○`），让用户知道哪个跑完了；切到前台看过了才清掉。**
+ * 新规则：**停下来的先留着（`○`），让用户知道哪个跑完了；用户看过了才清掉。**
+ *
+ * ## 「看过」用的是 opencode 自己的 `time.viewed`，不是 herdr 的 `agent_session`
+ *
+ * 早先拿 herdr 报的「这个 pane 当前是哪个 session」当「用户看过」的信号，**实测行不通**：
+ * herdr 的 opencode 集成 hook 只处理 `session.created / updated / status / compacted /
+ * error / idle / deleted`，**没有 `session.viewed`**。而「切到一个跑完的 session 看看」
+ * 恰好只产生 `session.viewed` 这一个事件 —— hook 不理，herdr 的 `agent_session` 就一直
+ * 是旧的（实测一个 pane 停在几百小时前的 session 上）。于是「看过就清除」永远不触发。
+ *
+ * opencode 自己有专门的 `session.viewed` 事件，并在 `time.viewed` 上留时间戳，
+ * `time.idle` 则是它最后一次停下来干活的时刻。两者相减就是判据，见
+ * {@link hasBeenViewedSinceIdle}。不需要任何防抖：那是时间戳比较，不是状态猜测。
  *
  * ## 三条过滤规则，按顺序
  *
  * 1. 还在跑 / 在等授权（`live`）→ 不归这里管，它们已经从活跃集合直接进列表了。
  *    `alsoSkip` 同理：官方 TUI 当前选中的那个由 `▸` 那一行负责，不能重复列。
- * 2. `acknowledgedAt` 距今超过 `idleGraceMs` → 用户已经把它切到前台、结果看过了，
- *    不再占行。**要求连续稳定这么久**是实测出来的：官方集成的 `agent_session`
- *    会在两次轮询之间反复变（同一个 pane 上实测换过三次 session），照单全收的话
- *    会在用户切走的一瞬间把行误删。
+ * 2. 已经「跑完之后又被打开过」（`hasBeenViewedSinceIdle`）→ 结果你看过了，不再占行。
  * 3. 每个目录按 `updatedAt` 倒序只留 `idleKeep` 条 —— 不设上限的话一个开了好几天的
  *    目录能把所有槽位占满，真正在跑的那条被挤成「+N」。
  *
@@ -2802,12 +2834,12 @@ export function resolveInlineHostWorkspace(directory, index, official) {
  * 不改传入的 records，也不碰 `runtime.state.panes`：**被上限挤掉的记录必须留着**，
  * 否则下一轮它又从这里冒出来，反复横跳。
  *
- * @param {Record<string, {directory?:string, idleSince?:number, acknowledgedAt?:number, updatedAt?:number}>} records
- * @param {{live?:Set<string>|string[], alsoSkip?:Set<string>|string[], now:number, idleGraceMs:number, idleKeep:number, isChild?:(id:string)=>boolean}} options
+ * @param {Record<string, {directory?:string, idleAt?:number, viewedAt?:number, updatedAt?:number}>} records
+ * @param {{live?:Set<string>|string[], alsoSkip?:Set<string>|string[], idleKeep:number, isChild?:(id:string)=>boolean}} options
  * @returns {{keep: string[], dropped: Array<{directory:string,total:number,kept:number}>}}
  */
 export function selectRetainedIdle(records, options) {
-  const { live, alsoSkip, now, idleGraceMs, idleKeep, isChild } = options || {};
+  const { live, alsoSkip, idleKeep, isChild } = options || {};
   const liveIds = live instanceof Set ? live : new Set(live || []);
   const skipIds = alsoSkip instanceof Set ? alsoSkip : new Set(alsoSkip || []);
   const childOf = typeof isChild === "function" ? isChild : () => false;
@@ -2817,8 +2849,7 @@ export function selectRetainedIdle(records, options) {
   const byDir = new Map();
   for (const [id, rec] of Object.entries(records || {})) {
     if (liveIds.has(id) || skipIds.has(id)) continue;
-    const seenAt = Number(rec?.acknowledgedAt) || 0;
-    if (seenAt > 0 && now - seenAt >= idleGraceMs) continue;
+    if (hasBeenViewedSinceIdle(rec)) continue;
     if (childOf(id)) continue;
     const updatedAt = Number(rec?.updatedAt) || 0;
     const list = byDir.get(rec?.directory);

@@ -31,7 +31,7 @@ This plugin lists every other root session under the same directory, with live s
 Scope:
 
 - Only root sessions. Child/sub-agents are not listed separately.
-- **Finished sessions don't vanish into thin air**: once one stops it stays in the list as `○`, so you can tell "finished" from "lost". The newest `IDLE_KEEP` per directory are kept; bring one to the foreground to read the result and it gets cleared.
+- **Finished sessions don't vanish into thin air**: once one stops it stays in the list as `○`, so you can tell "finished" from "lost". The newest `IDLE_KEEP` per directory are kept; open one to read the result and it gets cleared.
 - Read-only. To interact, switch back to the real TUI pane.
 - No duplicates. The session your TUI has selected is yielded to the official row.
 

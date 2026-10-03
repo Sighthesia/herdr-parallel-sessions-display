@@ -274,7 +274,7 @@ session 自带 `directory`。要找到对应的 herdr workspace，用 `herdr pan
 | `AUTO_START` | `false` | Herdr 恢复后自动拉起管理器 |
 | `INSTALL_AGENT_VIEW` | `false` | 是否安装全局 Agents 视图投影 |
 | `POLL_INTERVAL_MS` | `5000` | 轮询兜底间隔 |
-| `IDLE_GRACE_MS` | `15000` | 状态变化的防抖时间。非内联模式：非活跃后回收镜像行的宽限期。内联模式：被官方集成连续认作前台 session 多久算「用户已查看」 |
+| `IDLE_GRACE_MS` | `15000` | 状态变化的防抖时间。非内联模式：非活跃后回收镜像行的宽限期。内联模式不再用它判断「用户是否看过」—— 那件事改用 opencode 的 `time.viewed`（见 12.14） |
 | `IDLE_KEEP` | `3` | 内联模式：每个目录最多留几条「已完成、尚未查看过」的 session（见 12.14） |
 | `SESSION_ROWS` | 空=自动 | 一个 agent 行最多显示几个 session；留空则读侧边栏模板（见 12.15） |
 | `AGENT_VIEW_SCOPE` | `mirror` | `mirror` 只显示镜像行；`sort-only` 只装排序、保留官方集成的行 |
@@ -608,15 +608,29 @@ hook 将来真跑起来时写的是同一个值。而不补报的后果是「因
 回收该行。模板里已经没有内置标题行了，所以整条（含标题）一起消失 —— 用户看到的是
 session 随机丢失，分不清「跑完了」和「被弄丢了」。
 
-**产品决策**：跑完的 session 留在列表里显示 `○`，让用户知道哪个完成了；**用户把它切到
-前台、结果看过了才清除**。
+**产品决策**：跑完的 session 留在列表里显示 `○`，让用户知道哪个完成了；**用户打开看过
+结果之后才清除**。
 
-判据是 `claimed` —— 官方集成把这个 session 报成某个 pane 的当前 session，即用户真的
-切过去了。**要求连续 claimed 满 `IDLE_GRACE_MS` 才认**：实测官方集成的 `agent_session`
-会在两次轮询之间反复变（同一个 pane 上换过三次 session），照单全收会在用户切走的那
-一瞬间把行误删，而用户根本没看过。
+**判据必须用 opencode 自己的时间戳，不能用 herdr 的 `agent_session`。** 这条是被实测逼
+出来的：herdr 的 opencode 集成 hook（`~/.config/opencode/plugins/herdr-agent-state.js`）
+只处理 `session.created / updated / status / compacted / error / idle / deleted`，
+**没有 `session.viewed`**。而「切到一个跑完的 session 看看结果」**只产生
+`session.viewed` 这一个事件** —— hook 不理，herdr 的 `agent_session` 就一直停在几百
+小时前的那个 session（实测 `w18:p14` 报的是 `自动化测试弹窗`，而它的 `viewed` 已是八
+小时前）。基于 `claimed` 的判据因此永远不触发，症状就是「15 秒以上仍然存在」。
 
-两条边界都不能省：
+opencode 有专门的 `session.viewed` 事件，并在 session 上留两个时间戳：
+
+| 字段 | 含义 |
+| --- | --- |
+| `time.idle` | 最后一次停下来干活的时刻 |
+| `time.viewed` | 最后一次在 TUI 里被打开的时刻 |
+
+判据就是 **`viewed > idle`**（`hasBeenViewedSinceIdle`）：跑完之后又被打开过。**不需要
+任何防抖** —— 这是时间戳比较，不是状态猜测。`idle` 缺失（从没停过）时不参与判据，否则
+`viewed > 0` 会把所有还没跑完的当成「看过」。
+
+其余三条边界都不能省：
 
 - **每目录上限 `IDLE_KEEP`（默认 3）**，按 `updatedAt` 倒序保留最近的。不设上限的话，
   一个开了好几天的目录会把所有槽位占满，真正在跑的那条被挤成「+N」。上限挤掉的**记录
@@ -625,10 +639,14 @@ session 随机丢失，分不清「跑完了」和「被弄丢了」。
 - **闲置的子 agent 也要挡掉**。2a 只在筛选「活跃」集合时查 `parentID`，一旦 opencode 改了
   `parentID=null` 的过滤语义、或 state 是旧版本写的，子 agent 就会从「已完成」这条路径漏
   进来，违反 12.6 的产品决策。
+- **「已完成」那条路径必须自己刷新时间戳**。这些 session 不在 `activeStates` 里，每轮
+  `listRootSessions` 拉回的列表是它们唯一的刷新来源；只从 `rec` 抄的话 `viewed` 永远
+  停在「刚跑完那一刻」，用户后来打开过也看不出来。
 
 判定逻辑是纯函数 `selectRetainedIdle`（board.mjs），不修改传入对象，可直接
-`node -e` 断言。`acknowledgedAt` / `updatedAt` 必须在 `normalizeState` 的白名单里，
-否则插件一重启就丢，「查看过才清除」每次重启都要重来一遍。
+`node -e` 断言。`idleAt` / `viewedAt` / `updatedAt` 必须在 `normalizeState` 的白名单里，
+否则插件一重启就丢，「查看过才清除」每次重启都要重来一遍。看过之后的记录直接**删掉**
+（正在跑的除外）—— 它永远不会再被列，留着只会让 state.json 一直涨。
 
 ### 12.15 槽位数跟随侧边栏模板，不设死上限
 

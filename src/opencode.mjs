@@ -453,7 +453,7 @@ function num(v) {
 /** 把 v1 / v2 的 Session.Info 收敛到同一个形状。 */
 export function normalizeSession(raw) {
   if (!raw || typeof raw !== "object") {
-    return { id: "", title: "", directory: "", projectID: "", updatedAt: 0, parentID: "" };
+    return { id: "", title: "", directory: "", projectID: "", updatedAt: 0, idleAt: 0, viewedAt: 0, parentID: "" };
   }
   return {
     id: str(raw.id),
@@ -464,6 +464,10 @@ export function normalizeSession(raw) {
     projectID: str(raw.projectID),
     // v1: raw.time.updated；v2 同名
     updatedAt: num(raw.time?.updated) || num(raw.time?.created),
+    // v2 的 `time.idle` / `time.viewed`。**这是「用户查看过没有」的唯一可靠信号**，
+    // 见 {@link hasBeenViewedSinceIdle}。
+    idleAt: num(raw.time?.idle) || 0,
+    viewedAt: num(raw.time?.viewed) || 0,
     parentID: str(raw.parentID),
   };
 }

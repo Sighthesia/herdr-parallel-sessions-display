@@ -22,14 +22,12 @@ Conversations 2 and 3 are genuinely running on the same server, but the sidebar 
 ```
 [1] space                            ← workspace group
 ◐ opencode                           ← official agent row
-│▸ ● Conversation 1                  ← selected in the TUI (the tree's root)
+│▸ ● Conversation 1                  ← selected in the TUI
 ├─ ● Conversation 2                  ← still running in background
 └─ ○ Conversation 3                  ← idle session
 ```
 
 One tree per workspace, one row per session, live state. You see how many sessions a directory has running and which one just finished, without clicking through any pane.
-
-`PARALLEL_CONNECTOR` picks the glyphs: `bar` (default, shown above), `tree` (`├─ ▸ ●` / `└─ ●`), or `none`. Overflow collapses into a `+N` on the last row instead of disappearing.
 
 ## Supported agents
 

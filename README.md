@@ -26,11 +26,12 @@ Default mode is **inline**: no extra panes or tabs. The session list is attached
 
 Herdr's built-in integration only reports the session currently selected in that pane's TUI (plus its children). Other sessions running on the same server stay invisible unless you click through panes one by one.
 
-This plugin lists every other running root session under the same directory, with live state.
+This plugin lists every other root session under the same directory, with live state.
 
 Scope:
 
-- Only running root sessions. Child/sub-agents are not listed separately.
+- Only root sessions. Child/sub-agents are not listed separately.
+- **Finished sessions don't vanish into thin air**: once one stops it stays in the list as `○`, so you can tell "finished" from "lost". The newest `IDLE_KEEP` per directory are kept; bring one to the foreground to read the result and it gets cleared.
 - Read-only. To interact, switch back to the real TUI pane.
 - No duplicates. The session your TUI has selected is yielded to the official row.
 
@@ -130,6 +131,7 @@ Full commented list: [`config/.env.example`](config/.env.example). Most users on
 | `PARALLEL_CONNECTOR` | `bar` | `bar` (default): TUI-selected session is the root `│▸`, others are branches `├─`/`└─`. `tree` / `none` also available |
 | `CODEX_ENABLED` / `CLAUDE_ENABLED` | `true` | Set `false` to skip that provider |
 | `CLAUDE_BIN` | empty | Absolute path if the board process can't find `claude` on its `PATH` |
+| `IDLE_KEEP` | `3` | Inline mode: how many finished-but-unreviewed sessions to keep **per directory**. They stay visible as `○` so you can tell "finished" from "lost"; they are dropped once you bring one to the foreground. `0` restores the old behaviour (they vanish) |
 | `POLL_INTERVAL_MS` / `CLAUDE_POLL_MS` | `5000` / `10000` | Polling cadence |
 | `LOG_LEVEL` | `info` | Use `debug` for troubleshooting |
 

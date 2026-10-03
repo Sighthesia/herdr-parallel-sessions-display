@@ -57,6 +57,8 @@ const config = {
   agentViewScope: store.asEnum(raw, "AGENT_VIEW_SCOPE", ["mirror", "sort-only"], "mirror"),
   pollIntervalMs: store.asInt(raw, "POLL_INTERVAL_MS", 5_000, 1_000, 600_000),
   idleGraceMs: store.asInt(raw, "IDLE_GRACE_MS", 15_000, 0, 3_600_000),
+  // 内联模式：每个目录最多留几条「跑完了但你还没在前台看过」的 session。
+  idleKeep: store.asInt(raw, "IDLE_KEEP", 3, 0, 32),
   // 已废弃：RESUME_MODE=opencode 会在 herdr 重启时于镜像 pane 里拉起 opencode TUI，
   // 官方集成随即覆盖掉我们这一行（不是新增重复行），镜像功能对该目录静默失效。
   // 只读不认，写了就在启动时明确告知已忽略。
@@ -1742,16 +1744,47 @@ async function applySessionState({ client, roots, activeStates, polledPermission
   }
 
   // 1b. 正常回收：不再活跃且过了宽限期的行 → release + 关 pane（标签页空了会整页关掉）
-  for (const [sessionID, rec] of Object.entries(runtime.state.panes)) {
-    const active = activeStates.has(sessionID) || pending.has(sessionID);
-    if (active) {
-      rec.idleSince = 0;
-      continue;
+  //
+  // **内联模式不走这条路**：行只是侧边栏上的文字，没有镜像 pane 要关，而且
+  // 「停下来」不等于「该消失」—— 那正是用户判断哪个任务跑完了的唯一依据。
+  // 内联模式用 1c。
+  if (!config.mirrorInline) {
+    for (const [sessionID, rec] of Object.entries(runtime.state.panes)) {
+      const active = activeStates.has(sessionID) || pending.has(sessionID);
+      if (active) {
+        rec.idleSince = 0;
+        continue;
+      }
+      if (!rec.idleSince) rec.idleSince = now;
+      const graceLeft = config.idleGraceMs - (now - rec.idleSince);
+      if (graceLeft <= 0) {
+        await teardownMirror(sessionID, rec, "停止运行且已过宽限期");
+      }
     }
-    if (!rec.idleSince) rec.idleSince = now;
-    const graceLeft = config.idleGraceMs - (now - rec.idleSince);
-    if (graceLeft <= 0) {
-      await teardownMirror(sessionID, rec, "停止运行且已过宽限期");
+  } else {
+    // 内联模式没有镜像 pane 要回收，但 idleSince 仍然要维护：2c 靠它区分
+    // 「还在跑」和「跑完了」，selectRetainedIdle 也按它分组。
+    for (const sessionID of activeStates.keys()) {
+      const rec = runtime.state.panes[sessionID];
+      if (rec) rec.idleSince = 0;
+    }
+  }
+
+  // 1c. 内联模式：把「已在前台查看过」的 session 标记出来，随后不再列它。
+  //
+  // 判据是**官方集成把这个 session 报成了某个 pane 的当前 session**（claimed），
+  // 即用户真的把它切到了前台、看到了结果 —— 这就是用户说的「查看过就可以清除」。
+  //
+  // 要连续 claimed 满 IDLE_GRACE_MS 才认：实测官方集成会在两次轮询之间反复改
+  // agent_session（同一个 pane 的 session 变过三次），照单全收的话会在切走
+  // 的一瞬间把行误删，用户根本没看过。
+  if (config.mirrorInline) {
+    for (const [sessionID, rec] of Object.entries(runtime.state.panes)) {
+      if (claimed.has(sessionID)) {
+        if (!rec.acknowledgedAt) rec.acknowledgedAt = now;
+      } else {
+        rec.acknowledgedAt = 0;
+      }
     }
   }
 
@@ -1798,16 +1831,56 @@ async function applySessionState({ client, roots, activeStates, polledPermission
     if (probed && !probed.parentID) wanted.push(probed);
   }
 
-  // 2c. 还在宽限期内、暂时空闲的行：保持 idle 显示
-  for (const [sessionID, rec] of Object.entries(runtime.state.panes)) {
-    if (wanted.some((w) => w.id === sessionID)) continue;
-    if (!rec.idleSince) continue; // 没有 idleSince 说明它还活跃（上面已处理）
-    wanted.push({
-      id: sessionID,
-      title: rec.title,
-      directory: rec.directory,
-      projectID: "",
+  // 2c. 停下来了但用户还没在前台查看过的行：保留，让用户知道「这个跑完了」。
+  //
+  // 内联模式下这一段不再受 IDLE_GRACE_MS 约束（1b 已经不走回收了），只受两件事
+  // 约束：用户在前台看过它（1c 的 acknowledgedAt），或者每个目录的条数上限
+  // （IDLE_KEEP）。这就是用户要的「完成了要能看见，看过了才清除」。
+  //
+  // 非内联模式下 rec 没有 idleSince 就说明它还活跃，这里保持原样。
+  if (config.mirrorInline) {
+    const decision = selectRetainedIdle(runtime.state.panes, {
+      // 「还在跑 / 在等授权」的不归这里管，它们已经从 2a/2b 进 wanted 了。
+      live: new Set([...activeStates.keys(), ...pending.keys()]),
+      // 官方 TUI 当前选中的那个 session 由 publishInlineSessions 渲染成 `▸`
+      // 那一行，不能在这里再列一遍（它也已经不算「并行」了）。
+      alsoSkip: claimed,
+      now,
+      idleGraceMs: config.idleGraceMs,
+      idleKeep: config.idleKeep,
+      // 兜底：正常情况下记录里不会有子 agent（2a 在建记录之前就把它们挡掉了），
+      // 所以这里只是防「opencode 改了 parentID=null 的过滤语义」或旧版本写的 state。
+      isChild: (id) => Boolean(infoById.get(id)?.parentID),
     });
+    for (const id of decision.keep) {
+      const rec = runtime.state.panes[id];
+      wanted.push({
+        id,
+        title: rec.title,
+        directory: rec.directory,
+        projectID: "",
+        updatedAt: rec.updatedAt,
+      });
+    }
+    for (const d of decision.dropped) {
+      const name = (d.directory || "?").split("/").filter(Boolean).pop() || d.directory;
+      log(
+        "debug",
+        `${name} 目录有 ${d.total} 条已完成待查看，只列最近 ${d.kept} 条（IDLE_KEEP），其余本轮不列`,
+      );
+    }
+  } else {
+    for (const [sessionID, rec] of Object.entries(runtime.state.panes)) {
+      if (wanted.some((w) => w.id === sessionID)) continue;
+      if (!rec.idleSince) continue; // 没有 idleSince 说明它还活跃（上面已处理）
+      wanted.push({
+        id: sessionID,
+        title: rec.title,
+        directory: rec.directory,
+        projectID: "",
+        updatedAt: rec.updatedAt,
+      });
+    }
   }
 
   // --- 3. 逐个确保 pane 存在并上报 ---------------------------------------
@@ -1851,6 +1924,8 @@ async function applySessionState({ client, roots, activeStates, polledPermission
         state: "",
         stateMessage: "",
         idleSince: 0,
+        acknowledgedAt: 0,
+        updatedAt: 0,
         reportedAt: 0,
         fingerprint: "",
         lastState: "",
@@ -1887,6 +1962,9 @@ async function applySessionState({ client, roots, activeStates, polledPermission
     rec.directory = info.directory || rec.directory || "";
     rec.state = state;
     rec.stateMessage = message;
+    // 2d 的「每目录保留最近的 N 条」靠它排序。opencode 的 updatedAt 只在会话
+    // 列表里有（1a/2b 的 info 带 updatedAt）；2c 从 rec 兜底回填的 info 也带。
+    if (Number.isFinite(info.updatedAt) && info.updatedAt > 0) rec.updatedAt = info.updatedAt;
 
     if (state === "idle") {
       if (!rec.idleSince) rec.idleSince = now;
@@ -2583,6 +2661,68 @@ export function resolveInlineHostWorkspace(directory, index, official) {
   const ranked = [...byCount.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
   if (ranked.length === 0) return null;
   return { workspaceId: ranked[0][0], tier: "ancestor-cwd", paneHits: ranked[0][1] };
+}
+
+/**
+ * 内联模式：决定「已经停下来」的 session 里哪些还留在侧边栏上。
+ *
+ * ## 为什么要留
+ *
+ * 旧逻辑是「不活跃就回收」，用户那边的观感是 session 随机消失 —— 而 `/session/active`
+ * 在会话一停下就会移除条目，所以**每个跑完的 session 都会在宽限期后从侧边栏上整条
+ * 消失**，标题也跟着消失（模板里已经没有内置标题行了）。用户没法区分「跑完了」和
+ * 「插件把它弄丢了」。
+ *
+ * 新规则：**停下来的先留着（`○`），让用户知道哪个跑完了；切到前台看过了才清掉。**
+ *
+ * ## 三条过滤规则，按顺序
+ *
+ * 1. 还在跑 / 在等授权（`live`）→ 不归这里管，它们已经从活跃集合直接进列表了。
+ *    `alsoSkip` 同理：官方 TUI 当前选中的那个由 `▸` 那一行负责，不能重复列。
+ * 2. `acknowledgedAt` 距今超过 `idleGraceMs` → 用户已经把它切到前台、结果看过了，
+ *    不再占行。**要求连续稳定这么久**是实测出来的：官方集成的 `agent_session`
+ *    会在两次轮询之间反复变（同一个 pane 上实测换过三次 session），照单全收的话
+ *    会在用户切走的一瞬间把行误删。
+ * 3. 每个目录按 `updatedAt` 倒序只留 `idleKeep` 条 —— 不设上限的话一个开了好几天的
+ *    目录能把所有槽位占满，真正在跑的那条被挤成「+N」。
+ *
+ * ## 纯函数
+ *
+ * 不改传入的 records，也不碰 `runtime.state.panes`：**被上限挤掉的记录必须留着**，
+ * 否则下一轮它又从这里冒出来，反复横跳。
+ *
+ * @param {Record<string, {directory?:string, idleSince?:number, acknowledgedAt?:number, updatedAt?:number}>} records
+ * @param {{live?:Set<string>|string[], alsoSkip?:Set<string>|string[], now:number, idleGraceMs:number, idleKeep:number, isChild?:(id:string)=>boolean}} options
+ * @returns {{keep: string[], dropped: Array<{directory:string,total:number,kept:number}>}}
+ */
+export function selectRetainedIdle(records, options) {
+  const { live, alsoSkip, now, idleGraceMs, idleKeep, isChild } = options || {};
+  const liveIds = live instanceof Set ? live : new Set(live || []);
+  const skipIds = alsoSkip instanceof Set ? alsoSkip : new Set(alsoSkip || []);
+  const childOf = typeof isChild === "function" ? isChild : () => false;
+  const cap = Math.max(0, Number.isFinite(idleKeep) ? idleKeep : 0);
+
+  /** @type {Map<string, Array<{id:string,updatedAt:number}>>} */
+  const byDir = new Map();
+  for (const [id, rec] of Object.entries(records || {})) {
+    if (liveIds.has(id) || skipIds.has(id)) continue;
+    const seenAt = Number(rec?.acknowledgedAt) || 0;
+    if (seenAt > 0 && now - seenAt >= idleGraceMs) continue;
+    if (childOf(id)) continue;
+    const updatedAt = Number(rec?.updatedAt) || 0;
+    const list = byDir.get(rec?.directory);
+    if (list) list.push({ id, updatedAt });
+    else byDir.set(rec?.directory, [{ id, updatedAt }]);
+  }
+
+  const keep = [];
+  const dropped = [];
+  for (const [directory, list] of byDir) {
+    list.sort((a, b) => b.updatedAt - a.updatedAt);
+    for (const entry of list.slice(0, cap)) keep.push(entry.id);
+    if (list.length > cap) dropped.push({ directory, total: list.length, kept: cap });
+  }
+  return { keep, dropped };
 }
 
 /**

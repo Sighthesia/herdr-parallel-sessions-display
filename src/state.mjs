@@ -19,6 +19,9 @@ export const CONFIG_DEFAULTS = Object.freeze({
   INSTALL_AGENT_VIEW: "false",
   POLL_INTERVAL_MS: "5000",
   IDLE_GRACE_MS: "15000",
+  // 每个目录最多留几条「已完成、还没在前台查看过」的 session（内联模式）。
+  // 0 = 不留，停下来 15 秒后照旧消失。
+  IDLE_KEEP: "3",
   // --- SPEC 第 7 节之外、为可运行性补的项（README 有完整表格）---
   AGENT_VIEW_SCOPE: "mirror", // mirror | sort-only
   MIRROR_TAB_LABEL: "oc-sessions",
@@ -363,6 +366,13 @@ export function normalizeState(raw) {
         state: str(rec.state),
         stateMessage: str(rec.stateMessage),
         idleSince: Number.isFinite(rec.idleSince) ? rec.idleSince : 0,
+        // 「用户已经把这个 session 切到前台看过」的起始时刻。看过的就不再占行。
+        // 官方集成上报 agent_session 会抖（实测同一个 pane 的 session 在几次轮询
+        // 间反复变），所以要等它稳住 IDLE_GRACE_MS 才认，见 board.mjs 的
+        // applySessionState。
+        acknowledgedAt: Number.isFinite(rec.acknowledgedAt) ? rec.acknowledgedAt : 0,
+        // 会话自己的 updatedAt。idle 排序和「超额丢弃谁」都要它。
+        updatedAt: Number.isFinite(rec.updatedAt) ? rec.updatedAt : 0,
         reportedAt: Number.isFinite(rec.reportedAt) ? rec.reportedAt : 0,
         fingerprint: str(rec.fingerprint),
         // 上一次真正上报出去的值，用来判断是否需要再调一次 herdr

@@ -30,7 +30,8 @@ Herdr 自带集成只上报当前 pane 的 TUI 选中的那个会话（及其子
 
 范围：
 
-- 只列运行中的根会话，子 agent / sub-agent 不单列。
+- 只列根会话，子 agent / sub-agent 不单列。
+- **跑完的会话不会凭空消失**：停下来之后仍留在列表里显示 `○`，让你分得清「跑完了」和「被弄丢了」；每个目录留最近 `IDLE_KEEP` 条，你把哪一个切到前台、结果看过了，那一条才清除。
 - 只读。要交互请切回真实的 TUI pane。
 - 不重复。真实 TUI 选中的会话会让给官方行。
 
@@ -132,6 +133,7 @@ rows = [
 | `PARALLEL_CONNECTOR` | `bar` | `bar`（默认）：TUI 选中的那个是根 `│▸`，其余是分支 `├─`/`└─`。另有 `tree` / `none` |
 | `CODEX_ENABLED` / `CLAUDE_ENABLED` | `true` | 不需要哪家就设 `false` |
 | `CLAUDE_BIN` | 空 | 看板进程的 `PATH` 里找不到 `claude` 时填绝对路径 |
+| `IDLE_KEEP` | `3` | 内联模式：每个目录最多留几条「跑完但还没查看过」的会话。它们以 `○` 留在列表里，你切到前台看过某一条才清除。`0` = 回到旧行为（跑完就消失） |
 | `POLL_INTERVAL_MS` / `CLAUDE_POLL_MS` | `5000` / `10000` | 轮询节奏 |
 | `LOG_LEVEL` | `info` | 排查问题用 `debug` |
 

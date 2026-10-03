@@ -11,7 +11,8 @@
 | 决策点 | 结论 |
 | --- | --- |
 | 镜像行能力 | **只看不聊**。镜像 pane 内不运行 opencode，不接受输入。 |
-| session 范围 | **仅运行中的根 session**。子 agent 由官方集成汇总进父行，不单列。 |
+| session 范围 | **根 session**。子 agent 由官方集成汇总进父行，不单列。 |
+| 停下来的 session | **保留**（内联模式）。跑完留在列表里显示 `○`，用户切到前台查看后才清除，见 12.9 |
 
 ---
 
@@ -237,6 +238,7 @@ session 自带 `directory`。要找到对应的 herdr workspace，用 `herdr pan
 三层回收，全部由同一条重算路径驱动：
 
 1. **单个镜像行**：session 不再活跃且过了宽限期 → `release-agent` + 关 pane → 该标签页里的镜像 pane 重新均分。
+   - **仅非内联模式**。内联模式没有镜像 pane，而且停下来的 session 要留着让用户知道它跑完了（12.9）。
 2. **整个镜像标签页**：标签页里已经没有镜像 pane（跟踪中的、或带 `oc_mirror` token 的）→ `herdr tab close` 整页关掉，同时删掉该目录的记录。
    - **硬安全阀**：标签页里还有**别的 source 上报的 agent 行**时绝不关——那已经不是「纯镜像标签页」了。sidebar 插件注入的 Sidebar pane 没有 agent 行，不会触发这个保护。
 3. **central 兜底工作区**：没有任何目录还在用 fallback → 关掉。里面还有别人的 agent 行则只关标签页、保留工作区（下次会在同一个工作区里重开镜像标签页，而不是新建一个同名工作区）。
@@ -272,7 +274,8 @@ session 自带 `directory`。要找到对应的 herdr workspace，用 `herdr pan
 | `AUTO_START` | `false` | Herdr 恢复后自动拉起管理器 |
 | `INSTALL_AGENT_VIEW` | `false` | 是否安装全局 Agents 视图投影 |
 | `POLL_INTERVAL_MS` | `5000` | 轮询兜底间隔 |
-| `IDLE_GRACE_MS` | `15000` | 状态转为非活跃后保留行的宽限时间，避免抖动 |
+| `IDLE_GRACE_MS` | `15000` | 状态变化的防抖时间。非内联模式：非活跃后回收镜像行的宽限期。内联模式：被官方集成连续认作前台 session 多久算「用户已查看」 |
+| `IDLE_KEEP` | `3` | 内联模式：每个目录最多留几条「已完成、尚未查看过」的 session（见 12.9） |
 | `AGENT_VIEW_SCOPE` | `mirror` | `mirror` 只显示镜像行；`sort-only` 只装排序、保留官方集成的行 |
 | `RETRY_DETECTION` | `true` | v2 无 retry 信号，需每活跃 session 多一次 HTTP 请求；关掉可省开销但丢失 `blocked` 判定 |
 | `AUTO_AUTH_SERVICE_JSON` | `true` | 探测到 401 时自动读 `~/.config/opencode/service.json` 取密码 |
@@ -594,6 +597,36 @@ hook 将来真跑起来时写的是同一个值。而不补报的后果是「因
 ### 12.12 token 命名
 
 沿用 `oc_sess1..oc_sess6`，**不因为支持多 agent 就改名**。token 挂在**具体某个 agent 行**上，不同 agent 的行本来就是不同的 pane，天然不冲突。改 token 名要动 `config.toml` 的 rows、README、SPEC，收益不抵风险。
+
+### 12.14 停下来的 session 保留到「查看过」为止
+
+**实测现象**：HardwareBridge 目录的侧边栏上，`无人机仿真测试工程与插件规划` 在两次快照
+之间（12:09 → 12:20）凭空出现又消失。根因是 opencode 的 `/api/session/active`
+**在会话停下的一刻就把条目移除**，而内联模式把它当成唯一的生死判据，宽限期一到就
+回收该行。模板里已经没有内置标题行了，所以整条（含标题）一起消失 —— 用户看到的是
+session 随机丢失，分不清「跑完了」和「被弄丢了」。
+
+**产品决策**：跑完的 session 留在列表里显示 `○`，让用户知道哪个完成了；**用户把它切到
+前台、结果看过了才清除**。
+
+判据是 `claimed` —— 官方集成把这个 session 报成某个 pane 的当前 session，即用户真的
+切过去了。**要求连续 claimed 满 `IDLE_GRACE_MS` 才认**：实测官方集成的 `agent_session`
+会在两次轮询之间反复变（同一个 pane 上换过三次 session），照单全收会在用户切走的那
+一瞬间把行误删，而用户根本没看过。
+
+两条边界都不能省：
+
+- **每目录上限 `IDLE_KEEP`（默认 3）**，按 `updatedAt` 倒序保留最近的。不设上限的话，
+  一个开了好几天的目录会把 6 个槽位占满，真正在跑的那条被挤成「+N」。上限挤掉的**记录
+  必须留在 `runtime.state.panes` 里**（只是本轮不列）—— 删掉的话下一轮它又冒出来，
+  反复横跳。
+- **闲置的子 agent 也要挡掉**。2a 只在筛选「活跃」集合时查 `parentID`，一旦 opencode 改了
+  `parentID=null` 的过滤语义、或 state 是旧版本写的，子 agent 就会从「已完成」这条路径漏
+  进来，违反 12.6 的产品决策。
+
+判定逻辑是纯函数 `selectRetainedIdle`（board.mjs），不修改传入对象，可直接
+`node -e` 断言。`acknowledgedAt` / `updatedAt` 必须在 `normalizeState` 的白名单里，
+否则插件一重启就丢，「查看过才清除」每次重启都要重来一遍。
 
 ### 12.13 已知边界（codex）
 

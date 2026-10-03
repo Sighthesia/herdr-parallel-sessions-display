@@ -11,21 +11,20 @@
 **不装插件（Herdr 自带集成）**
 
 ```
-[1] afloat
-  └ opencode  Tray hover二级菜单点击收起…     ← 只有这个 pane 的 TUI 选中的那一个
+[1] space
+◐ opencode  对话 1             ← 只有这个 pane 的 TUI 选中的那一个
 ```
 
-另外 3 个会话确实在同一个 server 上跑着，但侧边栏里没有它们的位置。想确认它们还在不在，只能逐个 pane 点过去看。
+对话 2、对话 3 确实在同一个 server 上跑着，但侧边栏里没有它们的位置。想确认它们还在不在，只能逐个 pane 点过去看。
 
 **装上插件**
 
 ```
-[1] afloat
-  └ ◐ opencode                               ← 该目录的官方 agent 行
-      │▸ ● Tray hover二级菜单点击收起…       ← TUI 当前选中的
-      │  ● MIDI绘制乐理辅助功能              ← 切走但还在跑
-      │  ● 实现 Hover 菜单式…                 ← 切走但还在跑
-      │  ○ 使用 DAPLink 识别 H750            ← 已结束，仍留在列表里
+[1] space                     ← 工作区分组
+◐ opencode                    ← 官方 agent 行
+│▸ ● 对话 1                   ← TUI 当前选中的
+│  ● 对话 2                   ← 切走但还在跑的
+│  ○ 对话 3                   ← 空闲会话
 ```
 
 每个工作区一棵树，一行 = 一个会话，状态实时。不用逐个点 pane 就知道这个目录里到底有几个会话在跑、哪个刚跑完。
@@ -38,15 +37,7 @@
 | Codex | 共享 app-server 守护进程 | 先 `herdr integration install codex`，且 Codex 跑在 Herdr pane 里 |
 | Claude Code | `claude agents --json` | Claude 跑在 Herdr pane 里 |
 
-默认走**内联模式**：不建 pane、不建标签页。会话列表挂在该目录的官方 agent 行下面，画成 ASCII 树。
-
-```
-[1] space                     ← 工作区分组
-◐ opencode                    ← 官方 agent 行
-│▸ ● 对话 1                   ← TUI 当前选中的
-│  ● 对话 2                   ← 切走但还在跑的
-│  ○ 对话 3                   ← 空闲会话
-```
+默认走**内联模式**：不建 pane、不建标签页。会话挂在该目录的官方 agent 行下面，画成 ASCII 树。
 
 ## 为什么需要它
 

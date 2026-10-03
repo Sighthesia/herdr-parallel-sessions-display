@@ -11,21 +11,20 @@ Four opencode sessions running in the same project directory, only one of them s
 **Without the plugin (Herdr's built-in integration)**
 
 ```
-[1] afloat
-  └ opencode  Tray hover二级菜单点击收起…     ← only the one that pane's TUI has selected
+[1] space
+◐ opencode  Conversation 1           ← only the one that pane's TUI has selected
 ```
 
-The other three are genuinely running on the same server, but the sidebar has no place for them. To confirm they're still alive you have to click through panes one by one.
+Conversations 2 and 3 are genuinely running on the same server, but the sidebar has no place for them. To confirm they're still alive you have to click through panes one by one.
 
 **With the plugin**
 
 ```
-[1] afloat
-  └ ◐ opencode                               ← the official agent row for this directory
-      │▸ ● Tray hover二级菜单点击收起…       ← selected in the TUI
-      │  ● MIDI绘制乐理辅助功能              ← switched away, still running
-      │  ● 实现 Hover 菜单式…                 ← switched away, still running
-      │  ○ 使用 DAPLink 识别 H750            ← finished, still listed
+[1] space                            ← workspace group
+◐ opencode                           ← official agent row
+│▸ ● Conversation 1                 ← selected in the TUI
+│  ● Conversation 2                 ← still running in background
+│  ○ Conversation 3                 ← idle session
 ```
 
 One tree per workspace, one row per session, live state. You see how many sessions a directory has running and which one just finished, without clicking through any pane.
@@ -38,15 +37,7 @@ One tree per workspace, one row per session, live state. You see how many sessio
 | Codex | Shared app-server daemon | `herdr integration install codex`, plus Codex running in a Herdr pane |
 | Claude Code | `claude agents --json` | Claude running in a Herdr pane |
 
-Default mode is **inline**: no extra panes or tabs. The session list is attached to the official agent row for that directory and rendered as an ASCII tree.
-
-```
-[1] space                            ← workspace group
-◐ opencode                           ← official agent row
-│▸ ● Conversation 1                 ← selected in the TUI
-│  ● Conversation 2                 ← still running in background
-│  ○ Conversation 3                 ← idle session
-```
+Default mode is **inline**: no extra panes or tabs. Sessions are attached to the official agent row for their directory and rendered as an ASCII tree.
 
 ## Why
 

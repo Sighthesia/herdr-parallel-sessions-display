@@ -91,6 +91,10 @@ herdr plugin pane open --plugin herdr-parallel-sessions-display --entrypoint boa
 
 `.env` 可以留空，默认值直接能跑。改完 `.env` 需要关掉看板标签页再重开。
 
+看板跑在一个 `Herdr Sessions` 标签页里。`AUTO_START=true`（默认）会在每次 Herdr
+重启后自动拉起它；关掉的话侧边栏会**静默**停止更新 —— 不报错，行就停在最后一次的状态。
+不建议关。
+
 三个 action（命令面板里按 id 也能调）：
 
 | action | 作用 |
@@ -124,6 +128,7 @@ rows = [
 | `OPENCODE_SERVER_URL` | 空 | 如 `http://127.0.0.1:4096`，留空自动探测 |
 | `OPENCODE_SERVER_PASSWORD` | 空 | server 开了 Basic Auth 时填 |
 | `MIRROR_INLINE` | `true` | `false` = 旧的每个会话一个 pane 模式（只支持 opencode） |
+| `AUTO_START` | `true` | Herdr 重启后自动拉起看板。**别关** —— 关掉后侧边栏会静默停止更新（不报错） |
 | `PARALLEL_CONNECTOR` | `bar` | `bar`（默认）：TUI 选中的那个是根 `│▸`，其余是分支 `├─`/`└─`。另有 `tree` / `none` |
 | `CODEX_ENABLED` / `CLAUDE_ENABLED` | `true` | 不需要哪家就设 `false` |
 | `CLAUDE_BIN` | 空 | 看板进程的 `PATH` 里找不到 `claude` 时填绝对路径 |

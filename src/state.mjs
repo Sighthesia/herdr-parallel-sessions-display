@@ -15,7 +15,7 @@ export const CONFIG_DEFAULTS = Object.freeze({
   OPENCODE_SERVER_USERNAME: "opencode",
   OPENCODE_SERVER_PASSWORD: "",
   MIRROR_LABEL: "Sessions",
-  AUTO_START: "false",
+  AUTO_START: "true",
   INSTALL_AGENT_VIEW: "false",
   POLL_INTERVAL_MS: "5000",
   IDLE_GRACE_MS: "15000",

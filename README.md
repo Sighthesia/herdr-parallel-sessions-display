@@ -89,7 +89,11 @@ herdr plugin config-dir herdr-parallel-sessions-display  # .env goes here
 herdr plugin pane open --plugin herdr-parallel-sessions-display --entrypoint board
 ```
 
-`.env` can stay empty; defaults work. After editing `.env`, close and reopen the board tab.
+.env` can stay empty; defaults work. After editing `.env`, close and reopen the board tab.
+
+The board lives in a `Herdr Sessions` tab. `AUTO_START=true` (the default) relaunches it
+after every Herdr restart; with it off the sidebar stops updating silently — no error, the
+rows just freeze at their last state. Don't disable it.
 
 Three actions (also available from the command palette):
 
@@ -122,6 +126,7 @@ Full commented list: [`config/.env.example`](config/.env.example). Most users on
 | `OPENCODE_SERVER_URL` | empty | e.g. `http://127.0.0.1:4096`. Empty = auto-detect |
 | `OPENCODE_SERVER_PASSWORD` | empty | Basic Auth password, if the server has one |
 | `MIRROR_INLINE` | `true` | `false` = legacy one-pane-per-session mode (opencode only) |
+| `AUTO_START` | `true` | Relaunch the board on Herdr restart. **Leave it on** — turning it off freezes the sidebar silently (no error) |
 | `PARALLEL_CONNECTOR` | `bar` | `bar` (default): TUI-selected session is the root `│▸`, others are branches `├─`/`└─`. `tree` / `none` also available |
 | `CODEX_ENABLED` / `CLAUDE_ENABLED` | `true` | Set `false` to skip that provider |
 | `CLAUDE_BIN` | empty | Absolute path if the board process can't find `claude` on its `PATH` |

@@ -29,6 +29,39 @@ External contributors and coding agents are welcome. This file is the entry poin
 
 `[[startup]]` is a one-shot init hook, not a supervised daemon — no resident logic there.
 
+## Required manual step: the sidebar template
+
+**The plugin never writes `~/.config/herdr/config.toml`.** Session rows are rendered by
+template tokens (`$oc_sess1` … `$oc_sess6`), and Herdr's stock
+`ui.sidebar.agents.rows` is `["state_icon","machine","workspace","tab"]` — it contains
+none of them. Without this edit the tokens are still written, the board runs, the logs
+are clean, **and the sidebar shows nothing at all**. It looks like a healthy install,
+which is exactly why it is easy to lose an afternoon on.
+
+Merge these rows into the existing `[ui.sidebar.agents]` in
+`~/.config/herdr/config.toml` **without dropping rows the user already has**:
+
+```toml
+[ui.sidebar.agents]
+rows = [
+  ["workspace"],
+  ["state_icon", "agent"],
+  ["$oc_sess1"], ["$oc_sess2"], ["$oc_sess3"],
+  ["$oc_sess4"], ["$oc_sess5"], ["$oc_sess6"],
+]
+```
+
+Then `herdr server reload-config`. Slot count must stay in sync with
+`herdr.SESSION_TOKENS` in `src/herdr.mjs`; `ui.sidebar.agents.rows` caps at 16 rows.
+
+## Keep `AUTO_START` on
+
+`AUTO_START` ships `true`. Turning it off causes **silent failure**: the board stops
+running, so tokens stop being refreshed, so the sidebar quietly freezes at its last
+state — no error anywhere. Users hit this weeks after install, usually right after a
+Herdr restart. The cost of leaving it on is one extra tab. Do not "optimise" it away,
+and do not weaken the startup log message that explains the consequence.
+
 ## Commands
 
 ```bash
@@ -54,6 +87,8 @@ node src/board.mjs --mode once
 - Logs are **not** in `herdr plugin log list`. Find the board pane via `herdr pane list --json` (label `Herdr Sessions`) and read it with `herdr pane read <id> --lines 200`.
 - Restart the board tab after editing `.env` or code.
 - `LOG_LEVEL=debug` prints per-session keep/skip reasons.
+- Sidebar shows no session rows at all → the template step above was skipped; check `[ui.sidebar.agents]` first, it is by far the most common cause.
+- Sidebar froze after a Herdr restart → the board is not running (`ps -ef | grep 'board\.mjs --mode pane'`); `AUTO_START` should make that impossible.
 
 ## Adding a config key
 

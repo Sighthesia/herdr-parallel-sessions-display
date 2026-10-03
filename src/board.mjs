@@ -52,7 +52,7 @@ const config = {
   mirrorLabel: store.asString(raw, "MIRROR_LABEL", "Sessions"),
   // 每个目录在自己的工作区里独占一个同名标签页放镜像 pane。
   mirrorTabLabel: store.asString(raw, "MIRROR_TAB_LABEL", "oc-sessions"),
-  autoStart: store.asBool(raw, "AUTO_START", false),
+  autoStart: store.asBool(raw, "AUTO_START", true),
   installAgentView: store.asBool(raw, "INSTALL_AGENT_VIEW", false),
   agentViewScope: store.asEnum(raw, "AGENT_VIEW_SCOPE", ["mirror", "sort-only"], "mirror"),
   pollIntervalMs: store.asInt(raw, "POLL_INTERVAL_MS", 5_000, 1_000, 600_000),
@@ -551,11 +551,18 @@ async function modeStartup() {
   runtime.state = state;
   await reconcileAgentView(state, { reason: "startup", force: true });
 
-  // 2) 可选拉起常驻管理器
+  // 2) 拉起常驻管理器（默认开，见 CONFIG_DEFAULTS 里的 AUTO_START）
   if (config.autoStart) {
     await ensureBoardRunning();
   } else {
-    log("info", "AUTO_START=false，不自动拉起管理器（用 prefix+shift+o 或插件 action 打开）");
+    // 说清楚后果，别只说「没拉起」：关掉 AUTO_START 的真实代价是**静默失效** ——
+    // 插件不再更新 token，侧边栏停在最后一次的状态，且没有任何报错。
+    log(
+      "warn",
+      "AUTO_START=false：不自动拉起常驻管理器。Herdr 下次重启后侧边栏会停止更新" +
+        "且不报错，需要手动打开看板（prefix+shift+o，或插件 action「并行会话看板」）。" +
+        "不建议关。",
+    );
   }
 
   // startup 钩子必须自己退出

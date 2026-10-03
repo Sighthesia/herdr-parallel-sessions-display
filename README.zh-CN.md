@@ -2,15 +2,15 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-在 Herdr 的 Agents 侧边栏显示 TUI 前台看不到的并行会话（后台同时运行的顶层主 agent，不是 subagent），按工作目录分组。包括 OpenCode 会话，以及 Codex 和 Claude Code 的后台 agent。
+把 **OpenCode**、**Codex**、**Claude Code** 里正在运行的会话，按工作目录显示在 Herdr Agents 视图里。
 
 ## 支持的 agent
 
 | Agent | 会话来源 | 需要条件 |
 | --- | --- | --- |
-| OpenCode 会话 | Server HTTP 接口 + SSE | 开着任意 opencode TUI（提供 server） |
-| Codex 后台 agent | 共享 app-server 守护进程 | 先 `herdr integration install codex`，且 Codex 跑在 Herdr pane 里 |
-| Claude Code 后台 agent | `claude agents --json` | Claude 跑在 Herdr pane 里 |
+| OpenCode | Server HTTP 接口 + SSE | 开着任意 opencode TUI（提供 server） |
+| Codex | 共享 app-server 守护进程 | 先 `herdr integration install codex`，且 Codex 跑在 Herdr pane 里 |
+| Claude Code | `claude agents --json` | Claude 跑在 Herdr pane 里 |
 
 默认走**内联模式**：不建 pane、不建标签页。会话列表挂在该目录的官方 agent 行下面，画成 ASCII 树。
 

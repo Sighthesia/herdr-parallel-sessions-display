@@ -295,7 +295,8 @@ src/
   claude.mjs             # Claude Code 会话发现（spawn `claude agents --json` + 纯字段映射，见第 13 节）
   state.mjs              # HERDR_PLUGIN_STATE_DIR 下的映射持久化
 config/.env.example
-README.md
+README.md            # 英文，主展示
+README.zh-CN.md      # 中文，与英文同步维护
 ```
 
 语言：Node.js（`.mjs`），无第三方依赖，使用内置 `fetch` 与 `node:child_process`。

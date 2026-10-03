@@ -1,181 +1,215 @@
 # herdr-parallel-sessions-display
 
-把 **opencode**、**codex** 和 **Claude Code** 里正在运行的会话，按工作区分组显示在 Herdr
-Agents 视图里。
+[English](README.md) | [简体中文](README.zh-CN.md)
 
-默认走**内联模式**：不创建任何 pane、不创建任何标签页，session 列表以 token 的形式挂在
-该目录的官方 agent 行下面，画成 ASCII 树状图。
+Shows the sessions that are currently running in **OpenCode**, **Codex** and **Claude
+Code**, grouped by working directory in Herdr's Agents view.
 
-想改这个插件本身的话，见文末的[「开发」](#开发)。
+By default it uses **inline mode**: no pane and no tab is created, and the session list is
+attached as tokens underneath the official agent row for that directory, drawn as an ASCII
+tree.
 
-## 它解决什么问题
+If you want to work on the plugin itself, see [Development](#development) at the end of
+this document.
 
-你在一个目录里开着 OpenCode，同一个 server 里跑着好几个 session。Herdr 自带的
-opencode 集成只上报「**当前 pane 的 TUI 选中的那一个** session 及其子 session」。
-于是同一个 server 里其它正在跑的 session —— 那些你切过去之前就一直在后台干活的
-session —— 在 Agents 视图里完全看不见。你只能一个个 pane 点过去确认谁还在跑。
+## What problem it solves
 
-这个插件补上这个缺口：每个未被打开的运行中根 session 各占一行，状态准确。
+You have OpenCode open on a directory, with several sessions running on the same server.
+Herdr's built-in OpenCode integration only reports the one session the TUI in the current
+pane has selected, plus its child sessions. So every other session running on that same
+server — the ones that have been working away in the background since before you switched
+away — is completely invisible in the Agents view. The only way to find out which ones are
+still running is to click through pane by pane.
 
-### 三条产品边界
+This plugin fills that gap: every running root session that is not opened gets its own row,
+with accurate state.
 
-| 决定 | 结论 |
+### Three product boundaries
+
+| Decision | Conclusion |
 | --- | --- |
-| 镜像行能做什么 | **只看不聊**。镜像 pane 里不运行 opencode，也不接受输入。要交互请切回你真实的 TUI pane。 |
-| 镜像哪些 session | **只有运行中的根 session**。子 agent 由官方集成汇总进父行，不单列。 |
-| 会不会重复 | **不会**。用户真实 TUI 选中的 session 会主动让给官方集成那一行。 |
+| What a mirror row can do | **Look, don't talk.** No OpenCode runs inside the mirror pane and it does not accept input. To interact, switch back to your real TUI pane. |
+| Which sessions get mirrored | **Only running root sessions.** Child agents are aggregated into the parent row by the official integration, they are not listed separately. |
+| Will anything be duplicated | **No.** The session your real TUI has selected is actively yielded to the official integration's row. |
 
-## 工作原理
+## How it works
 
-Herdr 的 Agents 视图里，**每一行都必须绑定一个真实 pane**。插件 v1 也不能动态注册
-action 或造原生 UI。所以方案是：
+Every row in Herdr's Agents view has to be bound to a real pane, and plugin v1 can neither
+register actions dynamically nor build native UI. So the approach is:
 
 ```
 opencode server
-   │  /api/session/active  谁在跑
-   │  /api/event (SSE)     权限等待 / 状态变化
-   │  /api/permission/request  待回复授权（轮询兜底）
+   │  /api/session/active  who is running
+   │  /api/event (SSE)     permission pending / state changes
+   │  /api/permission/request  authorization awaiting a reply (polling fallback)
    ▼
-board.mjs（常驻管理器，以插件面板形式存在）
-   │  为每个 session 分一个镜像 pane（只跑一个空转的 node 进程）
-   │  用自己的 source 替这些 pane 上报状态和元数据
+board.mjs (resident manager, living in a plugin pane)
+   │  one mirror pane per session (a single idling node process)
+   │  reports state and metadata on those panes under our own source
    ▼
-Herdr Agents 视图
+Herdr Agents view
 ```
 
-五个关键设计：
+Six key design decisions:
 
-- **状态直接来自 opencode server 的运行态**，不是读屏幕识别。所以比官方集成更准，
-  而且权限等待这种最有价值的信号能拿到。
-- **镜像行落在它自己目录对应的工作区里**。Agents 侧边栏的分组 token 只有 `workspace`，
-  没有「按目录分组」这个选项，所以镜像 pane 必须落在用户为这个目录开的工作区里，
-  那一行才会归到对应的 `[n] <项目名>` 分组下。见下面「行出现在哪」。
-- **每个目录在自己的工作区里独占一个标签页**放镜像（固定名 `oc-sessions`）。
-  这样绝不往你正在用的工作标签页里插 pane，多 pane 布局不会被挤压、不会抖。
-- **管理器是面板而不是后台进程**。`[[startup]]` 只是一次性初始化钩子，不是受监管的
-  守护进程，所以常驻逻辑放在 `[[panes]]` 里。
-- **镜像 pane 里什么都不跑**，只保持前台进程存活（`setInterval` 保活）。这样官方集成
-  不会在同一个 pane 上二次上报，重复行从源头就不可能发生。
-- **去重靠 session 身份**。每轮重算前读 Herdr 的 agent 列表，把已经被别的来源
-  （主要是官方集成）上报过的 session id 收集起来，从候选集里剔除。
+- **State comes straight from the OpenCode server's runtime**, not from reading the screen
+  and recognising it. That makes it more accurate than the official integration, and it
+  means high-value signals like permission pending are actually available.
+- **A mirror row lands in the workspace that belongs to its own directory.** The grouping
+  token of the Agents sidebar is `workspace` and nothing else, there is no group-by-directory
+  option, so the mirror pane has to land in the workspace the user opened for that
+  directory — only then does the row fall under the matching `[n] <project name>` group.
+  See "Where rows end up" below.
+- **Each directory gets a tab of its own in its workspace** to hold the mirrors (fixed name
+  `oc-sessions`). That way the plugin never inserts panes into the work tabs you are
+  actually using, so multi-pane layouts never get squeezed and never jitter.
+- **The manager is a pane, not a background process.** `[[startup]]` is only a one-shot
+  init hook, not a supervised daemon, so the resident logic lives in `[[panes]]`.
+- **Nothing runs inside a mirror pane**, it only keeps a foreground process alive
+  (`setInterval` keepalive). That way the official integration can never report a second
+  time on the same pane, and duplicate rows are impossible at the source.
+- **Deduplication is based on session identity.** Before each recompute it reads Herdr's
+  agent list, collects the session ids already reported by another source (mainly the
+  official integration), and removes them from the candidate set.
 
-### 行出现在哪
+### Where rows end up
 
-侧边栏长这样：
+The sidebar looks like this:
 
 ```
 [1] afloat
-  ├ opencode  Tray hover二级菜单点击收起无退场效果…   ← 官方行（TUI 当前选中的）
-  └ opencode  旧分支全屏辉光效果迁移至通知卡片和bar   ← 镜像行（同目录另一个在跑的）
+  ├ opencode  Tray hover 2nd-level menu collapse, no exit animation…   ← official row (the one the TUI has selected)
+  └ opencode  Move the old branch's fullscreen glow effect to notification cards and bar   ← mirror row (another one running in the same directory)
 [2] ReimuMoePCB_DAPLink
-  └ opencode  使用 DAPLink 识别 H750                ← 官方行
+  └ opencode  Use DAPLink to recognize H750          ← official row
 ```
 
-具体做法：从 session 的 `directory` 反查 herdr 的 pane（`cwd` / `foreground_cwd` 严格相等，
-再不行就看这个目录是不是在某个 pane 的目录之下），找到对应的 `workspace_id`，
-然后在那个工作区里开一个专属标签页 `oc-sessions` 放这个目录的镜像。
-**绝不靠目录名猜** —— 同一个项目名可以出现在任意路径下，猜错就把镜像行归到别人的分组里了。
+Concretely: take the session's `directory` and look up Herdr's panes in reverse (`cwd` /
+`foreground_cwd` strict equality, and failing that, whether this directory sits underneath
+some pane's directory), find the matching `workspace_id`, then open a dedicated tab
+`oc-sessions` in that workspace to hold this directory's mirrors. **Never guess by
+directory name** — the same project name can show up under any path, and a wrong guess
+files the mirror row under somebody else's group.
 
-一个工作区都匹配不上时（例如 session 在 `/tmp/...` 下而你没开过这个目录），
-才退回 central `Sessions` 工作区，日志里会写明「该目录没有对应的工作区，已归入 Sessions 兜底工作区」。
+Only when no workspace matches at all (for example the session is under `/tmp/...` and you
+never opened that directory) does it fall back to the central `Sessions` workspace, and
+the log then says `该目录没有对应的工作区，已归入 Sessions 兜底工作区` ("no workspace matches
+this directory, filed into the Sessions fallback workspace").
 
-### 镜像 pane 怎么排布
+### How mirror panes are laid out
 
-新 pane 切出来之后，插件会立刻**重平衡这个标签页里的整棵镜像子树**：对每个 split 节点
-把比例设成「first 子树的叶子数 ÷ 子树总叶子数」，于是所有镜像 pane 精确均分空间。
+Once the new pane is split out, the plugin immediately **rebalances the whole mirror
+subtree in that tab**: for every split node it sets the ratio to "leaf count of the first
+subtree ÷ total leaf count of the subtree", so all mirror panes divide the space exactly
+evenly.
 
-用 `layout.set_split_ratio`（只改比例），**不用** `layout.apply` —— apply 会重建标签页、
-销毁所有活着的终端进程，把已有镜像 pane 全杀掉重启。
+It uses `layout.set_split_ratio` (ratios only) and **never** `layout.apply` — apply
+rebuilds the tab and destroys every live terminal process, killing and restarting all
+existing mirror panes.
 
-镜像行再多也照建。窗口不够高时行会变矮、需要滚动，但插件不会因为「放不下」就拒绝建行。
+Mirror rows get created no matter how many there are. When the window is not tall enough
+rows get shorter and you have to scroll, but the plugin never refuses to create a row
+because it "does not fit".
 
-### 用完怎么收
+### Cleaning up when done
 
-- 某个目录下的 session 全停了 → 那个 `oc-sessions` 标签页**整页自动关掉**。
-- 没有目录再用兜底了 → `Sessions` 兜底工作区也关掉（Herdr 本身也会回收空工作区）。
-- 想立刻全清：`reap` action。
+- All sessions under a directory have stopped → that `oc-sessions` tab is **closed
+  automatically, the whole page**.
+- Nothing uses the fallback anymore → the `Sessions` fallback workspace is closed too
+  (Herdr reaps empty workspaces on its own).
+- To clear everything immediately: the `reap` action.
 
-### 上报为什么拆成两步
+### Why reporting is split into two steps
 
-`resume_argv` 非法时 herdr 的失败码是 `invalid_resume_argv`，而且官方文档写明
-「the report is not applied」—— 也就是说带一个坏恢复命令，会把 `agent_session_id`
-一起丢掉，session id 白报。所以：
+When `resume_argv` is invalid, Herdr's failure code is `invalid_resume_argv`, and the
+official docs state "the report is not applied" — meaning that a bad resume command takes
+the `agent_session_id` down with it and the session id is reported for nothing. Hence:
 
-1. `pane report-agent --state ... --agent-session-id <id>` —— 不带恢复命令，先把状态和
-   session 身份落库
-2. `pane report-agent-session --agent-session-id <id> -- <恢复命令>` —— 再单独挂恢复命令
+1. `pane report-agent --state ... --agent-session-id <id>` — no resume command, land the
+   state and the session identity first
+2. `pane report-agent-session --agent-session-id <id> -- <resume command>` — attach the
+   resume command separately
 
-第 2 步失败只影响「Herdr 重启后怎么恢复」，这一行本身不受影响。两步都写日志。
+A failure in step 2 only affects "how to resume after a Herdr restart"; the row itself is
+unaffected. Both steps are logged.
 
-状态映射：
+State mapping:
 
-| opencode | Herdr | 说明 |
+| opencode | Herdr | Notes |
 | --- | --- | --- |
-| 有未回复的权限请求 | `blocked` | 来自 SSE 的 `permission.asked` / `permission.replied` |
-| `retry`（v1）/ 末尾消息有 retry（v2） | `blocked` | 通常是报错要处理，错误信息写进 `--message` |
-| `busy` / `running` | `working` | 正在执行 |
-| 以上都不满足 | `idle` | 过了宽限期就回收该行 |
+| An unreplied permission request | `blocked` | From the SSE `permission.asked` / `permission.replied` events |
+| `retry` (v1) / a retry in the last message (v2) | `blocked` | Usually an error that needs handling, the error text goes into `--message` |
+| `busy` / `running` | `working` | Currently executing |
+| None of the above | `idle` | Once the idle grace period passes, the row is reaped |
 
-优先级：权限等待 > retry > busy。
+Priority: permission pending > retry > busy.
 
-## 安装
+## Installation
 
-### 前置条件
+### Requirements
 
-| 依赖 | 要求 | 说明 |
+| Dependency | Requirement | Notes |
 | --- | --- | --- |
-| [Herdr](https://herdr.dev/) | ≥ 0.9.3 | `herdr-plugin.toml` 里 `min_herdr_version` 声明的最低版本，低于它 Herdr 直接拒绝安装 |
-| [Node.js](https://nodejs.org/) | **必须在 `PATH` 上** | 常驻进程就是 `node src/board.mjs`，而 Herdr 是在 `PATH` 上找 `node`。**找不到时不会报错**：启动钩子和三个 action 静默失败，侧边栏什么都不出现。验证：`node --version` |
-| 操作系统 | Linux 或 macOS | 清单里声明了这两个平台。**真机联调只在 Linux 上做过**，macOS 目前只有代码审查结论 |
-| opencode server | 正在运行 | 插件的全部数据都来自它的 HTTP 接口，没有它插件什么都不显示。开着任意一个 opencode TUI 就行 |
+| [Herdr](https://herdr.dev/) | ≥ 0.9.3 | The minimum version declared as `min_herdr_version` in `herdr-plugin.toml`, and Herdr refuses to install anything older |
+| [Node.js](https://nodejs.org/) | **must be on `PATH`** | The resident process is `node src/board.mjs`, and Herdr looks up `node` on `PATH`. **When it cannot find it there is no error**: the startup hook and all three actions fail silently and nothing shows up in the sidebar. Verify with `node --version` |
+| Operating system | Linux or macOS | The manifest declares both platforms. **Live testing on a real machine has only been done on Linux**, macOS currently has code-review conclusions only |
+| OpenCode server | Running | Every bit of the plugin's data comes from its HTTP interface, and without it the plugin shows nothing. Having any opencode TUI open is enough |
 
-**codex 和 Claude Code 是可选的**：没装就自动不采集对应那部分。装了还得有 Herdr 认得的
-**官方 agent 行**能挂 —— 默认的内联模式是把 session 列表挂在官方行下面的，一个官方行都没有
-就等于没地方挂（分别见下面「codex 支持」和「Claude Code 支持」）。
+**Codex and Claude Code are optional**: if they are not installed, that part is simply not
+collected. If they are, you also need an **official agent row** that Herdr recognizes to
+mount on — the default inline mode hangs the session list underneath official rows, so
+with not a single official row there is nowhere to mount (see "Codex support" and "Claude
+Code support" below).
 
-插件**零第三方依赖、没有构建步骤**：清单里没有 `[[build]]`，代码全是 Node 内置模块的
-`.mjs`，仓库里也没有 `package.json`。所以不需要 `npm install`，克隆下来直接跑。
+The plugin has **zero third-party dependencies and no build step**: there is no `[[build]]`
+in the manifest, all the code is `.mjs` built on Node built-ins, and the repo has no
+`package.json`. So there is no `npm install` — clone it and run.
 
-### 从 GitHub 安装
+### Installing from GitHub
 
 ```bash
 herdr plugin install Sighthesia/herdr-parallel-sessions-display
 ```
 
-`install` 只接受 GitHub 简写（`owner/repo` 或 `owner/repo/子目录`）。它用 `git` 克隆仓库，
-**在交互式终端里先给一次预览**（源地址 + 将会执行的命令）再让你确认；已经信任这个仓库
-加 `--yes` 跳过确认，想钉死某个分支、tag 或提交就加 `--ref`：
+`install` only accepts the GitHub shorthand (`owner/repo` or `owner/repo/subdirectory`). It
+clones the repo with `git` and **shows a preview first in an interactive terminal** (source
+address plus the command that will be executed) before asking you to confirm; add `--yes`
+to skip the confirmation if you already trust the repo, and add `--ref` to pin a branch,
+tag or commit:
 
 ```bash
 herdr plugin install Sighthesia/herdr-parallel-sessions-display --yes
-herdr plugin install Sighthesia/herdr-parallel-sessions-display --ref <分支或提交>
+herdr plugin install Sighthesia/herdr-parallel-sessions-display --ref <branch-or-commit>
 ```
 
-本插件没有 `[[build]]`，所以安装过程不会执行任何构建命令。
+This plugin has no `[[build]]`, so the install runs no build commands at all.
 
-然后写配置、打开看板：
+Then write the config and open the board:
 
 ```bash
-# 1. 找到配置目录（install 时已经建好）
+# 1. Find the config directory (already created at install time)
 herdr plugin config-dir herdr-parallel-sessions-display
 
-# 2. 把插件目录里的 config/.env.example 复制成上面那个目录下的 .env
-#    （插件目录就是那份检出，herdr-plugin.toml 在它的根目录）
+# 2. Copy config/.env.example from the plugin directory into .env in that directory
+#    (the plugin directory is the checkout, herdr-plugin.toml sits at its root)
 
-# 3. 打开看板 —— 常驻管理器就跑在这个标签页里
+# 3. Open the board —— the resident manager runs inside this tab
 herdr plugin pane open --plugin herdr-parallel-sessions-display --entrypoint board
 ```
 
-GitHub 安装的插件目录是 Herdr 托管的检出目录，所以**模板要从那儿拿，`.env` 要写在
-`herdr plugin config-dir` 指出的目录里**，别写进插件目录。
+The plugin directory of a GitHub install is a Herdr-managed checkout, so **take the
+template from there and write `.env` into the directory that `herdr plugin config-dir`
+points at** — do not write it into the plugin directory.
 
-`.env` **可以全部留空**，默认值直接能跑；模板里每个键都带中文注释，配置项的含义见下面
-「配置」。**改完 `.env` 必须关掉看板标签页再重新打开才生效** —— 配置只在进程启动时读一次。
+`.env` **can be left completely empty**, the defaults work as-is; every key in the template
+carries a Chinese comment, and what each option means is in the "Configuration" table
+below. **After editing `.env` you must close the board tab and reopen it for it to take
+effect** — config is read exactly once, at process start.
 
-### 可选：绑定快捷键
+### Optional: binding a shortcut
 
-不想绑键也行，这三个 action 都能在 Herdr 的命令面板里按 id 调用。绑键的话在
-`~/.config/herdr/config.toml` 里加：
+Not binding keys is fine too — all three actions can be invoked by id from Herdr's command
+palette. To bind keys, add this to `~/.config/herdr/config.toml`:
 
 ```toml
 [[keys.command]]
@@ -184,129 +218,143 @@ type = "plugin_action"
 command = "herdr-parallel-sessions-display.board"
 ```
 
-插件自带三个 action：
+The plugin ships three actions:
 
-| action | 作用 |
+| action | Effect |
 | --- | --- |
-| `herdr-parallel-sessions-display.board` | 打开看板（常驻管理器） |
-| `herdr-parallel-sessions-display.sync` | 立刻触发一次全量重算 |
-| `herdr-parallel-sessions-display.reap` | 回收所有镜像行和镜像 pane |
+| `herdr-parallel-sessions-display.board` | Open the board (the resident manager) |
+| `herdr-parallel-sessions-display.sync` | Trigger one full recompute immediately |
+| `herdr-parallel-sessions-display.reap` | Reap all mirror rows and mirror panes |
 
-### 安装后如果侧边栏没反应
+### If nothing shows up in the sidebar after installing
 
-按顺序走这三步，完整版见下面[「故障排查」](#故障排查)：
+Walk these three steps in order, the full version is in [Troubleshooting](#troubleshooting)
+below:
 
-1. **看板标签页在不在。** 常驻管理器就是那个标签页里的 node 进程，它不跑的时候插件什么都不做
-   （侧边栏上留着最后一次成功重算时的内容，看起来完全正常）。拉起来：
+1. **Is the board tab there.** The resident manager is the node process inside that tab,
+   and while it is not running the plugin does nothing at all (the sidebar keeps whatever
+   the last successful recompute left there, which looks completely normal). Bring it up:
    `herdr plugin action invoke herdr-parallel-sessions-display.sync`
-2. **看板面板的输出不进 plugin log**，只能读 pane：
+2. **The board pane's output does not go to the plugin log**, you have to read the pane:
 
    ```bash
    herdr pane list --json | jq -r '.result.panes[]|select(.label=="Herdr Sessions")|.pane_id'
-   herdr pane read <看板pane_id> --lines 200
+   herdr pane read <board_pane_id> --lines 200
    ```
 
-3. **开 debug。** 把 `LOG_LEVEL=debug` 写进 `.env`，关掉看板标签页再重新打开。debug 会逐条
-   打出每个 session 为什么建行 / 不建行。
+3. **Turn on debug.** Put `LOG_LEVEL=debug` into `.env`, then close the board tab and
+   reopen it. debug prints, line by line, why each session got a row or did not.
 
-#### opencode server 找不到？
+#### Can't find the OpenCode server?
 
-自动探测的顺序是：`.env` 里的显式 `OPENCODE_SERVER_URL` → 默认端口 `4096` → 扫监听端口
-挑进程名含 `opencode` 的逐个试。
+The auto-detection order is: an explicit `OPENCODE_SERVER_URL` in `.env` → the default
+port `4096` → scan the listening ports and try every one whose process name contains
+`opencode`.
 
-最后一步依赖系统的 `lsof`（Linux 上优先用 `ss`，来自 `iproute2`）。**两个都没有时不会
-报错** —— 候选地址里就只剩默认端口，而你的 server 在别的端口上，于是永远连不上，表现和
-「插件坏了」一模一样。server 跑在非默认端口时也是这个症状。
+The last step depends on the system `lsof` (on Linux `ss` is preferred, from `iproute2`).
+**If you have neither, there is no error** — the only candidate left is the default port,
+your server is on a different port, so it never connects, and the symptom is identical to
+"the plugin is broken". A server running on a non-default port produces the same symptom.
 
-两个办法二选一：装上 `lsof`（或 `iproute2`），或者在 `.env` 里直接写死：
+Pick one of two fixes: install `lsof` (or `iproute2`), or hardcode it in `.env`:
 
 ```bash
 OPENCODE_SERVER_URL=http://127.0.0.1:4096
 ```
 
-## 配置
+## Configuration
 
-写在 `herdr plugin config-dir herdr-parallel-sessions-display` 指出的目录下的 `.env`。
-完整的带注释版本见 [`config/.env.example`](config/.env.example)。
+It goes into `.env` under the directory that
+`herdr plugin config-dir herdr-parallel-sessions-display` points at. The complete
+commented version is in [`config/.env.example`](config/.env.example).
 
-| 键 | 默认 | 说明 |
+| Key | Default | Notes |
 | --- | --- | --- |
-| `OPENCODE_SERVER_URL` | 空 | 显式指定地址，如 `http://127.0.0.1:4096`。留空则自动探测 |
-| `OPENCODE_SERVER_USERNAME` | `opencode` | Basic Auth 用户名 |
-| `OPENCODE_SERVER_PASSWORD` | 空 | Basic Auth 密码 |
-| `MIRROR_LABEL` | `Sessions` | **兜底**工作区名，仅当某目录匹配不上任何工作区时才会建 |
-| `MIRROR_TAB_LABEL` | `oc-sessions` | 每个目录在自己工作区里那个镜像标签页的名字 |
-| `AUTO_START` | `false` | Herdr 恢复后自动拉起管理器 |
-| `INSTALL_AGENT_VIEW` | `false` | 是否安装全局 Agents 视图投影 |
-| `POLL_INTERVAL_MS` | `5000` | 轮询兜底间隔 |
-| `IDLE_GRACE_MS` | `15000` | 转为非活跃后保留行的宽限时间 |
-| `AGENT_VIEW_SCOPE` | `mirror` | 投影范围：`mirror` 只显示镜像行 / `sort-only` 只排序 |
-| `RESUME_MODE` | — | **已废弃**，写了会被忽略并在启动日志里提示。恢复命令恒为常驻进程，见下 |
-| `MIRROR_PANE_RATIO` | `0.5` | 初始切分比例，建完立刻被重平衡覆盖 |
-| `MIRROR_PANE_DIRECTION` | `down` | 排列方向 `down` / `right` |
-| `MIRROR_INLINE` | `true` | **内联模式**：完全不建镜像 pane / `oc-sessions` 标签页，见下。`false` = 回到「每个 session 一个镜像行」的旧模型 |
-| `PARALLEL_TOKEN_MAX` | `78` | `oc_par` token 的值上限。Herdr 侧对单个 token 值硬截断在 80 字符 |
-| `PARALLEL_CONNECTOR` | `bar` | 会话行的连接符：`bar`（`│▸ ● 标题`，竖线通到底、整列对齐）/ `tree`（`├─ ▸ 标题`）/ `none`（`▸ 标题`） |
-| `PARALLEL_BUSY_FRAME_MS` | `150` | 转轮每帧多少毫秒。10 帧 × 150ms ≈ 1.5s 一轮 |
-| `PARALLEL_BUSY_ANIMATE` | `false` | **默认关**（实测要多花 8% 单核）。想看点阵转轮见下 |
-| `PARALLEL_BUSY_FRAMES` | `●` | 「正在跑」标记的**帧序列**。默认单字符 = 实心圆、静态 |
-| `PARALLEL_TRUNK` | 空 | session 行树状前缀里的父级竖线（`│`）。默认空 —— 想加回来设成 `│` 之类的非空白字符（空格存不住，Herdr 会 trim） |
-| `INLINE_ALWAYS_LIST` | `true` | 该 agent 的工作区里没有并行 session 时，**官方 session 自己那一行**还要不要写。模板里已经没有 `terminal_title_stripped` 了，关掉就等于官方标题消失 |
-| `REBALANCE_INTERVAL_MS` | `30000` | 常规重平衡巡检间隔。建行/回收时是即时的，这里只负责把别人（sidebar 插件、用户手动拖动）改乱的布局纠回来 |
-| `FOCUS_REDIRECT` | `true` | 焦点落到镜像行时，自动转到同目录真正的前台 agent，见下 |
-| `FOCUS_REDIRECT_COOLDOWN_MS` | `2500` | 同一个镜像行的重定向冷却，防抖 |
-| `SESSION_LIST_LIMIT` | `200` | 每页拉多少条会话 |
-| `SESSION_PAGE_LIMIT` | `8` | 最多翻几页找活跃 session |
-| `RETRY_DETECTION` | `true` | 是否探测「正在重试」状态（v2 下每 session 多一次请求） |
-| `RETRY_CHECK_LIMIT` | `8` | 每轮最多探测多少个 session |
-| `AUTO_AUTH_SERVICE_JSON` | `true` | 允许自动读 `~/.config/opencode/service.json` 的密码 |
-| `DISCOVERY_BACKOFF_MAX_MS` | `60000` | 服务端不可达时的退避上限 |
-| `LOG_LEVEL` | `info` | `debug` 适合排查问题 |
-| `CODEX_ENABLED` | `true` | 是否采集 codex 的 session。关掉就完全不连 codex 的 app-server |
-| `CODEX_SOCKET` | 空 | codex app-server 控制 socket 路径。留空用默认 `~/.codex/app-server-control/app-server-control.sock` |
-| `CODEX_CLIENT_NAME` | `herdr-parallel-sessions-display` | `initialize` 握手里上报的客户端名 |
-| `CODEX_SOURCE_KINDS` | 空 | 留空 = 内置 `cli,exec,appServer,vscode`（排除法滤掉子 agent）。**不要只填 `cli`**，实测会把 vscode 源的会话全滤掉且不报错 |
-| `CODEX_SESSION_LIMIT` | `100` | 每页拉多少条 thread |
-| `CODEX_TIMEOUT_MS` | `8000` | 单次 app-server 请求超时 |
-| `CODEX_ADOPT_SESSION` | `true` | 官方行没有 `agent_session` 时，由插件以 `herdr:codex` 的身份补报一次（读的是 codex 自己的 app-server，写的是真实 thread id）。**不补的话 codex 在 TUI 刚启动、还没跑过一轮对话时完全不可见**，见下 |
-| `CLAUDE_ENABLED` | `true` | 是否采集 Claude Code 的 session。关掉会撤掉 claude 行上已挂的列表 |
-| `CLAUDE_BIN` | 空 | `claude` 可执行文件的路径，留空用 PATH 上的。**GUI 起的 Herdr 进程的 PATH 未必和你终端一样**，终端里 `claude` 能跑、看板面板里 spawn 不到时就填绝对路径 |
-| `CLAUDE_TIMEOUT_MS` | `8000` | 单次 `claude agents --json` 超时。实测正常调用约 260ms |
-| `CLAUDE_POLL_MS` | `10000` | claude 的采集节奏（**与主循环的 5 秒独立**）。每次采集要 spawn 一次，按 5 秒就是每 20 秒白花 260ms 常驻开销 |
-| `CLAUDE_SESSION_LIMIT` | `50` | 最多认多少个会话（新的优先） |
-| `CLAUDE_ADOPT_SESSION` | `true` | 官方行没有 `agent_session` 时，由插件以 `herdr:claude` 的身份补报一次（写的是真实 session id）。**不补的话 claude 的会话一条都不显示**，见下 |
-| `CLAUDE_READ_TITLES` | `true` | 标题是默认显示名时，读 transcript 的首条用户消息来兜底。只读文件头部 64KB 且按会话记忆化 |
+| `OPENCODE_SERVER_URL` | empty | Explicit address, e.g. `http://127.0.0.1:4096`. Left empty means auto-detection |
+| `OPENCODE_SERVER_USERNAME` | `opencode` | Basic Auth username |
+| `OPENCODE_SERVER_PASSWORD` | empty | Basic Auth password |
+| `MIRROR_LABEL` | `Sessions` | Name of the **fallback** workspace, only created when a directory matches no workspace at all |
+| `MIRROR_TAB_LABEL` | `oc-sessions` | Name of the mirror tab each directory gets inside its own workspace |
+| `AUTO_START` | `false` | Bring the manager up automatically after Herdr restores |
+| `INSTALL_AGENT_VIEW` | `false` | Whether to install the global Agents view projection |
+| `POLL_INTERVAL_MS` | `5000` | Polling fallback interval |
+| `IDLE_GRACE_MS` | `15000` | How long a row is kept after it turns inactive |
+| `AGENT_VIEW_SCOPE` | `mirror` | Projection scope: `mirror` shows only mirror rows / `sort-only` only sorts |
+| `RESUME_MODE` | — | **Deprecated**, ignored if set and noted in the startup log. The resume command is always the resident process, see below |
+| `MIRROR_PANE_RATIO` | `0.5` | Initial split ratio, overwritten by the rebalance the moment the pane is created |
+| `MIRROR_PANE_DIRECTION` | `down` | Layout direction `down` / `right` |
+| `MIRROR_INLINE` | `true` | **Inline mode**: no mirror panes and no `oc-sessions` tabs at all, see below. `false` = back to the old one-mirror-row-per-session model |
+| `PARALLEL_TOKEN_MAX` | `78` | Upper bound for the `oc_par` token value. Herdr hard-truncates a single token value at 80 characters |
+| `PARALLEL_CONNECTOR` | `bar` | Connector for session rows: `bar` (`│▸ ● title`, the bar runs all the way down and the whole column lines up) / `tree` (`├─ ▸ title`) / `none` (`▸ title`) |
+| `PARALLEL_BUSY_FRAME_MS` | `150` | Milliseconds per spinner frame. 10 frames × 150ms ≈ 1.5s per cycle |
+| `PARALLEL_BUSY_ANIMATE` | `false` | **Off by default** (measured: it costs 8% more of a single core). See below for the braille dot matrix spinner |
+| `PARALLEL_BUSY_FRAMES` | `●` | The **frame sequence** of the "running" marker. The single-character default is a solid dot, static |
+| `PARALLEL_TRUNK` | empty | The parent bar (`│`) in the tree prefix of session rows. Empty by default — to bring it back, set a non-whitespace character such as `│` (spaces do not survive, Herdr trims them) |
+| `INLINE_ALWAYS_LIST` | `true` | Whether the **official session's own row** is still written when that agent's workspace has no parallel session. `terminal_title_stripped` is already gone from the template, so turning this off means the official title disappears |
+| `REBALANCE_INTERVAL_MS` | `30000` | Interval of the routine rebalance sweep. Creating and reaping rows are immediate, this only fixes layout that somebody else (a sidebar plugin, a user dragging panes) has messed up |
+| `FOCUS_REDIRECT` | `true` | When focus lands on a mirror row, jump to the real foreground agent in the same directory, see below |
+| `FOCUS_REDIRECT_COOLDOWN_MS` | `2500` | Redirect cooldown for the same mirror row, debounce |
+| `SESSION_LIST_LIMIT` | `200` | How many sessions to fetch per page |
+| `SESSION_PAGE_LIMIT` | `8` | How many pages to walk at most while looking for active sessions |
+| `RETRY_DETECTION` | `true` | Whether to probe for the "retrying" state (on v2 that is one extra request per session) |
+| `RETRY_CHECK_LIMIT` | `8` | How many sessions to probe per round at most |
+| `AUTO_AUTH_SERVICE_JSON` | `true` | Allow reading the password from `~/.config/opencode/service.json` automatically |
+| `DISCOVERY_BACKOFF_MAX_MS` | `60000` | Upper bound for the backoff when the server is unreachable |
+| `LOG_LEVEL` | `info` | `debug` is the one you want for troubleshooting |
+| `CODEX_ENABLED` | `true` | Whether to collect Codex sessions. Off means the Codex app-server is never contacted at all |
+| `CODEX_SOCKET` | empty | Path to the Codex app-server control socket. Empty uses the default `~/.codex/app-server-control/app-server-control.sock` |
+| `CODEX_CLIENT_NAME` | `herdr-parallel-sessions-display` | Client name reported in the `initialize` handshake |
+| `CODEX_SOURCE_KINDS` | empty | Empty = built-in `cli,exec,appServer,vscode` (sub-agents are filtered out by exclusion). **Do not put only `cli`**, measured: it filters out every vscode-sourced session without complaining |
+| `CODEX_SESSION_LIMIT` | `100` | How many threads to fetch per page |
+| `CODEX_TIMEOUT_MS` | `8000` | Timeout for a single app-server request |
+| `CODEX_ADOPT_SESSION` | `true` | When the official row has no `agent_session`, the plugin backfills one as `herdr:codex` (it reads from Codex's own app-server and writes the real thread id). **Without the backfill Codex is completely invisible while the TUI has just started and has not run a single turn yet**, see below |
+| `CLAUDE_ENABLED` | `true` | Whether to collect Claude Code sessions. Turning it off removes the lists already mounted on Claude rows |
+| `CLAUDE_BIN` | empty | Path to the `claude` executable, empty uses the one on `PATH`. **The PATH of a GUI-launched Herdr is not necessarily the same as your terminal's**, so if `claude` runs in the terminal but the board pane cannot spawn it, put the absolute path here |
+| `CLAUDE_TIMEOUT_MS` | `8000` | Timeout for a single `claude agents --json`. Measured: a normal call takes about 260ms |
+| `CLAUDE_POLL_MS` | `10000` | Claude's collection cadence (**independent of the main loop's 5 seconds**). Every collection spawns one process, so at 5 seconds you burn 260ms of resident time every 20 seconds for nothing |
+| `CLAUDE_SESSION_LIMIT` | `50` | How many sessions to recognize at most (newest first) |
+| `CLAUDE_ADOPT_SESSION` | `true` | When the official row has no `agent_session`, the plugin backfills one as `herdr:claude` (it writes the real session id). **Without the backfill not a single Claude session shows up**, see below |
+| `CLAUDE_READ_TITLES` | `true` | When the title is the default display name, fall back to the first user message of the transcript. Only the first 64KB of the file is read, and it is memoized per session |
 
-改完 `.env` 需要重启看板面板（关掉标签页再打开）才生效。
+After editing `.env` you have to restart the board pane (close the tab and reopen it) for it
+to take effect.
 
-### 关于恢复命令（`RESUME_MODE` 已废弃）
+### About the resume command (`RESUME_MODE` is deprecated)
 
-恢复命令**恒为常驻进程**（`node mirror.mjs`），镜像 pane 内绝不运行 opencode。
+The resume command is **always the resident process** (`node mirror.mjs`), and OpenCode
+never runs inside a mirror pane.
 
-曾经有个 `RESUME_MODE=opencode` 选项，恢复命令是 `opencode --session <id>`，理由是
-「重启后镜像行还能接着聊」。**实测证明它会摧毁整个插件，已删除**：Herdr 重启时它在
-镜像 pane 里拉起 opencode TUI，官方集成随即在**同一个 pane** 上报官方 agent 行，把
-`oc_mirror` / `oc_session` 标记直接覆盖掉 —— 不是多出一行重复行，而是**这一行整个
-消失**。同时状态文件里 `paneId` 还在，插件以为它活着，既不重建也不让出，该目录的镜像
-功能静默失效。
+There used to be a `RESUME_MODE=opencode` option whose resume command was
+`opencode --session <id>`, on the theory that "after a restart the mirror row can keep
+chatting". **Measurement showed it destroys the whole plugin, and it has been deleted**: on
+a Herdr restart it launched the OpenCode TUI inside the mirror pane, and the official
+integration immediately reported the official agent row on **the same pane**, overwriting
+the `oc_mirror` / `oc_session` markers outright — not one extra duplicate row, but **the
+whole row disappearing**. Meanwhile `paneId` was still in the state file, so the plugin
+thought it was alive, neither rebuilt the row nor yielded it, and mirroring for that
+directory silently stopped working.
 
-> 旧文档里写「下一轮去重会看到该 session 已被占用，主动让出这一行，所以不会出现重复
-> 行」—— 这个推理假设官方集成会**新增**一行，实测是**覆盖**同一行。
+> The old docs claimed "the next dedupe round sees the session is already taken and yields
+> the row, so no duplicate row ever appears" — that reasoning assumes the official
+> integration **adds** a row. Measured, it **overwrites** the same row.
 
-想在某个镜像位置直接和 session 对话，手动敲 `opencode --session <id>` 即可：那一行会
-变成官方行，插件检测到标记丢失后主动让出，不会打架。
+To talk to a session directly at a mirror position, just type `opencode --session <id>`
+yourself: that row becomes the official row, the plugin detects the lost markers and yields
+it by itself, and the two do not fight.
 
-### 内联模式（默认）：不建任何 pane
+### Inline mode (default): no panes at all
 
-`MIRROR_INLINE=true` 时插件**不创建任何镜像 pane，也不创建 `oc-sessions` 标签页**。
-它用 `pane.report_metadata` 的 `--applies-to-source` 把 session 列表作为
-`$oc_sess*` token 挂到该目录**官方 agent 行**上，而**不接管那一行**：
+With `MIRROR_INLINE=true` the plugin **creates no mirror panes and no `oc-sessions` tabs**.
+It uses `--applies-to-source` of `pane.report_metadata` to hang the session list as
+`$oc_sess*` tokens off that directory's **official agent row**, and it **does not take over
+that row**:
 
-- 实测 `agent` 字段和 `agent_session.source` 都不受影响
-- 官方集成随后重报（`working` → `idle`）token 照样存活
-- 侧边栏里因此**只有官方行**，点击天然就跳到真正的前台 agent
+- measured: neither the `agent` field nor `agent_session.source` is affected
+- when the official integration re-reports (`working` → `idle`) the tokens survive anyway
+- so the sidebar contains **only official rows**, and clicking one naturally lands on the
+  real foreground agent
 
-`~/.config/herdr/config.toml` 的侧边栏模板：
+The sidebar template in `~/.config/herdr/config.toml`:
 
 ```toml
 [ui.sidebar.agents]
@@ -318,515 +366,625 @@ rows = [
 ]
 ```
 
-效果是 ASCII 树状图，**官方 session 也在里面**（用 `▸` 点出）：
+The result is an ASCII tree, and **the official session is in it too** (marked with `▸`):
 
 ```
 [1] afloat
 ◐ opencode
-│▸ ● 排查 Shell 重载启动初始化卡顿      ← 官方 TUI 当前选中的
-│  ● 排查Shell启动时壁纸揭露过渡卡顿      ← 切走但还在跑的
-│  ○ Tray hover二级菜单点击收起无退场效果…
+│▸ ● Debugging the slow init of Shell reload startup    ← the one the official TUI has selected
+│  ● Debugging the wallpaper reveal transition on shell startup    ← switched away but still running
+│  ○ Tray hover 2nd-level menu collapse, no exit animation…
 ```
 
-连接符可换（`PARALLEL_CONNECTOR`）：
+The connector is switchable (`PARALLEL_CONNECTOR`):
 
-| 值 | 效果 |
+| Value | Result |
 | --- | --- |
-| `bar`（默认） | `│▸ ● 标题` —— 竖线通到底，标记和标题整列对齐 |
-| `tree` | `├─ ▸ 标题` / `└─ 标题` —— 经典树状连接符 |
-| `none` | `▸ 标题` —— 完全不加前缀 |
+| `bar` (default) | `│▸ ● title` — the bar runs to the bottom, markers and titles line up as one column |
+| `tree` | `├─ ▸ title` / `└─ title` — the classic tree connectors |
+| `none` | `▸ title` — no prefix at all |
 
-`bar` 模式下官方行占 `▸ ` 两格、其余行用两个空格补位，所以所有行对齐。补出来的
-是**中间**的空格，不受 Herdr trim 前导空白的影响。
+In `bar` mode the official row takes the two cells of `▸ ` and every other row is padded
+with two spaces, so all rows line up. The padding is **interior** whitespace, which Herdr's
+trim of leading whitespace does not touch.
 
-### 「正在跑」的标记：实心圆（点阵转轮保留但默认不启用）
+### The "running" marker: a solid dot (the braille dot matrix spinner is kept but not enabled by default)
 
-默认是**实心圆 `●`，静止**。
+By default it is a **solid dot `●`, motionless**.
 
-想让这个标记像 opencode v2 那样转起来是可以的（下面说怎么开），但**默认关**——实测转轮
-期间约 12% 单核、关掉 4%，多花的那 8% 换来的观感提升有限：同一行的 `state_icon` 本来就
-在用 Herdr 自己的点阵转轮（`⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏`），**转起来的是那一行，不是我们这个标记**。
+Making this marker spin like OpenCode v2 is possible (see below for how), but it is **off
+by default** — measured: about 12% of a single core while spinning versus 4% with it off,
+and the extra 8% buys very little visually: the `state_icon` on the same row is already
+running Herdr's own braille dot matrix spinner (`⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏`), and **it is that row that
+spins, not our marker**.
 
-**为什么默认的实心圆不是点阵**：opencode v2 的运行指示器
-（[`session-progress-indicator-v2.tsx`](https://github.com/anomalyco/opencode/blob/1ddb0873aee50d209d1a8d7f91b89c5daf692d49/packages/session-ui/src/v2/components/session-progress-indicator-v2.tsx)）
-是 5×5 共 25 个点的点阵，靠改 opacity 播对角波纹。侧边栏复现不了原样：token 是静态文本、
-换行会被去掉、值硬截断 80 字符、Herdr 不会替我们播动画，那个二维点阵画不进一行。
+**Why the default solid dot is not a dot matrix**: OpenCode v2's running indicator
+([`session-progress-indicator-v2.tsx`](https://github.com/anomalyco/opencode/blob/1ddb0873aee50d209d1a8d7f91b89c5daf692d49/packages/session-ui/src/v2/components/session-progress-indicator-v2.tsx))
+is a 5×5 matrix of 25 dots animated by changing opacity along a diagonal wave. The sidebar
+cannot reproduce that as-is: a token is static text, newlines are stripped, values are
+hard-truncated at 80 characters, and Herdr does not animate on our behalf — a
+two-dimensional dot matrix does not fit into one line.
 
-**想开点阵转轮**（两项都要设，只设序列仍然是静帧）：
+**To turn the braille dot matrix spinner on** (you need both settings, setting only the
+sequence still gives you a still frame):
 
 ```bash
 PARALLEL_BUSY_FRAMES=⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏
 PARALLEL_BUSY_ANIMATE=true
-PARALLEL_BUSY_FRAME_MS=300    # 3s 一轮，开销约减半
+PARALLEL_BUSY_FRAME_MS=300    # 3s per cycle, roughly half the cost
 ```
 
-**动画怎么实现的**：Herdr 只会为它自己的 `state_icon` 播动画，自定义 token 拿不到，所以
-插件得周期性地把下一帧写回去。为此单开了一个 ticker 而**没有**把主重算循环跑快 —— 主循环
-一轮要做的事很重（拉活跃集合、扫会话、扫 pane、查权限），为了一次 150ms 的动画去跑它会
-把 Herdr 和 opencode 拖垮。ticker 只在内存里换字：主循环渲染完把带忙标记的行缓存下来
-（标记换成占位符），ticker 只负责把占位符换成下一帧写回去，不做任何查询。**没有忙标记时
-定时器直接停掉，空闲期零开销。**
+**How the animation works**: Herdr only animates its own `state_icon`, custom tokens get
+nothing, so the plugin has to write the next frame back periodically. It opens a separate
+ticker for that and deliberately **does not** speed up the main recompute loop — one round
+of the main loop is heavy (fetch the active set, scan sessions, scan panes, query
+permissions), and running it for a 150ms animation would drag Herdr and OpenCode down.
+The ticker only swaps characters in memory: after the main loop has rendered, it caches the
+rows that carry a busy marker (marker replaced by a placeholder), and the ticker only swaps
+the placeholder for the next frame and writes it back, doing no queries at all. **When there
+is no busy marker the timer stops outright: zero cost while idle.**
 
-**开销实测**：12%（转轮）vs 4%（关闭）。瓶颈**不在**进程 spawn —— 为此专门加了走 socket
-的写入路径，只省了 2%（14% → 12%）；真正省不掉的是 Herdr 每次 token 变化都要重绘侧边栏，
-4 个忙行 × 6.7 次/秒 ≈ 27 次/秒。所以帧率必须可调，这就是默认关它的原因。
+**Measured cost**: 12% (spinning) versus 4% (off). The bottleneck is **not** process
+spawning — a socket-based write path was added specifically for this and it only saved 2%
+(14% → 12%); what cannot be saved is that Herdr repaints the sidebar on every token change,
+4 busy rows × 6.7/s ≈ 27 repaints per second. So the frame rate has to be adjustable, which
+is exactly why it is off by default.
 
-官方那一行也由插件生成，是因为内置 `terminal_title_stripped` 拿不到树形连接线
-（内置 token 内容不可改，`rules` 只能改样式），两种格式混在一起会因为缩进不一致而
-读不出层级 —— 插件行反而比它 supposed 的父节点更靠左。
+The official row is generated by the plugin as well, because the built-in
+`terminal_title_stripped` cannot carry a tree connector (built-in token contents are not
+editable and `rules` only change styles), and mixing the two formats makes the hierarchy
+unreadable because the indents disagree — the plugin row ends up further left than the
+parent node it is supposed to sit under.
 
-**为什么缩进用 `├─` 而不是空格**：Herdr 会 **trim 自定义 token 的前导空白**
-（实测传 `"  └─ x"` 存下来是 `"└─ x"`），Unicode 空白字符（U+00A0、U+2000–200A、
-U+3000）同样会被 trim。所以连接线只能自己写进 token 值里。想去掉 `├─` 换成别的写法，
-改插件的 `PARALLEL_TRUNK`。
+**Why the indent is `├─` and not spaces**: Herdr **trims leading whitespace in custom
+tokens** (measured: passing `"  └─ x"` stores `"└─ x"`), and Unicode whitespace (U+00A0,
+U+2000–200A, U+3000) is trimmed too. So the connector has to be written into the token
+value itself. If you want to drop `├─` and write it some other way, change the plugin's
+`PARALLEL_TRUNK`.
 
-**挂载点怎么选**：优先用官方 agent 行的 `foreground_cwd` 精确匹配——那个 pane 里跑着
-opencode TUI，前台进程的 cwd 就是它那个 session 的目录，实测每一行都对得上。匹配不
-上才退到「该目录 pane 最多且有官方行」。**不能只用 pane 数量**：实测
-`Software/herdr` 在 `w19` 里有 7 个 pane 的 cwd 指向它（用户在那儿跑了一堆
-herdr-sidebar 实例）、在 `w1J` 里只有 4 个，光按数量会挂到不相干的工作区。
+**How the mount point is chosen**: an exact match against the official agent row's
+`foreground_cwd` first — the OpenCode TUI runs in that pane, and the foreground process's
+cwd is the directory of its session; measured, every row matched. Only when that fails does
+it fall back to "the directory with the most panes that also has an official row". **Pane
+count alone is not enough**: measured, `Software/herdr` is the cwd of 7 panes in `w19` (the
+user runs a pile of herdr-sidebar instances there) and only 4 in `w1J`, so counting alone
+would mount into an unrelated workspace.
 
-**四个硬限制**（实测，不是保守估计）：
+**Four hard limits** (measured, not conservative estimates):
 
-- 单个 token 值**硬截断在 80 字符**。插件自己先算好，放不下就用 `+N` 收尾。
-- 值里的**换行会被去掉**，所以一个 token 只能渲染一行 → N 个 session 必须 N 个
-  token、N 个 row。
-- **前导空白被 trim**，所以空格缩进存不住。
-- **空槽位不渲染成空白行**，所以槽位可以放心加。现在 6 个（上限是 `rows` 共 16 行）。
+- A single token value is **hard-truncated at 80 characters**. The plugin does the
+  arithmetic itself and ends with `+N` when it does not fit.
+- **Newlines inside the value are stripped**, so one token can only render one line → N
+  sessions need N tokens and N rows.
+- **Leading whitespace is trimmed**, so indentation with spaces does not survive.
+- **Empty slots do not render as blank rows**, so slots can be added without worry. Six
+  right now (`rows` caps out at 16 lines in total).
 
-**已知的功能损失**：session 在用户没开 TUI 的目录下（典型是 `/tmp` 下的临时工程）时，
-那个工作区里没有可挂载的官方行，这条信息就**不显示**（日志里会说明是哪个 session、
-哪个目录）。想让这类 session 也可见，把 `MIRROR_INLINE` 设成 `false` 回到建 pane 模式。
+**Known loss of function**: when a session lives in a directory where the user has not
+opened a TUI (typically a scratch project under `/tmp`), that workspace has no official row
+to mount on, so the information is simply **not shown** (the log says which session and
+which directory). To make those sessions visible too, set `MIRROR_INLINE` to `false` and go
+back to the pane-creating model.
 
-### codex 支持
+### Codex support
 
-除了 opencode，插件也会读 **codex 正在跑的会话**，用同样方式挂到 codex 的官方 agent 行上。
-侧边栏里每个 agent 各显示自己那份列表，不会串。
+Besides OpenCode, the plugin also reads **the sessions Codex has running** and mounts them
+the same way, on Codex's official agent rows. Each agent shows its own list in the sidebar,
+they never mix.
 
-**怎么读到的**：走 codex 的 **app-server**（JSON-RPC over WebSocket），不是读 sqlite。
-实测 `~/.codex/state_5.sqlite` 的 `threads` 表直接读是 **0 行**（数据在 `-wal` 里），
-而 app-server 直接返回真实数据。
+**How it reads them**: through Codex's **app-server** (JSON-RPC over WebSocket), not by
+reading sqlite. Measured: reading the `threads` table of `~/.codex/state_5.sqlite` directly
+gives **0 rows** (the data is in `-wal`), while the app-server returns the real data
+straight away.
 
-用的是**共享 app-server 守护进程**（`~/.codex/app-server-control/app-server-control.sock`），
-因为只有连它才拿得到**实时状态**（`active` / `idle` / `notLoaded` / `systemError`）——
-自起一个实例虽然也能列出会话，但状态全是 `notLoaded`，分不出「正在跑」和「历史遗留」。
-守护进程本来就常驻，我们只是多一个客户端连接，不增加常驻成本。
+It uses the **shared app-server daemon**
+(`~/.codex/app-server-control/app-server-control.sock`), because only connecting to that
+one yields **live state** (`active` / `idle` / `notLoaded` / `systemError`) — starting your
+own instance can list sessions too, but every state comes back `notLoaded` and there is no
+way to tell "currently running" from "left over from the past". The daemon is resident
+anyway; we are just one more client connection, which adds no resident cost.
 
-**前置条件**：需要先装 herdr 的 codex 集成，它靠 hook 向 herdr 上报 agent 行：
+**Prerequisite**: install Herdr's Codex integration first, it reports agent rows to Herdr
+through a hook:
 
 ```bash
 herdr integration install codex
-herdr integration status        # 确认 codex: current
+herdr integration status        # confirm codex: current
 ```
 
-**没装的话 codex 的会话一行都不显示**——内联模式只往官方行上挂 token，没有官方行就
-无处可挂。插件采集到会话但找不到对应官方行时会打一条 info 日志说明这件事（只说一次）。
-注意这个命令会往 `~/.codex/hooks.json` 注入 hook，如果那文件里已有别的 hook（比如
-`dcg`），确认合并没有覆盖。
+**Without it not a single Codex session is displayed** — inline mode only mounts tokens
+onto official rows, and with no official row there is nowhere to mount. When the plugin
+collects sessions but cannot find a matching official row it writes one info log line
+saying so (only once). Note that this command injects a hook into `~/.codex/hooks.json`; if
+that file already contains other hooks (say `dcg`), check that the merge did not clobber
+them.
 
-装完之后，开一个 codex 会话就能在侧边栏看到：
+Once that is in place, start a Codex session and the sidebar shows:
 
 ```
 [1] afloat
 ◐ codex
-├─ ▸ ● 你正在做的那个任务
-└─ ● 另一个还在跑的会话
+├─ ▸ ● The task you are working on
+└─ ● Another session that is still running
 ```
 
-**调优**：`CODEX_SOURCE_KINDS` 留空就是对的（内置 `cli,exec,appServer,vscode`，用排除法
-滤掉子 agent）。**不要只填 `cli`** —— 实测会把 vscode 源的会话全部滤掉，而且不报错，
-表现是列表凭空消失。子 agent 不单列。
+**Tuning**: leaving `CODEX_SOURCE_KINDS` empty is the right thing (built-in
+`cli,exec,appServer,vscode`, filtering sub-agents out by exclusion). **Do not put only
+`cli`** — measured, it filters out every vscode-sourced session and does not complain, and
+the symptom is the list simply vanishing. Sub-agents are not listed separately.
 
-### 为什么需要 `CODEX_ADOPT_SESSION`
+### Why `CODEX_ADOPT_SESSION` is required
 
-内联模式靠 `pane.report_metadata --applies-to-source` 往官方行上挂 token，而这个参数
-要求**目标 source 已经在那个 pane 上有记录**。没有记录时写完立刻消失（实测 `tokens`
-变 null）。
+Inline mode mounts tokens onto official rows via
+`pane.report_metadata --applies-to-source`, and that parameter requires **the target source
+to already have a record on that pane**. Without a record the write disappears immediately
+(measured: `tokens` goes null).
 
-codex 这边会真的缺：**Codex 0.160 的 `SessionStart` hook 在 TUI 启动时不触发**
-（二进制里是 `run_pending_session_start_hook`，挂起到会话真正开始干活才跑）。实测两种
-方式都确认过——直接观察 hook 是否被调用、以及用 `bypass_hook_trust` 排除「信任失效」
-这个干扰因素后重测，结论一致。
+On the Codex side it is genuinely missing: **Codex 0.160's `SessionStart` hook does not fire
+when the TUI starts** (in the binary it is `run_pending_session_start_hook`, deferred until
+the session actually starts working). Measured both ways — watching the hook directly, and
+re-running the test with `bypass_hook_trust` to rule out "trust expired" as a confounder.
+Both give the same answer.
 
-于是官方行一直空着 `agent_session`，codex 会话一条都显示不出来。所以插件会自己补报一次：
-从 **codex 自己的 app-server** 读出该目录的真实 thread id，以 `herdr:codex` 的身份写进
-`agent_session`。写的是真值，官方 hook 将来真跑起来时写的是同一个值。
+So the official row keeps an empty `agent_session` and not a single Codex session shows up.
+The plugin therefore backfills once: it reads the real thread id of that directory from
+**Codex's own app-server** and writes it into `agent_session` as `herdr:codex`. It writes
+the true value — the official hook, if it ever does run, writes the same value.
 
-补报之后，`agent_session.value` 就是 codex 的 thread id，和 app-server 返回的 `id` 完全
-对上——于是「用会话自己的标题而不是终端标题」这条精确匹配路径也顺带生效了。
+After the backfill, `agent_session.value` is Codex's thread id and matches the `id` the
+app-server returns exactly — which incidentally also brings the "use the session's own
+title instead of the terminal title" exact-match path into play.
 
-**挑哪个会话当「官方那个」**：用官方行的 `foreground_cwd` 精确匹配会话的 `cwd`。同目录
-有多个时，已补报过的那个仍然有效就继续用它，否则优先正在跑的，再否则取最近动过的。
+**Which session counts as "the official one"**: an exact match between the official row's
+`foreground_cwd` and the session's `cwd`. When several sessions share a directory, keep
+using the one already backfilled if it is still valid, otherwise prefer the one that is
+running, otherwise take the most recently touched.
 
-**关掉它**（`CODEX_ADOPT_SESSION=false`）就回到纯被动：只显示官方集成已经报上来的，绝不
-代替它写。代价是 codex 在跑完第一轮对话之前完全不可见。
+**Turning it off** (`CODEX_ADOPT_SESSION=false`) goes back to purely passive: only what the
+official integration has reported is shown, and the plugin never writes on its behalf. The
+price is that Codex is completely invisible until it has finished its first turn.
 
-> 顺带说明：`--applies-to-source herdr:codex` 猜一个 source 去挂是**挂不上**的，
-> token 写完再查就是 null。所以「补报」和「挂载」必须都做，缺一不可。
+> Worth mentioning while we are here: guessing a source for
+> `--applies-to-source herdr:codex` does **not** mount. The token is written and reads back
+> as null. So "backfill" and "mount" both have to happen, neither one is optional.
 
-### Claude Code 支持
+### Claude Code support
 
-同样把 **Claude Code 正在跑的会话**挂到 claude 的官方 agent 行上，显示方式和 codex 完全一致。
-**前置条件不一样**：不需要先 `herdr integration install claude` —— 在 Herdr 的某个 pane 里跑起
-claude 就有官方行了，而会话身份由插件自己补（见下）。
+It mounts **the sessions Claude Code has running** onto Claude's official agent rows the
+same way, rendered exactly like Codex. **The prerequisite is different**: you do not need
+`herdr integration install claude` first — the moment Claude runs inside some Herdr pane
+there is an official row, and the plugin fills in the session identity itself (see below).
 
-**怎么读到的**：`claude agents --json`。官方文档明说这是唯一受支持的程序化接口（`~/.claude/jobs/`
-和 `roster.json` 是非稳定接口、不要解析）。单次约 260ms，每 10 秒跑一次（`CLAUDE_POLL_MS`）；
-Herdr 里一个 claude 行都没有时连 spawn 都跳过。
+**How it reads them**: `claude agents --json`. The official docs say plainly that this is
+the only supported programmatic interface (`~/.claude/jobs/` and `roster.json` are unstable
+interfaces, do not parse them). One call takes about 260ms and runs every 10 seconds
+(`CLAUDE_POLL_MS`); when Herdr has not a single Claude row, even the spawn is skipped.
 
-**不用装守护进程**：`claude daemon status` 是 `not running` 时，正在跑的会话照样列得出来。
+**No daemon to install**: when `claude daemon status` reports `not running`, the sessions
+that are running are still listed.
 
-**标题**：Claude 默认给的显示名是 `herdr-fe` 这种（目录名 + 两个字符），没有信息量；后台任务
-还没拿到标题时甚至会拿自己的短 id 当名字。插件会去读该会话 transcript 的**首条用户消息**
-当标题（只读文件头部，按会话记忆化）。想关掉读盘设 `CLAUDE_READ_TITLES=false`，代价是那些
-会话显示成 `(无标题)`。
+**Titles**: Claude's default display name is something like `herdr-fe` (directory name plus
+two characters), which carries no information, and a background task that has not got a
+title yet will even use its own short id as a name. The plugin reads the session
+transcript's **first user message** and uses it as the title (only the head of the file,
+memoized per session). To turn the disk read off, set `CLAUDE_READ_TITLES=false`; the price
+is that those sessions display as `(无标题)`.
 
-### 为什么需要 `CLAUDE_ADOPT_SESSION`
+### Why `CLAUDE_ADOPT_SESSION` is required
 
-和 codex 同款问题，但原因不同：Herdr 0.9.3 的 claude 集成靠 hook 上报
-（`~/.claude/hooks/herdr-agent-state.sh`），**没装集成时 `herdr agent list` 给的 claude 行
-根本没有 `agent_session` 字段**。而内联模式只往「官方行」上挂 token，于是那些行一条都进不了，
-会话完全不可见。
+The same problem as Codex, but for a different reason: Herdr 0.9.3's Claude integration
+reports through a hook (`~/.claude/hooks/herdr-agent-state.sh`), and **with the integration
+not installed the Claude rows from `herdr agent list` have no `agent_session` field at
+all**. Inline mode only mounts tokens onto "official rows", so not one of those rows can be
+used and the sessions are completely invisible.
 
-所以插件会自己补报一次：以 `herdr:claude` 的身份把 `claude agents --json` 里的真实
-session id 写进那一行的 `agent_session`。写的是真值，官方 hook 将来真跑起来写的是同一个值。
-关掉它（`CLAUDE_ADOPT_SESSION=false`）就回到纯被动，代价是 claude 的会话一条都不显示。
+So the plugin backfills once: as `herdr:claude` it writes the real session id from
+`claude agents --json` into that row's `agent_session`. It writes the true value — the
+official hook, if it ever runs, writes the same value. Turning it off
+(`CLAUDE_ADOPT_SESSION=false`) goes back to purely passive, at the price that not a single
+Claude session is displayed.
 
-**挑哪个会话当「官方那个」**：这一步 claude 比 codex 准 —— Herdr 报的
-`foreground_process_group_id` 与 `claude agents` 里的 `pid` **逐字节相等**（实测
-`w1J:p12` → 2440557 → 某个 session id），所以是**精确匹配**而不是猜；后台任务的进程命令行里
-还直接带着 `--session-id <uuid>`。只有「那个会话压根没出现在列表里」这类情况才会退回按目录
-匹配（退回时日志里会写明「目录匹配（降级，pid 没对上）」）。
+**Which session counts as "the official one"**: Claude is more precise than Codex here —
+the `foreground_process_group_id` reported by Herdr is **byte-for-byte equal** to the `pid`
+in `claude agents` (measured: `w1J:p12` → 2440557 → some session id), so this is an **exact
+match** rather than a guess; the command line of a background task even carries
+`--session-id <uuid>` directly. Only cases like "that session never showed up in the list"
+fall back to matching by directory, and when they do, the log says `目录匹配（降级，pid 没对上）`
+("directory match (degraded, pid did not match)").
 
-### 关于 `FOCUS_REDIRECT`（只在 `MIRROR_INLINE=false` 时生效）
+### About `FOCUS_REDIRECT` (only active when `MIRROR_INLINE=false`)
 
-> `MIRROR_INLINE=true`（默认）下**这段不适用**：侧边栏里只有官方行，点它本来就跳官方
-> pane，订阅不会被建立。内联模式就是下面那条「让跳转落到有用的地方」的最终形态 ——
-> 连镜像行都不需要了。
+> With `MIRROR_INLINE=true` (the default) **this section does not apply**: the sidebar only
+> has official rows, clicking one jumps to the official pane anyway, and no subscription is
+> ever established. Inline mode is the end state of "make the jump land somewhere useful"
+> below — it does not even need mirror rows.
 
-Herdr 的侧边栏**没有「某行不可点击」的开关**。`agent.view.set` 只有 filter / sort /
-label；`AgentInfo` 里唯一相关的 `interactive_ready` 在 0.9.3 根本不返回；config 里
-没有相关项；插件 v1 明确排除非终端 UI。所以在旧的「建 pane」模型下，镜像行只能保持
-可点击。
+Herdr's sidebar has **no switch for "this row is not clickable"**. `agent.view.set` only
+offers filter / sort / label; the only relevant field in `AgentInfo`, `interactive_ready`,
+is not returned at all in 0.9.3; there is nothing in the config; and plugin v1 explicitly
+excludes non-terminal UI. So under the old "create panes" model, mirror rows can only stay
+clickable.
 
-`FOCUS_REDIRECT=true`（默认）时的行为是：**焦点一旦落到镜像 pane，就立刻转到该目录
-真正的前台 agent**——也就是 Herdr 自己侦测到、且不是我们上报的那一行。落点规则：
+With `FOCUS_REDIRECT=true` (the default) the behaviour is: **the moment focus lands on a
+mirror pane, it jumps straight to the real foreground agent of that directory** — the row
+Herdr detected itself and that is not one we reported. The landing rules:
 
-1. 先排除 `oc-sessions` 标签页里的候选。官方 opencode 有可能就开在这个标签页里
-   （镜像 pane 被官方集成接管后的遗留），跳过去等于没离开镜像标签页。
-2. 在用户自己的标签页里，优先当前聚焦的，其次 `working` → `blocked` → `idle` → `done`。
-3. 该工作区一个官方 agent 都没有时（例如 `Sessions` 兜底工作区）**不跳转**，保留原来
-   的只读卡片——弹到一个不对的 pane 比不弹更糟。
+1. Candidates inside the `oc-sessions` tab are excluded first. The official OpenCode may
+   well be running in that tab (a leftover from a mirror pane that the official integration
+   took over), and jumping there is the same as never leaving the mirror tab.
+2. Within the user's own tabs, prefer the currently focused one, then
+   `working` → `blocked` → `idle` → `done`.
+3. When the workspace has not a single official agent (for example the `Sessions` fallback
+   workspace) it **does not jump** and keeps the original read-only card — popping into the
+   wrong pane is worse than not popping at all.
 
-**副作用要知道**：焦点落在镜像 pane 上不只由点侧边栏行产生。按 `prefix+alt+N` 切工作区
-时 Herdr 会恢复该工作区上次聚焦的 pane，如果那正好是镜像 pane，同样会被弹走。多数
-情况下这是合心意的（你去这个工作区就是为了干活），但如果你就是想去 `oc-sessions` 标签页
-看看，会被弹回来，需要再点一次官方行。设 `FOCUS_REDIRECT=false` 可完全关掉。
+**Know the side effect**: focus landing on a mirror pane does not only come from clicking a
+sidebar row. When you switch workspaces with `prefix+alt+N`, Herdr restores whichever pane
+was focused last in that workspace, and if that happens to be a mirror pane it gets bounced
+too. Most of the time that is what you want (you went to that workspace to work), but if
+you specifically wanted to look at the `oc-sessions` tab you get bounced back and have to
+click the official row once more. Set `FOCUS_REDIRECT=false` to turn it off completely.
 
+`agent.view.set` is a **global** setting: it affects every agent in the whole Agents
+sidebar, not just mirror rows. So it is off by default. Once you enable it:
 
+- `AGENT_VIEW_SCOPE=mirror`: show only mirror rows (filtered by the reported `oc_mirror`
+  token)
+- `AGENT_VIEW_SCOPE=sort-only`: no filtering, only sorting by "needs attention first, then
+  most recently changed"
 
-`agent.view.set` 是**全局**设置，会影响整个 Agents 侧边栏的所有 agent，不只是镜像行。
-所以默认关闭。打开后：
+And it has no CLI wrapper; the plugin implements a bare socket client of its own
+(newline-delimited JSON).
 
-- `AGENT_VIEW_SCOPE=mirror`：只显示镜像行（按上报的 `oc_mirror` token 过滤）
-- `AGENT_VIEW_SCOPE=sort-only`：不过滤，只按「需要关注优先 + 最近状态变更」排序
+**One safety floor: the plugin never installs a filtered projection while there is not a
+single mirror row.** The filter is global, so in that state it would hide every row of the
+official integration and the sidebar would go straight to `no matching agents`. So when the
+mirror row count is 0 it degrades to `sort-only` automatically, and promotes itself back as
+soon as mirror rows return.
 
-而且它没有 CLI 封装，插件是自己写的一层裸 socket 客户端（newline-delimited JSON）。
+And this calibration logic runs once in **every operating mode** (startup / pane / action /
+once), so after you turn `INSTALL_AGENT_VIEW` off, running any action at all clears the
+projection — you never end up with "the config was turned off ages ago but the filter is
+still living inside a running Herdr".
 
-**一条安全底线：插件绝不会在「一条镜像行都没有」的时候安装带筛选的投影。**
-筛选是全局的，那种情况下会把官方集成的行全部隐藏掉，侧边栏直接变成
-`no matching agents`。所以镜像行为 0 时会自动降级成 `sort-only`，镜像行回来再自动升回去。
+### Making sidebar rows show readable titles
 
-而且这段校准逻辑在**每一种运行模式**（startup / pane / action / once）里都会跑一次，
-所以你把 `INSTALL_AGENT_VIEW` 关掉之后随便执行一个 action，投影就会被清掉 ——
-不会出现「配置早就关了，筛选还赖在运行中的 Herdr 里」的情况。
+Mirror rows report these tokens, and you can use them directly in your sidebar row template:
 
-### 让侧边栏行显示可读标题
-
-镜像行上报了这些 token，可以在你的侧边栏行模板里直接用：
-
-| token | 内容 | 例 |
+| token | Content | Example |
 | --- | --- | --- |
-| `$oc_title` | session 标题 | `Tray hover二级菜单点击收起无退场效果` |
-| `$oc_project` | 项目名（会话目录的 basename） | `afloat` |
-| `$oc_state` | 状态 | `working` |
-| `$oc_session` | opencode session id | `ses_f37dc43f...` |
-| `$oc_mirror` | 镜像行标记，恒为 `1` | `1` |
+| `$oc_title` | Session title | `Debugging the slow init of Shell reload` |
+| `$oc_project` | Project name (basename of the session directory) | `afloat` |
+| `$oc_state` | State | `working` |
+| `$oc_session` | OpenCode session id | `ses_f37dc43f...` |
+| `$oc_mirror` | Mirror row marker, always `1` | `1` |
 
-同时插件也会 `pane rename` 镜像 pane（`● afloat · Tray hover…`，40 字内），这个 label
-和终端标题是分开的两份数据。
+The plugin also `pane rename`s the mirror pane (`● afloat · Debugging the slow init…`,
+within 40 characters), and that label is separate data from the terminal title.
 
-> 注意：如果你装了 `herdr-sidebar` 这类插件，它的 `hs_title` token 优先级更高，会盖掉
-> 终端标题。要让镜像行按 `$oc_title` 显示，在**你自己的** sidebar 行模板里加
-> `$oc_title` 即可 —— 插件不会去改你其它插件的配置。
+> Note: if you have a plugin such as `herdr-sidebar` installed, its `hs_title` token has
+> higher priority and overrides the terminal title. To make mirror rows display
+> `$oc_title`, add `$oc_title` to **your own** sidebar row template — the plugin does not
+> go editing your other plugins' configuration.
 
-## 兼容的 opencode 版本
+## Compatible OpenCode versions
 
-插件同时适配 opencode v1 和 v2 的 HTTP 面，靠 `/api/info` 或 `/global/health` 自动判定：
+The plugin adapts to both the OpenCode v1 and v2 HTTP surfaces and decides automatically
+via `/api/info` or `/global/health`:
 
 | | v1 | v2 |
 | --- | --- | --- |
-| 健康检查 | `GET /global/health` | `GET /api/info`（v2 没有 health 路由） |
-| 活跃状态 | `GET /session/status` | `GET /api/session/active` |
-| 根会话 | `GET /session?roots=true` | `GET /api/session?parentID=null` |
-| 会话目录字段 | `directory` | `location.directory` |
-| 权限等待 | 只能靠 SSE | SSE + `GET /api/permission/request` 轮询兜底 |
-| SSE 事件名 | `event:` 字段 | `data:` 里 JSON 的 `type` 字段 |
+| Health check | `GET /global/health` | `GET /api/info` (v2 has no health route) |
+| Active state | `GET /session/status` | `GET /api/session/active` |
+| Root sessions | `GET /session?roots=true` | `GET /api/session?parentID=null` |
+| Session directory field | `directory` | `location.directory` |
+| Permission pending | SSE only | SSE + `GET /api/permission/request` polling fallback |
+| SSE event name | the `event:` field | the `type` field of the JSON inside `data:` |
 
-v2 的两个坑插件都处理了：SSE 会发 `: heartbeat` 注释行、事件名不在 `event:` 里；
-权限请求要靠 `x-opencode-directory` 头按目录分，所以是并发逐目录查再合并。
+The plugin handles both v2 traps: the SSE stream sends `: heartbeat` comment lines and the
+event name is not in `event:`; permission requests are separated per directory by the
+`x-opencode-directory` header, so it queries each directory concurrently and merges the
+results.
 
-`opencode serve --discoverable` 还没发布，所以 server 发现走：显式 URL → 默认端口 4096 →
-`ss -ltnp` / `lsof` 扫进程名含 opencode 的监听端口逐个验证。
+`opencode serve --discoverable` has not shipped yet, so server discovery goes: explicit
+URL → default port 4096 → `ss -ltnp` / `lsof` to scan listening ports whose process name
+contains opencode and verify them one by one.
 
-## 故障排查
+## Troubleshooting
 
-**先看插件日志：**
+**Start with the plugin logs:**
 
 ```bash
-# 看板面板的输出不进 plugin log，要走 pane read —— 先找到看板那个 pane：
+# The board pane's output does not go to the plugin log, you have to use pane read
+# —— first find the board's pane:
 herdr pane list --json | jq -r '.result.panes[] | select(.label=="Herdr Sessions") | .pane_id'
-herdr pane read <看板pane_id> --lines 200
+herdr pane read <board_pane_id> --lines 200
 ```
 
-调不出细节就把 `LOG_LEVEL=debug` 写进 `.env` 再重启看板。debug 级别会打出每个
-session 为什么建行 / 不建行（是让给真实 TUI 了，还是它是子 agent）。
-`.env` 里写了插件不认识的键时，启动日志会明确列出来（拼错的键同样会）——
-**看到这个 warn 就别再怀疑时序了，那个键根本没被读**。
+If you cannot get any detail, put `LOG_LEVEL=debug` into `.env` and restart the board. The
+debug level prints, for every session, why it got a row or did not (was it yielded to a
+real TUI, or is it a sub-agent). When `.env` contains a key the plugin does not recognize,
+the startup log lists it explicitly (misspelled keys included) — **once you see that warn,
+stop suspecting timing: the key was never read**.
 
-**侧边栏上的会话列表不更新了（关了看板标签页 / Herdr 重启之后最常见）：**
+**The session list in the sidebar stopped updating (most common after closing the board
+tab or restarting Herdr):**
 
-管理器就是那个看板标签页里的常驻进程。**它不在跑的时候插件什么都不做**，
-侧边栏上留下的是最后一次成功重算时的内容，看起来完全正常 —— 这就是最难认的
-一种「坏了」。确认与恢复：
+The manager is the resident process inside that board tab. **While it is not running the
+plugin does nothing at all**, and what remains in the sidebar is the content from the last
+successful recompute, which looks completely normal — this is the hardest kind of "broken"
+to recognize. How to confirm and how to recover:
 
 ```bash
-# 1) 看板在不在（看板标签页里那个 node 进程）
+# 1) Is the board there (the node process inside the board tab)?
 ps -ef | grep 'board\.mjs --mode pane' | grep -v grep
 
-# 2) 不在就拉起来。sync 动作会自己检查并重启它
+# 2) Not there? Bring it up. The sync action checks and restarts it by itself
 herdr plugin action invoke herdr-parallel-sessions-display.sync
 ```
 
-想让 Herdr 重启后自动拉起，把 `.env` 里的 `AUTO_START` 设成 `true`。
+To have it come up automatically after a Herdr restart, set `AUTO_START` to `true` in
+`.env`.
 
-**Agents 视图里一行都没有：**
+**Not a single row in the Agents view:**
 
-1. 看板面板是不是真的在跑？`herdr plugin pane open --plugin herdr-parallel-sessions-display --entrypoint board`
-2. opencode server 能不能访问？日志里搜「已连接 opencode」。没有这行说明没连上。
-   手动试一下：
+1. Is the board pane actually running? `herdr plugin pane open --plugin herdr-parallel-sessions-display --entrypoint board`
+2. Can the OpenCode server be reached? Search the log for `已连接 opencode`. If that line
+   is missing, it did not connect. Try it by hand:
 
    ```bash
    curl -s http://127.0.0.1:4096/api/info
    curl -s -u opencode:$OPENCODE_SERVER_PASSWORD http://127.0.0.1:4096/api/info
    ```
 
-3. server 是不是在非默认端口？直接写 `OPENCODE_SERVER_URL` 最省事。
-4. 日志里全是「让出 N 个」而 N 等于活跃 session 数？见下面「镜像行比预期少」。
+3. Is the server on a non-default port? Writing `OPENCODE_SERVER_URL` is the least effort.
+4. Is the log full of `让出 N 个` with N equal to the number of active sessions? See "Fewer
+   mirror rows than expected" below.
 
-**侧边栏突然空了 / 显示 `no matching agents`（最优先处理）：**
+**The sidebar suddenly went empty / shows `no matching agents` (handle this first):**
 
-这是插件的全局筛选投影把**官方的行也一起藏了**。先自救，再排查。
+The plugin's global filtering projection hid the **official rows as well**. Get yourself
+out first, then find out why.
 
 ```bash
-# 1) 先把投影清掉。只清「确实是本插件装的」那一份，不会动别人的视图。
+# 1) Clear the projection first. It only clears the one this plugin really installed,
+#    and will not touch anybody else's view.
 herdr plugin action invoke herdr-parallel-sessions-display.sync
 ```
 
-> 上面这条 action 一启动就会做投影校准：`INSTALL_AGENT_VIEW=false` 而插件以为自己装过时，
-> 会立刻 `agent.view.clear` 并把记录置空。侧边栏应该立刻恢复正常。
-> 任何一种运行模式（startup / 看板面板 / action / once）都会做同一件事，
-> 所以「重新打开看板面板」同样有效。
+> That action does the projection calibration the moment it starts: when
+> `INSTALL_AGENT_VIEW=false` but the plugin believes it installed one, it immediately runs
+> `agent.view.clear` and clears the record. The sidebar should recover right away. Every
+> operating mode (startup / board pane / action / once) does the same thing, so "reopen the
+> board pane" works just as well.
 
-然后再排查为什么筛选会在没有镜像行的时候装上：
+Then find out why the filter was installed while there were no mirror rows:
 
 ```bash
-# 2) 看板面板里搜这两行日志
-#    「重平衡镜像布局」      —— 说明镜像 pane 确实在
-#    「镜像行 N」            —— N=0 且投影仍带 filter 就是异常
+# 2) Search the board pane's log for these two lines
+#    「重平衡镜像布局」      —— it means the mirror panes really are there
+#    「镜像行 N」            —— N=0 while the projection still carries a filter is the anomaly
 herdr plugin pane open --plugin herdr-parallel-sessions-display --entrypoint board
-herdr pane read <看板pane_id> --lines 200
+herdr pane read <board_pane_id> --lines 200
 ```
 
-3. `.env` 里把 `INSTALL_AGENT_VIEW=false` 确认一遍，重启看板。
-4. 如果你**确实想要** `mirror` 范围：先让 opencode 那边至少有一个 session 在跑，
-   镜像行出现后插件会自动把投影升回带筛选的版本。
+3. Confirm `INSTALL_AGENT_VIEW=false` in `.env` and restart the board.
+4. If you **really** want the `mirror` scope: first get at least one session running on the
+   OpenCode side, and once mirror rows appear the plugin promotes the projection back to
+   the filtered version.
 
-**镜像行比预期少：**
+**Fewer mirror rows than expected:**
 
-日志里搜「让出 N 个」。`N` 等于活跃 session 数时说明所有 session 都被用户真实 TUI
-占着了 —— 这是正确行为，不是 bug。
+Search the log for `让出 N 个`. When `N` equals the number of active sessions, every
+session is taken by a real user TUI — that is correct behaviour, not a bug.
 
-**某一行还是没有名字（显示成 `'/usr/bin/node' …`）：**
+**One row still has no name (it displays as `'/usr/bin/node' …`):**
 
-侧边栏那一行的默认文本来自终端标题（OSC），镜像 pane 里跑的是 node 进程。
-插件已经用 `pane rename` 给 pane 起了可读名字，也上报了 `$oc_title` / `$oc_project`
-token。如果你装了 `herdr-sidebar`，它的 `hs_title` 优先级更高 —— 在你自己的 sidebar
-行模板里加 `$oc_title` 就行（见上面「让侧边栏行显示可读标题」）。
+The default text of that sidebar row comes from the terminal title (OSC), and what runs
+inside a mirror pane is a node process. The plugin has already given the pane a readable
+name with `pane rename` and has reported the `$oc_title` / `$oc_project` tokens. If you
+have `herdr-sidebar` installed, its `hs_title` has higher priority — just add `$oc_title`
+to your own sidebar row template (see "Making sidebar rows show readable titles" above).
 
-**镜像行状态一直不更新：**
+**A mirror row's state never updates:**
 
-看日志里的 `SSE up/down`。SSE 断了会自动重连并在日志里 warn；重连期间退化成
-`POLL_INTERVAL_MS` 轮询，权限等待的判定精度会下降但不会完全瞎。行会一直存在，
-只是 `blocked` 可能晚几秒才亮。
+Look at `SSE up/down` in the log. A dropped SSE reconnects automatically and warns in the
+log; while reconnecting it degrades to `POLL_INTERVAL_MS` polling, so permission pending is
+detected less precisely but not completely blind. The row stays there, only `blocked` may
+light up a few seconds late.
 
-**`Sessions` 兜底工作区不见了 / 镜像标签页残留：**
+**The `Sessions` fallback workspace is gone / mirror tabs are left over:**
 
 ```bash
 herdr plugin pane open --plugin herdr-parallel-sessions-display --entrypoint board
 herdr plugin action invoke herdr-parallel-sessions-display.reap
 ```
 
-`reap` 会先 release 再关掉所有镜像 pane，把每个目录的镜像标签页整页关掉，
-兜底工作区也关掉，映射清干净。session 还在跑的话，下一轮会重新建回来。
+`reap` releases first and then closes every mirror pane, closes each directory's mirror tab
+as a whole page, closes the fallback workspace too, and wipes the mappings clean. If the
+sessions are still running they are rebuilt on the next round.
 
-**行出现在了 `Sessions` 分组里，而不是项目分组里：**
+**Rows show up in the `Sessions` group instead of a project group:**
 
-说明那个 session 的目录在你的 herdr 里**没有对应的工作区**（你没在那个目录开过
-workspace/tab）。看板日志里会有一行：
+That means the session's directory has **no matching workspace** in your Herdr (you never
+opened a workspace/tab in that directory). The board log will have a line like:
 
 ```
 /tmp/xxx/yyy 没有对应的工作区，已归入 Sessions 兜底工作区
 ```
 
-解决办法：在那个目录下用 herdr 开一个 workspace（`herdr workspace create --cwd <目录>`），
-下一轮镜像就会自动挪进那个工作区，成为正确分组下的镜像行。
+Fix: create a workspace in that directory with Herdr
+(`herdr workspace create --cwd <dir>`), and the next mirror round moves itself into that
+workspace as a mirror row under the correct group.
 
-**同一目录的镜像行顺序会变：**
+**The order of mirror rows within the same directory changes:**
 
-镜像标签页内部的排列由平衡 BSP 树决定，等分空间。哪个 session 先跑就先建哪个，
-顺序不保证稳定 —— 分组是对的就行。
+The layout inside the mirror tab is decided by a balanced BSP tree that divides the space
+evenly. Whichever session starts first gets created first, so the order is not guaranteed
+stable — as long as the grouping is right that is fine.
 
-**claude 的会话一行都不显示：**
+**Not a single Claude session is displayed:**
 
-按顺序确认这三件事：
+Check these three things in order:
 
 ```bash
-# 1) Herdr 里到底有没有 claude 行？（内联模式只能挂在官方行上，没有行就无处可挂）
+# 1) Does Herdr actually have Claude rows at all? (inline mode can only mount on official
+#    rows; with no row there is nowhere to mount)
 herdr agent list | grep -o '"agent":"claude"' | head -1
 
-# 2) Claude Code 自己认不认这些会话？
+# 2) Does Claude Code itself recognize these sessions?
 claude agents --json
 
-# 3) claude 那个可执行文件在**看板进程**的 PATH 里吗？Herdr 是 GUI 起的，
-#    它的 PATH 未必和你终端一样。终端里能跑、插件里 spawn 不到就填 CLAUDE_BIN。
-herdr plugin config-dir herdr-parallel-sessions-display   # 把绝对路径写进 CLAUDE_BIN
+# 3) Is the claude executable on the PATH of the **board process**? Herdr is launched by
+#    the GUI, so its PATH is not necessarily your terminal's. If it runs in the terminal but
+#    the plugin cannot spawn it, set CLAUDE_BIN.
+herdr plugin config-dir herdr-parallel-sessions-display   # put the absolute path into CLAUDE_BIN
 ```
 
-- 第 1 步为空 = 没有 claude 跑在 Herdr 的 pane 里（后台 `claude -p` 的会话就属于这种，
-  没有 pane 就没有可挂载的行）。日志里会有
-  「Herdr 里没有 claude 的 agent 行（= 没有 claude 跑在 Herdr 的 pane 里），无处挂载」。
-- 有 claude 行但没补上身份 = 补报没成功。日志搜「补报 claude 会话身份」。
-  `pane.report_metadata --applies-to-source herdr:claude` 要求那个 pane 上已经有
-  `herdr:claude` 的记录，所以**补报必须排在挂载之前**。
-- 改完配置**必须重启看板标签页**才生效。
+- Step 1 coming back empty = no Claude is running inside a Herdr pane (background
+  `claude -p` sessions are exactly that, no pane means no row to mount). The log will
+  contain `Herdr 里没有 claude 的 agent 行（= 没有 claude 跑在 Herdr 的 pane 里），无处挂载`.
+- There are Claude rows but no identity was backfilled = the backfill did not succeed.
+  Search the log for `补报 claude 会话身份`.
+  `pane.report_metadata --applies-to-source herdr:claude` requires a record for
+  `herdr:claude` to already exist on that pane, so **the backfill must come before the
+  mount**.
+- After changing config you **must restart the board tab** for it to take effect.
 
-**claude 会话标题显示成 `(无标题)`：**
+**A Claude session title shows up as `(无标题)`:**
 
-说明那个会话的 transcript 里还没写出第一条用户消息（Claude Code 刚起、或用户还没发过话）。
-发一句话就会更新 —— 插件**不缓存**失败的解析就是为了这个。
+It means the transcript of that session has no first user message written yet (Claude Code
+just started, or the user has not said anything). One message and it updates — the plugin
+**does not cache** a failed parse, precisely for this.
 
-**claude 的状态停在十分钟前不动：**
+**Claude's state is stuck ten minutes in the past:**
 
-`CLAUDE_POLL_MS` 默认 10000 采一次。这是设计如此（省 CPU），不是卡住。想跟手设成 `5000`。
+`CLAUDE_POLL_MS` collects every 10000 by default. That is by design (it saves CPU), not a
+hang. If you want it snappier, set it to `5000`.
 
-**Herdr 重启后行没了：**
+**Rows are gone after a Herdr restart:**
 
-正常情况下 startup 钩子会从 `HERDR_PLUGIN_STATE_DIR` 恢复映射。检查两件事：
-`AUTO_START` 是否为 `true`（管理器得有人跑），以及 `resume_agents_on_restore`
-是否被关掉（那会让 Herdr 忽略所有恢复命令）。映射文件在插件 state 目录下的
-`state.json`，可以直接看。
+Normally the startup hook restores the mappings from `HERDR_PLUGIN_STATE_DIR`. Check two
+things: whether `AUTO_START` is `true` (something has to be running the manager), and
+whether `resume_agents_on_restore` has been turned off (that makes Herdr ignore every
+resume command). The mapping file is `state.json` in the plugin state directory, and you
+can read it directly.
 
-**行出现了但标题是 session id：**
+**Rows appear but the title is a session id:**
 
-说明那个 session 没出现在会话列表里（列表翻页没覆盖到，或者刚创建）。
-插件会退化成用 id 当标题，下轮拿到真实标题就会自动改。
+It means that session did not show up in the session list (pagination did not reach it, or
+it was just created). The plugin falls back to using the id as the title and fixes it
+automatically once the real title arrives.
 
-## 已知边界
+## Known limits
 
-- **一个运行中 session 一行 = 一个镜像 pane**，有终端资源成本。镜像集中在各目录自己的
-  `oc-sessions` 标签页里，不打开不占视野，但不是零成本。行数很多时每行会变矮、需要滚动 ——
-  插件不会因为放不下就拒绝建行。
-- **每个目录会在它的工作区里多出一个标签页**，叫 `oc-sessions`（前缀由 Herdr 加）。
-  关掉它不影响镜像行以外的任何东西；镜像重建时会自己再开一个。
-- **镜像标签页里会被 `herdr-sidebar` 注入一个 Sidebar pane**（它给每个标签页都注入）。
-  那个 pane 没有 agent 行，既不参与镜像的布局平衡，也不会挡住标签页回收。
-- **镜像行只读**。要交互得切回真实 TUI 手动换 session。
-- **状态准确性依赖 SSE**。断流时退化为轮询，`blocked` 精度下降。
-- **不碰官方集成文件**（`~/.config/opencode/plugins/herdr-agent-state.js` 等），
-  也不用 `herdr integration install/uninstall`。避免和官方集成抢同一个 pane 的状态归属。
-- **去重不靠 `agent_session`**。herdr 0.9.3 只给官方集成存原生 session 引用，
-  第三方 source 传了 `agent_session_id` 也会被省略（实测：`plugin:` / `user:` /
-  `custom:` source、带不带 `resume_argv`、seq 多大都一样）。所以去重走自己上报的
-  `oc_session` token，副作用是 Herdr 重启后的原生 session 恢复在镜像行上不可用。
-- **不接管第三方插件的显示层**。镜像行上报了 `$oc_title` / `$oc_project` / `$oc_state`
-  token 也设了 pane label，但 `herdr-sidebar` 的 `hs_title` 优先级更高，改它要你自己动手。
-- v2 下 `retry` 探测每个活跃 session 多一次 HTTP 请求，行多时可以在 `.env` 里
-  关掉 `RETRY_DETECTION`。
+The first three below apply only when `MIRROR_INLINE=false` (the old model, one mirror pane per
+session). The default inline mode creates no panes and no tabs, so none of that terminal
+resource cost applies.
 
-## 开发
+- **One row per running session = one mirror pane**, and that has a terminal resource cost.
+  The mirrors are collected into each directory's own `oc-sessions` tab, so they take up no
+  screen space until opened, but it is not free. With many rows each row gets shorter and
+  you have to scroll — the plugin never refuses to create a row because it does not fit.
+- **Each directory gains one extra tab in its workspace**, named `oc-sessions` (Herdr adds
+  a prefix). Closing it affects nothing except the mirror rows; when the mirrors are rebuilt
+  they open another one by themselves.
+- **`herdr-sidebar` injects a Sidebar pane into the mirror tab** (it injects into every
+  tab). That pane has no agent row, so it neither takes part in the mirror layout balancing
+  nor blocks the tab from being reaped.
+- **Mirror rows are read-only.** To interact you have to switch back to the real TUI and
+  change session by hand.
+- **State accuracy depends on SSE.** When the stream breaks it degrades to polling and
+  `blocked` gets less precise.
+- **It does not touch the official integration files**
+  (`~/.config/opencode/plugins/herdr-agent-state.js` and friends) and does not use
+  `herdr integration install/uninstall`. That avoids fighting the official integration over
+  who owns the state of the same pane.
+- **Deduplication does not rely on `agent_session`.** Herdr 0.9.3 only stores native session
+  references for the official integration, and a third-party source has `agent_session_id`
+  stripped even when it passes one (measured: with `plugin:` / `user:` / `custom:` sources,
+  with or without `resume_argv`, at any seq — all identical). So deduplication goes through
+  the `oc_session` token the plugin reports itself. The side effect is that native session
+  restore after a Herdr restart is unavailable on mirror rows.
+- **It does not take over the display layer of third-party plugins.** Mirror rows report
+  the `$oc_title` / `$oc_project` / `$oc_state` tokens and set a pane label, but
+  `herdr-sidebar`'s `hs_title` has higher priority, and changing that is on you.
+- On v2, `retry` detection costs one extra HTTP request per active session, and with many
+  rows you can turn `RETRY_DETECTION` off in `.env`.
 
-改这个插件本身之前，先读完这一节。想改插件的只有作者，`install` 是给用户用的、`link`
-是给作者用的，两者不要混。
+## Development
 
-### 本机开发流程
+Read this whole section before changing the plugin itself. Only the author works on the
+plugin: `install` is for users, `link` is for the author, and the two must not be mixed
+up.
+
+### Local development workflow
 
 ```bash
 git clone https://github.com/Sighthesia/herdr-parallel-sessions-display.git
 cd herdr-parallel-sessions-display
-herdr plugin link /绝对路径/herdr-parallel-sessions-display
+herdr plugin link /absolute/path/herdr-parallel-sessions-display
 ```
 
-`link` **不会执行 `[[build]]`**（本插件也没有构建步骤），它只是把当前工作目录注册进去，
-所以「能不能跑起来」这件事由你自己保证。改完代码**关掉看板标签页再重新打开**才生效 ——
-不关的话跑的还是旧代码。已经 `install` 过同一插件再 `link` 会被 Herdr 拒绝，先
-`herdr plugin unlink herdr-parallel-sessions-display`。
+`link` **does not run `[[build]]`** (this plugin has no build step anyway); it just registers
+the current working directory, so making sure it actually runs is up to you. After changing
+code you **must close the board tab and reopen it** for it to take effect — if you do not,
+the old code keeps running. If you already `install`ed the same plugin, Herdr refuses the
+`link`; run `herdr plugin unlink herdr-parallel-sessions-display` first.
 
-### 没有测试套件，验证只能真机联调
+### No test suite; verification is live testing on a real machine
 
-这个仓库**没有 `package.json`、没有第三方依赖、没有构建、没有 lint、没有 CI，也没有任何
-能离线跑的测试**。别去找测试框架、别加 CI，这套东西目前不存在。
+This repo has **no `package.json`, no third-party dependencies, no build, no lint, no CI and
+nothing that can run offline as a test**. Do not go looking for a test framework, do not add
+CI — none of that exists here.
 
-纯函数（例如 `parseSs` / `parseLsof`）可以用 `node -e` 单独断言，但**行为正确性只能真机跑**：
-打开看板、开几个 opencode / codex / claude 会话、看侧边栏。
+Pure functions (for example `parseSs` / `parseLsof`) can be asserted individually with
+`node -e`, but **behavioural correctness can only be verified live**: open the board, open a
+few opencode / codex / claude sessions, look at the sidebar.
 
-### 自检模式
+### Self-check mode
 
 ```bash
 node src/board.mjs --mode once
 ```
 
-跑一轮就退，不抢常驻锁。但正因为两者都往同一批 pane 上写 token，**它和常驻管理器并存时会
-互相覆盖侧边栏上的内容** —— 只在管理器不跑时用（或明知后果时再用）。
+It runs one round and exits, and it does not take the resident lock. But precisely because
+both write tokens to the same set of panes, **when it runs alongside the resident manager
+they overwrite each other's content in the sidebar** — only use it when the manager is not
+running (or when you know the consequence and use it anyway).
 
-### 怎么看日志
+### How to read the logs
 
-看板面板的输出**不进 plugin log**（`herdr plugin log list` 里找不到），只能走 pane：
+The board pane's output **does not go to the plugin log** (you will not find it in
+`herdr plugin log list`), you have to go through the pane:
 
 ```bash
 herdr pane list --json | jq -r '.result.panes[]|select(.label=="Herdr Sessions")|.pane_id'
-herdr pane read <看板pane_id> --lines 200
+herdr pane read <board_pane_id> --lines 200
 ```
 
-`LOG_LEVEL=debug` 写进 `.env` 并重启看板标签页后会逐条打出每个 session 建行 / 不建行的
-原因。`.env` 里写了插件不认识的键时，启动日志会 warn。
+With `LOG_LEVEL=debug` in `.env` and the board tab restarted, it prints, line by line, why
+each session got a row or did not. When `.env` contains a key the plugin does not
+recognize, the startup log warns.
 
-### 新增一个配置键必须同时改四处
+### Adding a config key means changing four places
 
-最容易踩的坑：`src/state.mjs` 里的 `CONFIG_DEFAULTS` 是**白名单**，不在里面的键会被
-`loadConfig` **静默丢弃** —— 表现是「改了配置完全没反应且没有任何提示」，历史上因此白配过
-七个键。新增一个键要同时改：
+The easiest trap to fall into: `CONFIG_DEFAULTS` in `src/state.mjs` is an **allowlist**, and
+keys that are not in it get **silently dropped** by `loadConfig` — the symptom is "I changed
+the config and absolutely nothing happened, with no hint at all", which historically wasted
+seven perfectly good keys. Adding a key means changing all of these:
 
-1. `src/state.mjs` 的 `CONFIG_DEFAULTS`
-2. `src/board.mjs` 的 `config` 对象
+1. `CONFIG_DEFAULTS` in `src/state.mjs`
+2. the `config` object in `src/board.mjs`
 3. [`config/.env.example`](config/.env.example)
-4. 本文档的「配置」表格
+4. the "Configuration" table in this document
 
-启动日志会对未知键打 warn（拼错的键也走这条路），看到就别再怀疑时序了 —— 那个键根本没被读。
+The startup log warns about unknown keys (misspelled keys take the same route); once you
+see it, stop suspecting timing — the key was never read.
 
-### 提交规范
+### Commit conventions
 
-conventional commit，中文描述（与仓库历史一致）：
+Conventional commits, with descriptions in Chinese (consistent with this repo's history):
 
 ```
 feat: 支持 xx
@@ -835,18 +993,22 @@ docs: 补上 zz 的说明
 perf: 降低忙标记开销
 ```
 
-### 改代码前必读
+### Read before changing code
 
-完整清单在 [`AGENTS.md`](AGENTS.md)：入口与装配方式（`herdr-plugin.toml` +
-`src/board.mjs` 的四种模式）、各文件职责、实测踩出来的硬约束、以及排障入口。最要紧的三条：
+The full list is in [`AGENTS.md`](AGENTS.md) — **it is Chinese-only**: entry points and how
+everything is assembled (`herdr-plugin.toml` plus the four modes of `src/board.mjs`), what
+each file is responsible for, the hard constraints that were measured the hard way, and the
+troubleshooting entry points. The three most important ones:
 
-- **不要碰官方集成文件**（`~/.config/opencode/plugins/herdr-agent-state.js`、
-  `~/.claude/hooks/herdr-agent-state.sh` 等），也不要用 `herdr integration install/uninstall`
-  —— 同一 pane 的状态归属是独占的。
-- **镜像 pane 里绝不运行 opencode，也绝不运行 claude**，恢复命令恒为常驻进程。
-- **只用 `layout.set_split_ratio`，绝不用 `layout.apply`**（apply 重建标签页、销毁所有
-  终端进程）。
+- **Do not touch the official integration files**
+  (`~/.config/opencode/plugins/herdr-agent-state.js`,
+  `~/.claude/hooks/herdr-agent-state.sh` and so on), and do not use
+  `herdr integration install/uninstall` — ownership of a pane's state is exclusive.
+- **Never run OpenCode inside a mirror pane, and never run Claude either.** The resume
+  command is always the resident process.
+- **Only use `layout.set_split_ratio`, never `layout.apply`** (apply rebuilds the tab and
+  destroys every terminal process).
 
-`AGENTS.md` 里那些注释的密度是有意的：它们写的是「为什么这样、实测踩到什么坑」，不是复述
-代码。改代码时保持这个密度。
-
+The density of those comments in `AGENTS.md` is intentional: they record why it is done
+this way and what pit was measured on the way, not a restatement of the code. Keep that
+density when you change code.

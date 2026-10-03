@@ -2,7 +2,8 @@
 
 Herdr 插件：把**同一个 opencode server 内所有运行中的根 session**（以及 codex、Claude Code
 的会话）按工作目录挂到 Herdr Agents 侧边栏的**官方 agent 行**上，显示成 ASCII 树状会话列表。
-设计背景与实测依据见 [SPEC.md](SPEC.md)，用户向说明与排障见 [README.md](README.md)。
+设计背景与实测依据见 [SPEC.md](SPEC.md)，用户向说明与排障见 [README.md](README.md)（英文，
+主展示）与 [README.zh-CN.md](README.zh-CN.md)（中文）。两份必须同步改。
 
 ## 这不是常规 Node 项目
 

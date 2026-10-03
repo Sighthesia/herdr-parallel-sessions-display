@@ -2,7 +2,7 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-Shows the sessions running behind your TUI: **OpenCode sessions** plus **background agents (Codex and Claude Code)** — top-level main agents running in parallel that the foreground TUI doesn't show. Not subagents. Displayed in Herdr's Agents view, grouped by working directory.
+Show parallel sessions invisible to the TUI foreground in Herdr's Agents sidebar (top-level main agents running in the background, not subagents), grouped by working directory. Covers OpenCode sessions plus Codex and Claude Code background agents.
 
 ## Supported agents
 

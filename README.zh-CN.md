@@ -2,7 +2,7 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-显示 TUI 前台看不到的并行会话：**OpenCode 会话**加**后台 agent（Codex 和 Claude Code）**——都是在后台同时运行的顶层主 agent，不是 subagent。按工作目录显示在 Herdr Agents 视图里。
+在 Herdr 的 Agents 侧边栏显示 TUI 前台看不到的并行会话（后台同时运行的顶层主 agent，不是 subagent），按工作目录分组。包括 OpenCode 会话，以及 Codex 和 Claude Code 的后台 agent。
 
 ## 支持的 agent
 

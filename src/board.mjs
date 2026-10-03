@@ -324,7 +324,7 @@ const MIRROR_AGENT_LABEL = herdr.MIRROR_DISPLAY_LABEL;
 
 function log(level, ...args) {
   if (LEVELS[level] < LEVELS[config.logLevel]) return;
-  const line = `[herdr-oc-mirror] ${new Date().toISOString().slice(11, 19)} ${level.toUpperCase()} ${args
+  const line = `[${herdr.pluginId()}] ${new Date().toISOString().slice(11, 19)} ${level.toUpperCase()} ${args
     .map((a) => (typeof a === "string" ? a : safeJson(a)))
     .join(" ")}\n`;
   try {

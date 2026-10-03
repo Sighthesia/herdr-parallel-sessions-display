@@ -32,7 +32,7 @@ External contributors and coding agents are welcome. This file is the entry poin
 ## Required manual step: the sidebar template
 
 **The plugin never writes `~/.config/herdr/config.toml`.** Session rows are rendered by
-template tokens (`$oc_sess1` … `$oc_sess6`), and Herdr's stock
+template tokens (`$oc_sess1` … `$oc_sessN`), and Herdr's stock
 `ui.sidebar.agents.rows` is `["state_icon","machine","workspace","tab"]` — it contains
 none of them. Without this edit the tokens are still written, the board runs, the logs
 are clean, **and the sidebar shows nothing at all**. It looks like a healthy install,
@@ -51,8 +51,17 @@ rows = [
 ]
 ```
 
-Then `herdr server reload-config`. Slot count must stay in sync with
-`herdr.SESSION_TOKENS` in `src/herdr.mjs`; `ui.sidebar.agents.rows` caps at 16 rows.
+Then `herdr server reload-config`. **The board reads this table and sizes itself to it**
+(`resolveSessionSlots` → `herdr.countSessionRows`), so adding more `["$oc_sessN"]` rows
+here is all it takes — there is no slot count to keep in sync any more, and
+`ui.sidebar.agents.rows` caps at 16 rows. `SESSION_ROWS` overrides the detected number
+when a user wants to cap it in the plugin instead.
+
+Herdr **stores tokens the template never references** (measured: `oc_sess16` lands in
+`pane.list` with only 6 rows configured) — it just never renders them. So a successful
+`report-metadata` is not proof that a row is visible, and over-allocating slots is not
+free of consequences in the other direction either: sessions past the template's count
+vanish with no `+N` at all.
 
 ## Keep `AUTO_START` on
 

@@ -72,7 +72,7 @@ Steps: 1) check herdr >= 0.9.3 and `node --version` works on PATH;
 2) run `herdr plugin install Sighthesia/herdr-parallel-sessions-display --yes`;
 3) copy config/.env.example from the plugin checkout to the .env in
 `herdr plugin config-dir herdr-parallel-sessions-display` (empty defaults are fine);
-4) merge the $oc_sess1..6 rows into [ui.sidebar.agents] in ~/.config/herdr/config.toml
+4) merge the `$oc_sess1..6` rows into `[ui.sidebar.agents]` in `~/.config/herdr/config.toml` (add more `$oc_sessN` rows whenever you like — the board counts them itself)
 without dropping existing rows; 5) open the board
 (`herdr plugin pane open --plugin herdr-parallel-sessions-display --entrypoint board`),
 run the sync action, and confirm session rows appear in the Agents sidebar.
@@ -118,6 +118,8 @@ rows = [
 ]
 ```
 
+Six is enough for most setups, but you are not capped at six: **add more `["$oc_sessN"]` rows here and the board picks the count up automatically** (it reads this very table). Herdr allows up to 16 rows. Empty rows render as nothing, so having spare ones costs nothing. If you'd rather cap it in the plugin than in your config file, set `SESSION_ROWS`.
+
 ## Configuration
 
 Full commented list: [`config/.env.example`](config/.env.example). Most users only need these:
@@ -132,6 +134,7 @@ Full commented list: [`config/.env.example`](config/.env.example). Most users on
 | `CODEX_ENABLED` / `CLAUDE_ENABLED` | `true` | Set `false` to skip that provider |
 | `CLAUDE_BIN` | empty | Absolute path if the board process can't find `claude` on its `PATH` |
 | `IDLE_KEEP` | `3` | Inline mode: how many finished-but-unreviewed sessions to keep **per directory**. They stay visible as `○` so you can tell "finished" from "lost"; they are dropped once you bring one to the foreground. `0` restores the old behaviour (they vanish) |
+| `SESSION_ROWS` | auto | How many sessions one agent row can show. **Empty = auto**: the board reads how many `$oc_sess*` your sidebar template's `ui.sidebar.agents.rows` references, so add `["$oc_sess7"]` there and you get a seventh row — no plugin config to touch. Set it only to cap things yourself (max 16) |
 | `POLL_INTERVAL_MS` / `CLAUDE_POLL_MS` | `5000` / `10000` | Polling cadence |
 | `LOG_LEVEL` | `info` | Use `debug` for troubleshooting |
 

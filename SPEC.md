@@ -12,7 +12,7 @@
 | --- | --- |
 | 镜像行能力 | **只看不聊**。镜像 pane 内不运行 opencode，不接受输入。 |
 | session 范围 | **根 session**。子 agent 由官方集成汇总进父行，不单列。 |
-| 停下来的 session | **保留**（内联模式）。跑完留在列表里显示 `○`，用户切到前台查看后才清除，见 12.9 |
+| 停下来的 session | **保留**（内联模式）。跑完留在列表里显示 `○`，用户切到前台查看后才清除，见 12.14 |
 
 ---
 
@@ -275,7 +275,8 @@ session 自带 `directory`。要找到对应的 herdr workspace，用 `herdr pan
 | `INSTALL_AGENT_VIEW` | `false` | 是否安装全局 Agents 视图投影 |
 | `POLL_INTERVAL_MS` | `5000` | 轮询兜底间隔 |
 | `IDLE_GRACE_MS` | `15000` | 状态变化的防抖时间。非内联模式：非活跃后回收镜像行的宽限期。内联模式：被官方集成连续认作前台 session 多久算「用户已查看」 |
-| `IDLE_KEEP` | `3` | 内联模式：每个目录最多留几条「已完成、尚未查看过」的 session（见 12.9） |
+| `IDLE_KEEP` | `3` | 内联模式：每个目录最多留几条「已完成、尚未查看过」的 session（见 12.14） |
+| `SESSION_ROWS` | 空=自动 | 一个 agent 行最多显示几个 session；留空则读侧边栏模板（见 12.15） |
 | `AGENT_VIEW_SCOPE` | `mirror` | `mirror` 只显示镜像行；`sort-only` 只装排序、保留官方集成的行 |
 | `RETRY_DETECTION` | `true` | v2 无 retry 信号，需每活跃 session 多一次 HTTP 请求；关掉可省开销但丢失 `blocked` 判定 |
 | `AUTO_AUTH_SERVICE_JSON` | `true` | 探测到 401 时自动读 `~/.config/opencode/service.json` 取密码 |
@@ -393,7 +394,8 @@ rows = [
 | token 值里的换行会被去掉 | 传 `"a\nb\nc"` 存下来是 `"abc"` | 一个 token 只能渲染一行 → N 个 session 必须 N 个 token、N 个 row |
 | 单个 token 值硬截断 80 字符 | 请求 82 字符存下来是 80 | 插件自己先截到 78 并用「+N」收尾 |
 | 空槽位不渲染成空白行 | `$oc_sess4..6` 无值时那三行不出现 | 槽位可以放心加 |
-| `ui.sidebar.agents.rows` 最多 16 行 | — | 现在用 2 + 6 = 8 行 |
+| **模板没引用的 token 也照样存进去** | `rows` 只有 6 行时写 `oc_sess16`，`pane.list` 里查得到 | 「写成功」不能用来探测可渲染行数 → 只能直接读 config.toml（11.15） |
+| `ui.sidebar.agents.rows` 最多 16 行 | — | 所以一个 agent 行最多显示 16 个 session |
 | 合法内置 token 只有 8 个 | `workspace` `machine` `tab` `agent` `state_icon` `terminal_title` `terminal_title_stripped` `pane` | 带 `$` 的是自定义 token，herdr 不校验存在性 |
 | 每 agent 条目各渲染一遍，无分组头去重 | 两个 agent 同工作区时 `[1] afloat` 会重复 | 分组只能靠 workspace 行，**做不到「每个工作区一个头」** |
 | `rules` 只能匹配该 token 自己的值 | 不能按行条件化样式 | — |
@@ -596,7 +598,7 @@ hook 将来真跑起来时写的是同一个值。而不补报的后果是「因
 
 ### 12.12 token 命名
 
-沿用 `oc_sess1..oc_sess6`，**不因为支持多 agent 就改名**。token 挂在**具体某个 agent 行**上，不同 agent 的行本来就是不同的 pane，天然不冲突。改 token 名要动 `config.toml` 的 rows、README、SPEC，收益不抵风险。
+沿用 `oc_sess1..oc_sessN`，**不因为支持多 agent 就改名**。token 挂在**具体某个 agent 行**上，不同 agent 的行本来就是不同的 pane，天然不冲突。改 token 名要动 `config.toml` 的 rows、README、SPEC，收益不抵风险。
 
 ### 12.14 停下来的 session 保留到「查看过」为止
 
@@ -617,7 +619,7 @@ session 随机丢失，分不清「跑完了」和「被弄丢了」。
 两条边界都不能省：
 
 - **每目录上限 `IDLE_KEEP`（默认 3）**，按 `updatedAt` 倒序保留最近的。不设上限的话，
-  一个开了好几天的目录会把 6 个槽位占满，真正在跑的那条被挤成「+N」。上限挤掉的**记录
+  一个开了好几天的目录会把所有槽位占满，真正在跑的那条被挤成「+N」。上限挤掉的**记录
   必须留在 `runtime.state.panes` 里**（只是本轮不列）—— 删掉的话下一轮它又冒出来，
   反复横跳。
 - **闲置的子 agent 也要挡掉**。2a 只在筛选「活跃」集合时查 `parentID`，一旦 opencode 改了
@@ -627,6 +629,37 @@ session 随机丢失，分不清「跑完了」和「被弄丢了」。
 判定逻辑是纯函数 `selectRetainedIdle`（board.mjs），不修改传入对象，可直接
 `node -e` 断言。`acknowledgedAt` / `updatedAt` 必须在 `normalizeState` 的白名单里，
 否则插件一重启就丢，「查看过才清除」每次重启都要重来一遍。
+
+### 12.15 槽位数跟随侧边栏模板，不设死上限
+
+一个 agent 行能显示几个 session，**上限在用户的模板里，不在插件里**。
+
+**实测**：模板 `rows` 只有 6 行时，`pane report-metadata` 写 `oc_sess16` 照样成功、
+`pane.list` 里也查得到 —— 也就是说**「写成功」完全不能用来探测可渲染行数**，写进去
+的 token 只是永远不会被渲染。而这正是最糟的失败形态：多出来的 session **静默消失，
+连 `+N` 都不会有**，用户既看不到少了什么，也不知道去哪里改。
+
+所以槽位数由 `resolveSessionSlots`（board.mjs）决定：
+
+1. `SESSION_ROWS` 显式设置 → 用它（封顶 16）。这是用户想手动收口时的出口。
+2. 否则直接读 `~/.config/herdr/config.toml` 的 `ui.sidebar.agents.rows`，数它引了
+   几个 `$oc_sess*`（**按最大序号，不是按个数** —— 模板可能跳号）。用户往模板里
+   加一行 `$oc_sess7`，下一轮就多显示一个 session，**不需要改任何插件配置**。
+3. 读不到 → 退回 6（历史行为）。
+
+配置文件路径从 `HERDR_SOCKET_PATH` 的所在目录推出来（Herdr 注入），比猜
+`XDG_CONFIG_HOME` 可靠。解析只做计数，不引入 TOML 依赖（官方没有第三方依赖），
+函数 `countSessionRows` 是纯函数可直接断言。
+
+实测的解析坑：`rows = [` 后面要**按嵌套深度**找外层数组的闭合括号 —— 找第一个 `]`
+会命中 `rows = [` 自己，只找一层又会停在 `["workspace"]` 的 `]` 上，两种都让 count
+永远是 0。表头终止符也必须要求**顶格**（`^[ \t]*\[name\]$`），用 `^\s*\[` 会在数组
+第一行就误判成新表头。
+
+顺带：挂载点的选择必须**记住上一次挑的那一行**（`inlineHosts`，持久化），只有它真
+的消失才重选。按状态重挑的写法在只有一个窗口时看不出问题，但同一工作区开两个
+opencode 时两行的 busy/idle 每隔几秒互换，整棵会话树被反复改写 —— 侧边栏看起来就是
+两行的列表在互相换位。
 
 ### 12.13 已知边界（codex）
 

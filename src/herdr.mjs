@@ -6,6 +6,8 @@
 //   3. 任何调用都不许抛到调用方：失败返回结构化结果，由上层记录并忽略。
 
 import net from "node:net";
+import path from "node:path";
+import { readFileSync } from "node:fs";
 import { spawn } from "node:child_process";
 
 const DEFAULT_CLI_TIMEOUT_MS = 10_000;
@@ -519,8 +521,15 @@ export const PARALLEL_TOKEN = "oc_par";
  *
  * ## 槽位数量
  *
- * **已实测空的槽位不会渲染成空白行**，所以槽位可以放心加。`rows` 最多 16 行，
- * 现在用 2 + 6 = 8 行，余量充足。要增减就同时改这里和 config.toml 的 `rows`。
+ * **已实测空的槽位不会渲染成空白行**，所以多写槽位零视觉成本；反过来，
+ * **Herdr 也会老老实实存下模板里没引用的 token**（实测 `rows` 只有 6 行时
+ * `oc_sess16` 照样存进去），只是永远不会被渲染 —— 也就是「多出来的 session 静默
+ * 消失、连 `+N` 都不会有」。
+ *
+ * 所以槽位数必须等于模板能渲染的行数。插件不自己拍这个数，而是
+ * {@link detectSidebarSessionRows} 直接去读 `~/.config/herdr/config.toml` 里
+ * `ui.sidebar.agents.rows` 数出来：用户往模板里加一行 `$oc_sess7`，插件下一轮就
+ * 多写一个槽位，**不需要改任何配置**。用户想手动收口才设 `SESSION_ROWS`。
  *
  * ## 这组 token 与 agent 无关
  *
@@ -534,9 +543,126 @@ export const PARALLEL_TOKEN = "oc_par";
  *
  * 侧边栏模板里对应写：
  *   rows = [["workspace"], ["state_icon","agent"],
- *           ["$oc_sess1"], …, ["$oc_sess6"]]
+ *           ["$oc_sess1"], …, ["$oc_sessN"]]
  */
-export const SESSION_TOKENS = ["oc_sess1", "oc_sess2", "oc_sess3", "oc_sess4", "oc_sess5", "oc_sess6"];
+
+/**
+ * session 槽位的上限。
+ *
+ * **不是 16。** 实测 `ui.sidebar.agents.rows` 的 16 行上限是**整个数组**的，而模板
+ * 里已经占了 2 行给 `["workspace"]` 和 `["state_icon","agent"]` —— 写成 16 个
+ * session 行就是 18 行，herdr 会**整份拒绝**：
+ * `sidebar layouts may contain at most 16 rows ... keeping current ui settings`。
+ *
+ * 所以自动探测出来的数量总是安全的（它数的就是用户自己那份模板）；这个常量只用来
+ * 给 `SESSION_ROWS` 封顶，14 + 2 行表头 = 16，正好卡在 herdr 的上限内。
+ */
+export const MAX_SESSION_SLOTS = 14;
+
+/**
+ * 前 `count` 个 session token 的名字。
+ *
+ * @param {number} count 1..{@link MAX_SESSION_SLOTS}
+ * @returns {string[]}
+ */
+export function sessionTokens(count) {
+  const n = Math.min(MAX_SESSION_SLOTS, Math.max(1, Math.trunc(Number(count) || 1)));
+  return Array.from({ length: n }, (_, i) => `oc_sess${i + 1}`);
+}
+
+/**
+ * 从 Herdr 的 `config.toml` 里数出侧边栏模板给 session 留了几行。
+ *
+ * ## 为什么必须去读文件
+ *
+ * 真正的上限在**用户的模板**里，不在插件里。实测 `herdr pane report-metadata`
+ * 对模板没引用的 token 也照样存储成功（`rows` 只有 6 行时 `oc_sess16` 照样存进去），
+ * 所以「写成功」不能用来探测可渲染行数 —— 只能直接读配置。
+ *
+ * ## 为什么值得读
+ *
+ * 反过来，「只写 6 个槽位、多的折成 `+N`」是**静默降级**：用户看不到自己少了什么，
+ * 也不知道改哪里能看见。读模板之后，用户往 `rows` 里加一行 `$oc_sess7`，下一轮
+ * 插件就多写一个槽位，什么都不用配。
+ *
+ * 解析只做「数一数 `$oc_sess*` 在 `ui.sidebar.agents.rows` 里出现了几次」，
+ * 不做通用 TOML —— 官方没有 TOML 解析依赖，而这个需求只需要计数。
+ *
+ * @param {{env?:Record<string,string|undefined>, readFile?:(p:string)=>string}} [options]
+ * @returns {{count:number, path:string, ok:boolean}}
+ */
+export function detectSidebarSessionRows(options = {}) {
+  const env = options.env || process.env;
+  const read = options.readFile || ((p) => readFileSync(p, "utf8"));
+  // HERDR_SOCKET_PATH 由 Herdr 注入，其所在目录就是配置目录 —— 比猜 XDG 可靠。
+  const socket = env.HERDR_SOCKET_PATH || "";
+  const dir = env.HERDR_CONFIG_DIR || (socket ? path.dirname(socket) : "");
+  const filePath = dir ? path.join(dir, "config.toml") : "";
+  if (!filePath) return { count: 0, path: "", ok: false };
+  let text = "";
+  try {
+    text = read(filePath);
+  } catch {
+    return { count: 0, path: filePath, ok: false };
+  }
+  return { count: countSessionRows(text), path: filePath, ok: true };
+}
+
+/**
+ * 数 `config.toml` 里 `ui.sidebar.agents.rows` 引了多少个 `$oc_sess*`。
+ *
+ * 解析只做计数，不做通用 TOML —— 官方没有 TOML 解析依赖，而这个需求只需要一个数字。
+ *
+ * ## 两个实测出来的坑
+ *
+ * **一、16 行的上限算的是整个 `rows` 数组**，不是 session 行。模板里已经有
+ * `["workspace"]` 和 `["state_icon","agent"]` 两行，所以 session 行最多 14 —— 写满
+ * 16 会让 herdr **整份拒绝**这份配置（`sidebar layouts may contain at most 16 rows
+ * ... keeping current ui settings`），症状是「改了配置没反应」，不是报错。
+ *
+ * **二、找外层数组的闭合括号要按嵌套深度走。** 找第一个 `]` 会命中 `rows = [` 自己，
+ * 只找一层又会停在第一个元素 `["workspace"]` 的 `]` 上 —— 两种都让结果恒为 0。
+ * 表头终止符同理必须要求**顶格**，用 `^\s*\[` 会在数组第一行就误判成新表头。
+ *
+ * @param {string} text 整个 config.toml
+ * @returns {number}
+ */
+export function countSessionRows(text) {
+  const src = String(text || "");
+  const start = src.search(/^[ \t]*\[ui\.sidebar\.agents\][ \t]*(?:#.*)?$/m);
+  if (start < 0) return 0;
+  const rest = src.slice(src.indexOf("\n", start) + 1);
+  // 下一张表的头。**必须顶格**（`^[`，不是 `^\s*\[`）—— rows 数组的元素是缩进过的
+  // `  ["workspace"],`，用 `^\s*\[` 会在数组第一行就误判成表头，section 被截断成
+  // 空串，count 永远是 0。
+  const next = rest.search(/^[ \t]*\[(?:[A-Za-z_][\w.-]*|"[^"]*")\][ \t]*(?:#.*)?$/m);
+  const section = next < 0 ? rest : rest.slice(0, next);
+  const rowsIdx = section.search(/^[ \t]*rows[ \t]*=/m);
+  if (rowsIdx < 0) return 0;
+  // 从 `rows = [` 的**开括号之后**开始，按嵌套深度找**外层**数组的闭合括号。
+  // 两个坑都要躲：直接找第一个 `]` 会命中 `rows = [` 自己；只找一层又会停在第一个
+  // 元素 `["workspace"]` 的 `]` 上，body 里一个 `$oc_sess` 都没有，count 永远是 0。
+  const afterEq = section.indexOf("=", rowsIdx);
+  const open = section.indexOf("[", afterEq + 1);
+  if (open < 0) return 0;
+  let depth = 1;
+  let i = open + 1;
+  for (; i < section.length && depth > 0; i += 1) {
+    const ch = section[i];
+    if (ch === "[") depth += 1;
+    else if (ch === "]") depth -= 1;
+  }
+  const body = section.slice(open + 1, depth === 0 ? i - 1 : section.length);
+  const names = body.match(/\$oc_sess(\d+)/g) || [];
+  if (names.length === 0) return 0;
+  // 模板里可能跳号（写了 1..6 和 16），所以按最大序号算槽位数，**不能**按个数。
+  let max = 0;
+  for (const raw of names) {
+    const n = Number(String(raw).replace("$oc_sess", ""));
+    if (Number.isFinite(n) && n > max) max = n;
+  }
+  return Math.min(MAX_SESSION_SLOTS, max);
+}
 
 /** 算一个 agent 是不是我们自己的镜像行。 */
 export function isMirrorRow(agent) {

@@ -22,6 +22,11 @@ export const CONFIG_DEFAULTS = Object.freeze({
   // 每个目录最多留几条「已完成、还没在前台查看过」的 session（内联模式）。
   // 0 = 不留，停下来 15 秒后照旧消失。
   IDLE_KEEP: "3",
+  // 一个 agent 行最多显示几个 session。留空 = 自动读侧边栏模板
+  // `ui.sidebar.agents.rows` 里引了几个 `$oc_sess*`，所以往模板里加一行就多一行，
+  // 不用改这里。上限 14：herdr 的 16 行上限算的是**整个 rows 数组**，模板里已经
+  // 占了 2 行给 workspace / agent 行。
+  SESSION_ROWS: "",
   // --- SPEC 第 7 节之外、为可运行性补的项（README 有完整表格）---
   AGENT_VIEW_SCOPE: "mirror", // mirror | sort-only
   MIRROR_TAB_LABEL: "oc-sessions",
@@ -314,6 +319,10 @@ export function emptyState() {
     central: emptyCentral(),
     server: { baseUrl: "", flavor: "", version: "", lastOkAt: 0 },
     panes: {},
+    // 工作区 id → 该工作区里被选为挂载点的 pane（内联模式）。
+    // 持久化是为了**跨重启也稳定**：按状态重挑会让同一工作区里两个 opencode 窗口
+    // 的会话树每隔几秒互换位置，看着像 bug。
+    inlineHosts: {},
     agentView: null,
   };
 }
@@ -380,6 +389,13 @@ export function normalizeState(raw) {
         lastStateMessage: str(rec.lastStateMessage),
         lastResume: str(rec.lastResume),
       };
+    }
+  }
+  if (raw.inlineHosts && typeof raw.inlineHosts === "object") {
+    for (const [workspaceId, paneId] of Object.entries(raw.inlineHosts)) {
+      const ws = str(workspaceId);
+      const pane = str(paneId);
+      if (ws && pane) base.inlineHosts[ws] = pane;
     }
   }
   if (raw.agentView && typeof raw.agentView === "object") {

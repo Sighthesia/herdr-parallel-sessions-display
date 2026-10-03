@@ -72,7 +72,7 @@ Herdr Agents 视图
 2) 执行 `herdr plugin install Sighthesia/herdr-parallel-sessions-display --yes`；
 3) 把插件检出目录里的 config/.env.example 复制到
 `herdr plugin config-dir herdr-parallel-sessions-display` 指向目录下的 .env（留空用默认即可）；
-4) 把 $oc_sess1..6 这几行合并进 ~/.config/herdr/config.toml 的 [ui.sidebar.agents]，
+4) 把 `$oc_sess1..6` 这几行合并进 `~/.config/herdr/config.toml` 的 `[ui.sidebar.agents]`（想加就继续加 `$oc_sessN`，看板自己数），
 不要丢掉已有的行；5) 打开看板
 （`herdr plugin pane open --plugin herdr-parallel-sessions-display --entrypoint board`），
 执行 sync action，确认 Agents 侧边栏出现会话行。
@@ -118,6 +118,8 @@ rows = [
 ]
 ```
 
+六行对大多数场景够了，但**不是上限**：这里加多少行 `["$oc_sessN"]` 看板就自动跟着数（它读的就是这张表），Herdr 最多允许 16 行。空的行不会渲染成空白，留着备用不花钱。想在插件里收口而不是改配置文件，就设 `SESSION_ROWS`。
+
 ## 配置
 
 ## 配置
@@ -134,6 +136,7 @@ rows = [
 | `CODEX_ENABLED` / `CLAUDE_ENABLED` | `true` | 不需要哪家就设 `false` |
 | `CLAUDE_BIN` | 空 | 看板进程的 `PATH` 里找不到 `claude` 时填绝对路径 |
 | `IDLE_KEEP` | `3` | 内联模式：每个目录最多留几条「跑完但还没查看过」的会话。它们以 `○` 留在列表里，你切到前台看过某一条才清除。`0` = 回到旧行为（跑完就消失） |
+| `SESSION_ROWS` | 自动 | 一个 agent 行最多显示几个 session。**留空 = 自动**：看板直接读侧边栏模板 `ui.sidebar.agents.rows` 里引了几个 `$oc_sess*`，所以往模板里加一行 `["$oc_sess7"]` 就多显示一个，插件配置一个字都不用改。只有想自己收口才填（上限 16） |
 | `POLL_INTERVAL_MS` / `CLAUDE_POLL_MS` | `5000` / `10000` | 轮询节奏 |
 | `LOG_LEVEL` | `info` | 排查问题用 `debug` |
 

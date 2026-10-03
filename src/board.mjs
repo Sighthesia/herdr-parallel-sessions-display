@@ -59,6 +59,8 @@ const config = {
   idleGraceMs: store.asInt(raw, "IDLE_GRACE_MS", 15_000, 0, 3_600_000),
   // 内联模式：每个目录最多留几条「跑完了但你还没在前台看过」的 session。
   idleKeep: store.asInt(raw, "IDLE_KEEP", 3, 0, 32),
+  // 一个 agent 行最多显示几个 session。0 = 自动跟随侧边栏模板。
+  sessionRows: store.asInt(raw, "SESSION_ROWS", 0, 0, 16),
   // 已废弃：RESUME_MODE=opencode 会在 herdr 重启时于镜像 pane 里拉起 opencode TUI，
   // 官方集成随即覆盖掉我们这一行（不是新增重复行），镜像功能对该目录静默失效。
   // 只读不认，写了就在启动时明确告知已忽略。
@@ -294,7 +296,7 @@ async function tickBusySpinner() {
   for (const [paneId, row] of runtime.busyRows) {
     const payload = {};
     for (const [i, base] of row.bases.entries()) {
-      const name = herdr.SESSION_TOKENS[i];
+      const name = runtime.slots[i];
       if (!name) continue;
       const next = base.replaceAll(BUSY_PLACEHOLDER, glyph);
       if (next && next !== row.current[i]) payload[name] = next;
@@ -498,8 +500,55 @@ const runtime = {
    * 写进去的值，用来比对「这一帧真的变了吗」。
    */
   busyRows: new Map(),
+  /**
+   * 本轮实际使用的 session token 名（`oc_sess1` …）。
+   *
+   * 数量 = 用户侧边栏模板里给 session 留的行数（见 {@link resolveSessionSlots}），
+   * 不是写死的 6：**空的槽位不会渲染**，多写零成本；而少写会让多出来的 session
+   * 被折成 `+N`，用户既看不到也不知道自己少了什么。
+   */
+  slots: herdr.sessionTokens(6),
+  /** 槽位数量是怎么来的，写进启动日志让用户知道去哪里改。 */
+  slotSource: "默认 6（未能读到侧边栏模板）",
   shuttingDown: false,
 };
+
+// 槽位数在**模块初始化**时就定下来，不是常驻模式启动时。只在 `--mode pane` 里解析的
+// 话，`--mode once` 会一直用写死的 6：同一个配置在两种模式下渲染出不同的行数，
+// 调试时看到的现象和真实运行不一致 —— 这正是 once 模式存在的意义所在。
+{
+  const slots = resolveSessionSlots({ explicit: config.sessionRows });
+  runtime.slots = slots.tokens;
+  runtime.slotSource = slots.source;
+}
+
+/**
+ * 决定 session token 的数量。
+ *
+ * `SESSION_ROWS` 显式设置就用它（用户手动收口）；没设置就去读
+ * `~/.config/herdr/config.toml` 的 `ui.sidebar.agents.rows` 数出来 —— 用户往模板里
+ * 加一行 `$oc_sess7`，这里就跟着变成 7，**不需要改任何插件配置**。
+ *
+ * 读不到（没装、没有 socket 环境变量、模板没写 `rows`）就退回 6，也就是历史行为。
+ *
+ * @param {{env?:Record<string,string|undefined>, explicit?:number}} [options]
+ * @returns {{tokens:string[], source:string}}
+ */
+export function resolveSessionSlots(options = {}) {
+  const explicit = Number(options.explicit) || 0;
+  if (explicit > 0) {
+    const n = Math.min(herdr.MAX_SESSION_SLOTS, explicit);
+    return { tokens: herdr.sessionTokens(n), source: `SESSION_ROWS=${n}` };
+  }
+  const detected = herdr.detectSidebarSessionRows({ env: options.env || process.env });
+  if (detected.ok && detected.count > 0) {
+    return {
+      tokens: herdr.sessionTokens(detected.count),
+      source: `侧边栏模板 ${detected.path} 的 ui.sidebar.agents.rows（${detected.count} 行）`,
+    };
+  }
+  return { tokens: herdr.sessionTokens(6), source: "默认 6（未能读到侧边栏模板）" };
+}
 
 // ---------------------------------------------------------------------------
 // 模式分发
@@ -722,6 +771,9 @@ async function modePane() {
   await reconcileAgentView(runtime.state, { reason: "pane 启动", force: true });
 
   log("info", `管理器已启动（pane=${process.env.HERDR_PANE_ID || "?"}，轮询 ${config.pollIntervalMs}ms）`);
+  // 槽位数要说出来：它决定「一个 agent 行最多能列几个 session」，而模板行数写少了
+  // 的后果是**静默**的（多的 session 连 `+N` 都不会出现，用户不知道自己少了）。
+  log("info", `每个 agent 行最多列 ${runtime.slots.length} 个 session（${runtime.slotSource}）`);
   return undefined;
 }
 
@@ -2273,7 +2325,11 @@ async function publishInlineSessions(providers) {
     (a) => !herdr.isMirrorRow(a) && a.agent && typeof a.agent_session?.source === "string",
   );
 
-  const tokens = herdr.SESSION_TOKENS;
+  const tokens = runtime.slots;
+  // 扫除范围按**满额**算，不是按当前槽位数。槽位数会变（模板加行、`SESSION_ROWS`
+  // 改小），只按当前数量清的话，之前写进去的 `oc_sess7..16` 会永远留在 pane 上 ——
+  // 而 herdr 不会自己回收它们。清一次是一次 `--clear-token` 参数，代价可以忽略。
+  const sweepTokens = herdr.sessionTokens(herdr.MAX_SESSION_SLOTS);
   // 历史版本用过的 token 名，早已不在模板里，顺手清掉免得白占 metadata 配额：
   //   oc_par    = 单行版（多个 session 用 · 挤在一行）
   //   oc_par1..4 = 多行版但只放并行 session，官方那行还是内置 terminal_title
@@ -2291,6 +2347,15 @@ async function publishInlineSessions(providers) {
 
   // 只有确实要解析目录时才拉 pane 列表；index 跨 provider 共用一次就够了。
   const index = await paneIndex({ force: true });
+
+  // 挂载点记录清一次陈旧的：工作区关了、或者那个 agent 的官方行全没了，就把
+  // 记下来的 pane_id 扔掉。不清的话 state.json 会随着开关过的标签页一直涨。
+  if (runtime.state.inlineHosts && Object.keys(runtime.state.inlineHosts).length > 0) {
+    const liveWorkspaces = new Set(official.map((a) => str(a.workspace_id)));
+    for (const ws of Object.keys(runtime.state.inlineHosts)) {
+      if (!liveWorkspaces.has(ws)) delete runtime.state.inlineHosts[ws];
+    }
+  }
 
   let attached = 0;
   let cleared = 0;
@@ -2365,10 +2430,27 @@ async function publishInlineSessions(providers) {
       );
     }
 
-    /** 工作区里挑一个官方行作为挂载点：优先正在忙的，其次当前聚焦的。 */
+    /**
+     * 工作区里挑一个官方行作为挂载点。
+     *
+     * ## 为什么必须记住上一次挑的那一行
+     *
+     * 最早的排序是「谁在忙挂谁」，那在只有一个窗口时没区别。但同一工作区开了两个
+     * opencode 时，**两行的 busy/idle 每隔几秒就互换**（实测 `agent_status` 和
+     * `agent_session` 都会变），整棵会话树于是被反复改写到另一行 —— 侧边栏看起来
+     * 就是两行的列表每隔几秒互相换位。
+     *
+     * 所以：**上次挂在哪行就还挂哪行**，只有那一行真的消失了（关了窗口 / herdr
+     * 回收）才重选。重选时仍按原来的排序，行为不变。
+     */
     const pickHost = (workspaceId) => {
       const candidates = rows.filter((a) => str(a.workspace_id) === str(workspaceId));
       if (candidates.length === 0) return null;
+      const remembered = str(runtime.state.inlineHosts?.[workspaceId] || "");
+      if (remembered) {
+        const same = candidates.find((a) => str(a.pane_id) === remembered);
+        if (same) return same;
+      }
       const rank = (a) => {
         if (a.agent_status === "working") return 0;
         if (a.agent_status === "blocked") return 1;
@@ -2378,7 +2460,10 @@ async function publishInlineSessions(providers) {
         return 5;
       };
       candidates.sort((a, b) => rank(a) - rank(b) || str(a.pane_id).localeCompare(str(b.pane_id)));
-      return candidates[0];
+      const chosen = candidates[0];
+      if (!runtime.state.inlineHosts) runtime.state.inlineHosts = {};
+      runtime.state.inlineHosts[str(workspaceId)] = str(chosen.pane_id);
+      return chosen;
     };
 
     /**
@@ -2459,7 +2544,7 @@ async function publishInlineSessions(providers) {
       const want = desired.get(paneId);
       const actualTokens = agent.tokens || {};
       // 本轮该有值的槽位 + 本轮该为空但实际有值的槽位
-      const stale = tokens.filter((t) => actualTokens[t] != null);
+      const stale = sweepTokens.filter((t) => actualTokens[t] != null);
       const legacy = legacyTokens.filter((t) => actualTokens[t] != null);
 
       if (!want) {
@@ -2486,11 +2571,13 @@ async function publishInlineSessions(providers) {
       const rendered = want.slots.map((s) => s.replaceAll(BUSY_PLACEHOLDER, glyph));
       const animated = want.slots.some((s) => s.includes(BUSY_PLACEHOLDER));
 
-      // 只写「值不同」的槽位；用不到的槽位显式置空（attachMetadata 用空串覆盖）
+      // 只写「值不同」的槽位；用不到的槽位显式置空（attachMetadata 用空串覆盖）。
+      // 循环走满额而不是当前槽位数：`rendered` 只填到 tokens.length，多出来的
+      // `next` 是 undefined，正好走「该清就清」那条，把上一轮多写的槽位收掉。
       const payload = {};
       const toClear = [...legacy];
-      for (let i = 0; i < tokens.length; i += 1) {
-        const name = tokens[i];
+      for (let i = 0; i < sweepTokens.length; i += 1) {
+        const name = sweepTokens[i];
         const next = rendered[i] ?? "";
         const cur = actualTokens[name];
         if (next) {
@@ -2548,7 +2635,7 @@ async function publishInlineSessions(providers) {
     const paneId = str(agent?.pane_id);
     if (!paneId || handled.has(paneId)) continue;
     const actual = agent.tokens || {};
-    const stale = tokens.filter((t) => actual[t] != null);
+    const stale = sweepTokens.filter((t) => actual[t] != null);
     const legacy = legacyTokens.filter((t) => actual[t] != null);
     if (stale.length === 0 && legacy.length === 0) continue;
     const res = await herdr.attachMetadata({ paneId, clear: [...stale, ...legacy], seq: nextSeq() });
@@ -2785,14 +2872,15 @@ export function selectRetainedIdle(records, options) {
  *
  * ## 槽位不够时
  *
- * 超出 `herdr.SESSION_TOKENS` 长度时把多出来的折成最后一行末尾的「+N」——
- * 让人知道「还有几个」比静默丢掉强。**已实测空槽位不会渲染成空白行**，所以
- * 槽位可以放心多加。
+ * 超出槽位长度时把多出来的折成最后一行末尾的「+N」——让人知道「还有几个」比静默
+ * 丢掉强。**已实测空槽位不会渲染成空白行**，所以槽位可以放心多加；槽位数量来自
+ * {@link resolveSessionSlots}，默认跟着用户的侧边栏模板走。
  *
  * @param {Array<{title:string, official?:boolean}>} sessions 官方 session 排第一
+ * @param {string[]} [slotNames] 槽位 token 名，缺省用 runtime.slots
  */
-export function formatParallelSlots(sessions) {
-  const slots = herdr.SESSION_TOKENS;
+export function formatParallelSlots(sessions, slotNames) {
+  const slots = Array.isArray(slotNames) && slotNames.length > 0 ? slotNames : runtime.slots;
   const limit = config.parallelTokenMax;
   const trunk = config.parallelTrunk;
   const connector = config.connector;

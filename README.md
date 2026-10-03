@@ -90,11 +90,11 @@ Steps: 1) check herdr >= 0.9.3 and `node --version` works on PATH;
 3) copy config/.env.example from the plugin checkout to the .env in
 `herdr plugin config-dir herdr-parallel-sessions-display` (empty defaults are fine);
 4) merge the `$oc_sess1..6` rows into `[ui.sidebar.agents]` in `~/.config/herdr/config.toml` (add more `$oc_sessN` rows whenever you like — the board counts them itself)
-without dropping existing rows; 5) open the board
-(`herdr plugin pane open --plugin herdr-parallel-sessions-display --entrypoint board`),
+without dropping existing rows; 5) start the board
+(`herdr plugin action invoke herdr-parallel-sessions-display.board`),
 run the sync action, and confirm session rows appear in the Agents sidebar.
-If anything fails, read the board pane (label "Herdr Sessions") with
-`herdr pane read` and fix it. Do not edit other plugins' configs.
+If anything fails, read `~/.local/state/herdr/plugins/herdr-parallel-sessions-display/board.log`
+and fix it. Do not edit other plugins' configs.
 ```
 
 ### Manual install
@@ -104,14 +104,17 @@ herdr plugin install Sighthesia/herdr-parallel-sessions-display --yes
 herdr plugin config-dir herdr-parallel-sessions-display  # .env goes here
 
 # copy config/.env.example from the plugin checkout to .env, then:
-herdr plugin pane open --plugin herdr-parallel-sessions-display --entrypoint board
+herdr plugin action invoke herdr-parallel-sessions-display.board
 ```
 
-.env` can stay empty; defaults work. After editing `.env`, close and reopen the board tab.
+.env` can stay empty; defaults work. After editing `.env`, restart the manager (see
+"Troubleshooting" below).
 
-The board lives in a `Herdr Sessions` tab. `AUTO_START=true` (the default) relaunches it
-after every Herdr restart; with it off the sidebar stops updating silently — no error, the
-rows just freeze at their last state. Don't disable it.
+The board does **not** live in a tab. It is a background process detached from any pane,
+watched by a second detached process, so closing tabs can no longer kill it.
+`AUTO_START=true` (the default) launches the watchdog whenever Herdr restores its session;
+with it off the sidebar stops updating silently — no error, the rows just freeze at their
+last state. Don't disable it.
 
 Three actions (also available from the command palette):
 
@@ -166,16 +169,29 @@ Sessions in directories with no official row (e.g. `/tmp` scratch projects) have
 
 ## Troubleshooting
 
-Logs are **not** in `herdr plugin log list`. Read the board pane:
+Logs are **not** in `herdr plugin log list` (that only covers plugin *commands*). The
+manager writes to its state directory:
 
 ```bash
-herdr pane list --json | jq -r '.result.panes[]|select(.label=="Herdr Sessions")|.pane_id'
-herdr pane read <board_pane_id> --lines 200
+tail -f ~/.local/state/herdr/plugins/herdr-parallel-sessions-display/board.log
 ```
+
+The real path is printed in the manager's first log line. Two generations are kept
+(`board.log.1`).
+
+To check whether it is alive, look at `board.log`'s mtime (every poll rewrites it), or:
+
+```bash
+cat ~/.local/state/herdr/plugins/herdr-parallel-sessions-display/board.lock     # manager pid
+cat ~/.local/state/herdr/plugins/herdr-parallel-sessions-display/watchdog.lock   # watchdog pid
+```
+
+Both are pid files, and dead pids are reclaimed automatically, so a leftover file is
+harmless.
 
 Common cases:
 
-- **List stopped updating**: the board tab was closed or Herdr restarted. Run the `sync` action; set `AUTO_START=true` to relaunch automatically.
+- **List stopped updating**: run the `board` action. Normally the watchdog handles this by itself.
 - **Empty sidebar / `no matching agents`**: a global `agent.view.set` filter hid everything. Run `sync` to recalibrate, keep `INSTALL_AGENT_VIEW=false` unless you need it.
 - **Fewer rows than expected**: search the log for the yield message. Sessions owned by a real TUI are intentionally skipped.
 - **Can't reach the server**: check `OPENCODE_SERVER_URL`, or install `ss`/`lsof` so non-default ports can be auto-detected.
@@ -194,8 +210,14 @@ See [`AGENTS.md`](AGENTS.md) for the contributor guide. Quick version:
 
 ```bash
 herdr plugin link /absolute/path/herdr-parallel-sessions-display
-# edit code, then close and reopen the board tab
+# after editing code: kill the manager process; the watchdog respawns it from the new code
+kill "$(cat ~/.local/state/herdr/plugins/herdr-parallel-sessions-display/board.lock)"
 node src/board.mjs --mode once  # one-shot check, use when the manager is not running
 ```
 
 No test suite; verify on a real machine (Herdr + agents running, watch the sidebar). Use `LOG_LEVEL=debug` to see per-session decisions.
+
+Process layout: `--mode startup` (runs once when Herdr restores its session) launches
+`--mode watchdog` (detached), which launches `--mode pane` (the manager, also detached).
+The two check each other's liveness. The `[[panes]]` board pane is only a log viewer,
+not the resident process.

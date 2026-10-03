@@ -14,15 +14,20 @@ platforms = ["linux", "macos"]
 
 # One-shot init hook: runs once after Herdr restores the session.
 # It only does two things: replay the agent view projection and (optionally) start
-# the resident manager, then exits. No resident logic lives here --
+# the detached watchdog, then exits. No resident logic lives here --
 # [[startup]] is a one-shot hook, not a supervised daemon.
+#
+# This hook firing once per server lifetime is exactly why the manager cannot depend
+# on it for liveness. The watchdog (spawned here) is what keeps the manager alive.
 [[startup]]
 command = ["node", "src/board.mjs", "--mode", "startup"]
 
-# Opens the resident manager pane (the plugin's only resident process).
+# Makes sure the resident manager is running (and its watchdog is watching it).
+# This is the recovery entry point: the manager no longer lives in a pane, so this
+# no longer opens a window -- it starts the detached process if it is missing.
 [[actions]]
 id = "board"
-title = "Open Sessions Board"
+title = "Ensure Sessions Board Is Running"
 contexts = ["workspace"]
 command = ["node", "src/board.mjs", "--mode", "action", "--action", "board"]
 
@@ -41,11 +46,17 @@ title = "Clean Up Mirror Session Rows"
 contexts = ["workspace"]
 command = ["node", "src/board.mjs", "--mode", "action", "--action", "reap"]
 
-# The resident manager lives in its own tab: it never steals focus and never covers
-# the pane you are looking at.
+# The resident manager runs DETACHED from any pane -- see the comment block at the
+# top of src/board.mjs for why (a pane-hosted manager gets killed every time the
+# user closes that tab, and [[startup]] fires only once per server lifetime, so the
+# sidebar silently freezes forever).
+#
+# This pane entry is kept as a log viewer. In normal operation the detached manager
+# already holds the board lock, so this process exits immediately after printing why
+# -- it is not the resident process. The log is at $HERDR_PLUGIN_STATE_DIR/board.log.
 [[panes]]
 id = "board"
-title = "Herdr Sessions"
+title = "Herdr Sessions (log)"
 placement = "tab"
 command = ["node", "src/board.mjs", "--mode", "pane"]
 
@@ -53,4 +64,4 @@ command = ["node", "src/board.mjs", "--mode", "pane"]
 key = "prefix+shift+o"
 type = "plugin_action"
 command = "herdr-parallel-sessions-display.board"
-description = "Open the parallel sessions board"
+description = "Make sure the parallel sessions board is running"

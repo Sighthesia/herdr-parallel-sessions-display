@@ -1,18 +1,52 @@
 // board.mjs —— 常驻管理器。
 //
-// 为什么管理器必须以「插件面板」的形式存在：
-// SPEC 6.1 + 官方文档都写明 [[startup]] 是一次性初始化钩子，不是受监管的守护进程，
-// 所以常驻逻辑放在 [[panes]] id = "board" 的面板进程里。
+// ## 为什么管理器不再住在面板里
 //
-// 四种运行模式：
-//   --mode startup   一次性：重放 agent 视图投影、（可选）拉起面板，然后退出
+// 早先的注释写的是「[[startup]] 是一次性钩子，不是守护进程，所以常驻逻辑只能放在
+// [[panes]] 面板进程里」。**那个推论是对的，结论却是错的**，而且代价很大：
+//
+// 官方文档写明 `tab / zoomed / overlay` 面板**就是普通面板**。于是管理器变成用户某个
+// 项目工作区里的一个普通标签页 —— 用户在 9 个工作区之间来回干活，**随手关掉标签页就
+// 杀掉了它**。而 [[startup]] 每个 server 生命周期只跑一次（实测 herdr server 连续运行
+// 14h40m 期间只触发过一次），所以它一死就**再也不会被拉回来**，直到用户自己重启 herdr。
+// 整个过程零报错：token 不再刷新，侧边栏冻在最后一次的状态上，从外面看和「功能有 bug」
+// 完全无法区分。实测就是这样被当成功能问题连报三次的。
+//
+// 现在管理器**脱离面板运行**，由一个同样脱离面板的看门狗守着：
+//
+//   [[startup]]（一次性）─→ 看门狗（脱离面板）─→ 管理器（脱离面板）
+//                              ↑                        │
+//                              └────── 互相检查存活 ─────┘
+//
+// 两条设计约束，都是实测出来的：
+//
+// 1. **脱离面板不需要重建任何东西。** `HERDR_PANE_ID` 在整个文件里只出现一次，是一行
+//    启动日志；socket 路径是 `~/.config/herdr/herdr.sock` 这样的**固定路径**，不随
+//    server 实例变；`herdrBin()` 也从不硬编码。所以只需把 pane 作用域的几个变量摘掉。
+// 2. **看门狗和管理器必须互相守着。** 单向只有看门狗的话，看门狗自己被打死（OOM、
+//    手动 kill）就退化到「没有崩溃自愈」，而那正是这次要消灭的状态。
+//
+// 六种运行模式：
+//   --mode startup   一次性：重放 agent 视图投影、（可选）拉起看门狗，然后退出
+//   --mode watchdog  看门狗：脱离面板，只负责保证管理器活着
 //   --mode pane      常驻管理器：发现 server → SSE + 轮询 → 增删镜像 pane → 上报
 //   --mode action    由 [[actions]] 触发，通过 STATE_DIR 里的请求文件与常驻进程通信
 //   --mode once      自检 / 调试用：跑一轮重算就退出
+//
+// `[[panes]] id = "board"` 仍然保留，但角色变了：它现在只是一个**日志查看器**。
+// 管理器已经脱离运行时，面板进程会立刻因为 `acquireBoardLock` 失败而退出
+// （「已有一个管理器在运行，这个面板退出」），所以往里跑 opencode/codex 都不会被覆盖。
+//
+// 跨平台：拉起子进程只用 Node 自带的 `spawn(detached:true)` + `unref()`，底层在
+// Linux/macOS 是 `setsid()`、在 Windows 是 `CREATE_NEW_PROCESS_GROUP`，再加
+// `windowsHide` 免得弹黑框。**不依赖 systemd / launchd / Windows 服务**，因此
+// 三个平台同一份代码，也不需要管理员权限。
 
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import fs from "node:fs/promises";
+import fsSync from "node:fs";
+import { spawn } from "node:child_process";
 
 import * as herdr from "./herdr.mjs";
 import * as store from "./state.mjs";
@@ -208,6 +242,39 @@ const SYNC_FLAG = path.join(STATE_DIR, "sync.request");
 const REAP_FLAG = path.join(STATE_DIR, "reap.request");
 const MIRROR_PREFIX = "oc_";
 
+/**
+ * 看门狗的锁，和管理器自己的锁分开存 —— 两边要能各自判断「对方还活着吗」，
+ * 写同一个文件就没法互相校验了。
+ */
+const WATCHDOG_LOCK_FILE = path.join(STATE_DIR, "watchdog.lock");
+
+/**
+ * 脱离面板后 stdout/stderr 接不到终端，日志必须落盘，否则「失效了但没人知道」
+ * 这个老问题又回来了。2MB 上限，超了只保留一代。
+ */
+const BOARD_LOG_FILE = path.join(STATE_DIR, "board.log");
+const BOARD_LOG_MAX_BYTES = 2 * 1024 * 1024;
+
+/** 看门狗多久检查一次管理器。5s 足够快，也不值得更密。 */
+const WATCHDOG_INTERVAL_MS = 5_000;
+
+/**
+ * 被面板作用域绑定、脱离面板后必须摘掉的变量。
+ *
+ * **不是洁癖**：留着会让日志里出现一个早已不存在的 pane/tab/workspace id，看起来像
+ * 面板还开着，正好掩盖「它其实已经脱离面板在跑了」这个事实。
+ */
+const PANE_SCOPED_ENV = [
+  "HERDR_PANE_ID",
+  "HERDR_TAB_ID",
+  "HERDR_WORKSPACE_ID",
+  "HERDR_PLUGIN_CONTEXT_JSON",
+  "HERDR_PLUGIN_ENTRYPOINT_ID",
+];
+
+/** 看门狗自己跑起来必须有这些，否则子进程一定连不上 Herdr。缺了就明确报错退出。 */
+const REQUIRED_ENV = ["HERDR_PLUGIN_ID", "HERDR_SOCKET_PATH"];
+
 /** 镜像 pane 名上限。侧边栏一行放不下更多，留点余量给状态符号。 */
 const MIRROR_LABEL_MAX = 40;
 
@@ -328,7 +395,7 @@ const MIRROR_AGENT_LABEL = herdr.MIRROR_DISPLAY_LABEL;
 
 function log(level, ...args) {
   if (LEVELS[level] < LEVELS[config.logLevel]) return;
-  const line = `[${herdr.pluginId()}] ${new Date().toISOString().slice(11, 19)} ${level.toUpperCase()} ${args
+  const line = `[${herdr.pluginId()}] ${logTimestamp()} ${level.toUpperCase()} ${args
     .map((a) => (typeof a === "string" ? a : safeJson(a)))
     .join(" ")}\n`;
   try {
@@ -336,6 +403,53 @@ function log(level, ...args) {
   } catch {
     /* stderr 断了也不能影响主流程 */
   }
+  appendLogFile(line);
+}
+
+let logFileOpened = false;
+
+/**
+ * 脱离面板运行时把日志同时写进 STATE_DIR/board.log。
+ *
+ * ## 为什么必须落盘
+ *
+ * 以前日志打在面板的 stderr 上，随手就能翻。脱离面板后 stdout/stderr 接的是
+ * `stdio: "ignore"`，**什么都不写** —— 那等于把「侧边栏不动了，去哪看日志」这个
+ * 唯一的排查入口一起删掉了，而失效恰恰是静默的。所以这里补回来。
+ *
+ * 用同步 append：日志量很小（轮询只在状态变化时打），换来的是不 care 事件循环。
+ * 只轮转一代 —— 排查只需要最近这一段，两代以上没有价值，白占磁盘。
+ */
+function appendLogFile(line) {
+  if (process.env.BOARD_DETACHED !== "1") return;
+  try {
+    if (!logFileOpened) {
+      logFileOpened = true;
+      fsSync.mkdirSync(STATE_DIR, { recursive: true });
+      const st = fsSync.statSync(BOARD_LOG_FILE, { throwIfNoEntry: false });
+      if (st && st.size > BOARD_LOG_MAX_BYTES) {
+        fsSync.rmSync(`${BOARD_LOG_FILE}.1`, { force: true });
+        fsSync.renameSync(BOARD_LOG_FILE, `${BOARD_LOG_FILE}.1`);
+      }
+    }
+    fsSync.appendFileSync(BOARD_LOG_FILE, line);
+  } catch {
+    /* 写不了日志绝不能拖垮主流程 */
+  }
+}
+
+/**
+ * 日志时间戳用**本地时间**。
+ *
+ * 早先写的是 `toISOString().slice(11, 19)`，那是 UTC。本机在 UTC+8，所以日志里的
+ * 17:04 对应 `date` 的 01:04 —— 排查时对不上，看起来像「日志停在八小时前」。
+ * 之前无所谓（日志打在面板上，和终端输出混在一起），但脱离面板之后
+ * `board.log` 是**唯一的**诊断入口，时间对不上会直接误导排查方向。
+ */
+function logTimestamp() {
+  const d = new Date();
+  const p = (n, w = 2) => String(n).padStart(w, "0");
+  return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
 }
 
 function safeJson(value) {
@@ -567,6 +681,8 @@ async function main() {
   switch (MODE) {
     case "startup":
       return modeStartup();
+    case "watchdog":
+      return modeWatchdog();
     case "pane":
       return modePane();
     case "action":
@@ -620,27 +736,195 @@ async function modeStartup() {
   return undefined;
 }
 
+/**
+ * 拉起管理器 —— 现在是「保证看门狗在跑」，由看门狗去拉管理器。
+ *
+ * 为什么不直接拉管理器：直接拉等于把「谁来保证它一直活着」又退回给 [[startup]]，
+ * 那正是这次要消灭的静默失效。多一跳换来崩溃自愈。
+ */
 async function ensureBoardRunning() {
-  if (await boardIsRunning()) {
-    log("info", "管理器已在运行");
+  if (await watchdogIsRunning()) {
+    log("info", "看门狗已在运行");
     return true;
   }
-  const res = await herdr.pluginPaneOpen({
-    plugin: herdr.pluginId(),
-    entrypoint: "board",
-    placement: "tab",
-  });
-  if (res.ok) {
-    log("info", "已拉起管理器面板");
-    return true;
+  const env = childEnv(process.env);
+  const missing = REQUIRED_ENV.filter((k) => !env[k]);
+  if (missing.length > 0) {
+    // 这里必须喊出来。startup 钩子的环境缺了变量，插件就会安静地什么都不做 ——
+    // 而失效是静默的，这个 warn 可能是用户唯一能看到的线索。
+    log("error", `环境缺少 ${missing.join(", ")}，无法拉起看门狗（侧边栏将不会更新）`);
+    return false;
   }
-  log("warn", `拉起管理器失败: ${res.error}`);
-  return false;
+  startDetached(["--mode", "watchdog"], env);
+  log("info", "已拉起看门狗");
+  return true;
+}
+
+/**
+ * 给脱离面板的子进程准备环境：摘掉面板作用域的变量，标记自己是脱离运行的。
+ *
+ * 纯函数，不读 `process.env`（由参数传入），方便断言。
+ *
+ * @param {Record<string, string | undefined>} env
+ * @returns {Record<string, string>}
+ */
+export function childEnv(env) {
+  /** @type {Record<string, string>} */
+  const out = {};
+  for (const [key, value] of Object.entries(env || {})) {
+    if (typeof value !== "string") continue;
+    if (PANE_SCOPED_ENV.includes(key)) continue;
+    out[key] = value;
+  }
+  out.BOARD_DETACHED = "1";
+  return out;
+}
+
+/**
+ * 脱离当前进程组地启动一个子进程。
+ *
+ * ## 四个选项各自防的是什么
+ *
+ * - `detached: true` → 子进程活过父进程。父进程退出后它被 reparent 到 init，
+ *   **这是「关掉标签页也杀不掉」的全部机制**。
+ * - `stdio: "ignore"` → 不继承管道。继承了的话父进程退出后管道没人读，子进程
+ *   写日志就会阻塞；本仓库 `claude.mjs` 那条「继承管道会把事件循环卡住」的坑
+ *   就是同一回事。
+ * - `unref()` → 父进程不必等它，可以立刻退出。
+ * - `windowsHide: true` → Windows 上不要弹出黑框（`detached` 在那边等价于
+ *   `CREATE_NEW_PROCESS_GROUP`，默认会开新控制台）。
+ *
+ * 三个平台共用这一份实现，不碰任何平台 API。
+ *
+ * @param {string[]} args
+ * @param {Record<string, string>} env
+ */
+function startDetached(args, env) {
+  try {
+    const child = spawn(process.execPath, [path.join(HERE, "board.mjs"), ...args], {
+      detached: true,
+      stdio: "ignore",
+      windowsHide: true,
+      env,
+    });
+    child.unref();
+    return true;
+  } catch (err) {
+    log("error", `启动脱离进程失败: ${err?.message || err}`);
+    return false;
+  }
 }
 
 async function boardIsRunning() {
   const pid = await store.readPidFile(LOCK_FILE);
   return pid !== null && store.pidAlive(pid);
+}
+
+async function watchdogIsRunning() {
+  const pid = await store.readPidFile(WATCHDOG_LOCK_FILE);
+  return pid !== null && store.pidAlive(pid);
+}
+
+async function acquireWatchdogLock() {
+  const existing = await store.readPidFile(WATCHDOG_LOCK_FILE);
+  if (existing !== null && existing !== process.pid && store.pidAlive(existing)) return false;
+  await store.writePidFile(WATCHDOG_LOCK_FILE);
+  return true;
+}
+
+/**
+ * 看门狗：唯一职责是保证管理器活着。
+ *
+ * 它自己不住在面板里，所以没有「用户随手关掉」这一说。它唯一的死法是被外部杀掉
+ * （OOM / 手动 kill），而那种情况下管理器还活着 —— 于是管理器那边会反过来把它拉回来
+ * （`modePane` 里的 `ensureWatchdogRunning`）。**双向守着才是完整的**：
+ * 只有单向的话，任何一方死掉都会退化到「没有崩溃自愈」，而那正是要消灭的状态。
+ */
+async function modeWatchdog() {
+  const missing = REQUIRED_ENV.filter((k) => !process.env[k]);
+  if (missing.length > 0) {
+    log("error", `看门狗缺少 ${missing.join(", ")}，无法工作，退出`);
+    return;
+  }
+  if (!(await acquireWatchdogLock())) return;
+
+  // 看门狗不需要管理器那套退出流程（没有客户端要关、没有镜像行要保留），
+  // 只要把锁还回去就行。留着 pid 文件不清理的话，下次 herdr 重启时会看到一个
+  // 「看起来还在跑」的死 pid。
+  installWatchdogSignalHandlers();
+
+  log("info", `看门狗已启动（每 ${WATCHDOG_INTERVAL_MS / 1000}s 检查一次管理器）`);
+
+  let failures = 0;
+  let ticking = false;
+
+  /**
+   * 心跳的调度器。
+   *
+   * ## 这里为什么**不能**用文件里的 `sleep()`
+   *
+   * `sleep()` 里的定时器是 `unref()` 的 —— 它需要靠调用方别的东西撑住事件循环
+   * （管理器有 SSE 连接和轮询 interval，所以能撑住）。看门狗除了 sleep **什么都不
+   * 持有**，于是事件循环一空 Node 就直接退出。
+   *
+   * 实测就是这个坑：第一版看门狗用 `for(;;) { ...; await sleep(5s) }`，日志里能看到
+   * 「管理器已不在（第 1 次），已重新拉起」，然后**进程就没了** —— pid 文件还留在盘上。
+   * 而这个失效是静默的：管理器活着，看门狗死了，崩溃自愈正好在最需要的时候不存在。
+   *
+   * 所以这里用**没有 unref 的定时器**（`setTimeout` / `setInterval` 默认就是 ref 的），
+   * 它会撑住事件循环，这正是「我必须一直活着」在代码里的表达。
+   */
+  const schedule = (delayMs) => {
+    const timer = setTimeout(() => void tick(), delayMs);
+    runtime.timers.push(timer); // 退出时统一清
+  };
+
+  async function tick() {
+    if (ticking) return; // 慢一轮没跑完就跳过，绝不重入
+    ticking = true;
+    try {
+      if (!(await boardIsRunning())) {
+        failures += 1;
+        // 连续失败才退避。第一次立刻拉，否则每次 herdr 重启都要白等一轮。
+        if (failures <= 1) {
+          await respawnBoard();
+        } else {
+          const delay = Math.min(30_000, 1_000 * 2 ** (failures - 2));
+          log("debug", `管理器不在，退避 ${delay}ms 后重试`);
+          schedule(delay);
+          return;
+        }
+      } else {
+        failures = 0;
+      }
+    } catch (err) {
+      // 看门狗自己抛异常等于全局失效。必须吞掉并继续 —— 它唯一的职责就是活着。
+      log("error", `看门狗这一轮出错: ${err?.message || err}`);
+    } finally {
+      ticking = false;
+    }
+    schedule(WATCHDOG_INTERVAL_MS);
+  }
+
+  async function respawnBoard() {
+    if (await boardIsRunning()) return; // 退避期间自己好了
+    if (startDetached(["--mode", "pane"], childEnv(process.env))) {
+      log("info", `管理器已不在（第 ${failures} 次），已重新拉起`);
+    }
+  }
+
+  await tick();
+}
+
+/** 反向自愈：管理器发现看门狗没了就把它拉回来。见 {@link modeWatchdog}。 */
+async function ensureWatchdogRunning() {
+  if (await watchdogIsRunning()) return;
+  const env = childEnv(process.env);
+  const missing = REQUIRED_ENV.filter((k) => !env[k]);
+  if (missing.length > 0) return;
+  if (startDetached(["--mode", "watchdog"], env)) {
+    log("info", "看门狗不在，已重新拉起");
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -656,15 +940,17 @@ async function modeAction(action) {
   await reconcileAgentView(runtime.state, { reason: `action:${action}` });
 
   if (action === "board") {
-    const res = await herdr.pluginPaneOpen({
-      plugin: herdr.pluginId(),
-      entrypoint: "board",
-      placement: "tab",
-    });
-    if (!res.ok) {
-      log("warn", `打开看板失败: ${res.error}`);
-      process.exitCode = 1;
-    }
+    // 这个 action 以前是「打开看板面板」，现在看板不再住在面板里，所以它改成
+    // **保证看板在跑** —— 这才是侧边栏不动时用户真正需要的那一下。同时把日志路径
+    // 报出来，因为面板不再是查看日志的地方了。
+    const ok = await ensureBoardRunning();
+    log(
+      "info",
+      ok
+        ? `看板已确保在运行；日志：tail -f ${BOARD_LOG_FILE}`
+        : `看板拉起失败，详见 ${BOARD_LOG_FILE}`,
+    );
+    if (!ok) process.exitCode = 1;
     return;
   }
 
@@ -730,7 +1016,9 @@ async function modePane() {
   if (!process.env.HERDR_PLUGIN_ID) return;
 
   if (!(await acquireBoardLock())) {
-    log("info", "已有一个管理器在运行，这个面板退出");
+    // 正常情况：脱离运行的管理器已经在了，这个面板只是个日志查看器，锁拿不到就退出。
+    // 说清楚它不是失败，否则用户会以为插件坏了。
+    log("info", "管理器已在脱离面板运行，这个面板只作日志查看器，已退出");
     return;
   }
 
@@ -767,10 +1055,21 @@ async function modePane() {
     }, config.pollIntervalMs),
   );
 
+  // 反向自愈：看门狗被外部杀掉时把它拉回来。没有这一步的话，看门狗一死就退化成
+  // 「没有崩溃自愈」，而那正是这次改造要消灭的状态。间隔比主循环宽 —— 它只是兜底，
+  // 不是热路径。
+  runtime.timers.push(setInterval(() => void ensureWatchdogRunning(), 30_000));
+
   // Herdr 重启后 startup 钩子已经重放过视图，这里兜底再确认一次
   await reconcileAgentView(runtime.state, { reason: "pane 启动", force: true });
 
-  log("info", `管理器已启动（pane=${process.env.HERDR_PANE_ID || "?"}，轮询 ${config.pollIntervalMs}ms）`);
+  const detached = process.env.BOARD_DETACHED === "1";
+  log(
+    "info",
+    detached
+      ? `管理器已启动（脱离面板运行，日志见 ${BOARD_LOG_FILE}，轮询 ${config.pollIntervalMs}ms）`
+      : `管理器已在面板中启动（pane=${process.env.HERDR_PANE_ID || "?"}，轮询 ${config.pollIntervalMs}ms）`,
+  );
   // 槽位数要说出来：它决定「一个 agent 行最多能列几个 session」，而模板行数写少了
   // 的后果是**静默**的（多的 session 连 `+N` 都不会出现，用户不知道自己少了）。
   log("info", `每个 agent 行最多列 ${runtime.slots.length} 个 session（${runtime.slotSource}）`);
@@ -787,6 +1086,27 @@ async function acquireBoardLock() {
 async function releaseBoardLock() {
   const pid = await store.readPidFile(LOCK_FILE);
   if (pid === process.pid) await store.removeFile(LOCK_FILE);
+}
+
+/**
+ * 看门狗的退出处理：只还锁，然后退出。
+ *
+ * 和管理器的 {@link installSignalHandlers} 分开是因为两者要收尾的东西完全不同 ——
+ * 复用管理器的那个会在这里去关 opencode/codex 客户端和停转轮，纯粹是无谓的副作用。
+ */
+function installWatchdogSignalHandlers() {
+  for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"]) {
+    process.on(signal, () => {
+      if (runtime.shuttingDown) return;
+      runtime.shuttingDown = true;
+      log("info", `收到 ${signal}，看门狗退出（管理器继续运行）`);
+      for (const timer of runtime.timers) clearInterval(timer);
+      void (async () => {
+        await store.removeFile(WATCHDOG_LOCK_FILE);
+        process.exit(0);
+      })();
+    });
+  }
 }
 
 function installSignalHandlers() {

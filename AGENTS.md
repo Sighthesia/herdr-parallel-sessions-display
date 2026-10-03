@@ -19,7 +19,7 @@ External contributors and coding agents are welcome. This file is the entry poin
 
 | File | Responsibility |
 | --- | --- |
-| `src/board.mjs` (~3.7k lines) | Resident manager. Modes: `startup` (one-shot hook), `pane` (resident, the only daemon logic), `action` (communicates via request files in the state dir), `once` (one round, then exit) |
+| `src/board.mjs` (~4.4k lines) | Resident manager. Modes: `startup` (one-shot hook), `watchdog` (detached, keeps the manager alive), `pane` (the resident manager itself), `action` (communicates via request files in the state dir), `once` (one round, then exit) |
 | `src/opencode.mjs` | OpenCode HTTP client, v1/v2 auto-detected |
 | `src/codex.mjs` | Codex app-server client, hand-written WebSocket over unix socket |
 | `src/claude.mjs` | Claude Code discovery: `spawn claude agents --json` + field mapping and title fallback. No persistent connection |
@@ -28,6 +28,67 @@ External contributors and coding agents are welcome. This file is the entry poin
 | `src/mirror.mjs` | Keepalive process inside mirror panes; only used when `MIRROR_INLINE=false` |
 
 `[[startup]]` is a one-shot init hook, not a supervised daemon — no resident logic there.
+
+## The manager must NOT live in a pane
+
+This is the single most load-bearing constraint in the repo, and it was learned the hard
+way (three "it's broken again" reports in one session).
+
+The manager runs **detached**, watched by a second detached process:
+
+```
+[[startup]] (once) ─→ watchdog (detached) ─→ manager (detached)
+                            ↑                      │
+                            └──── mutual liveness ─┘
+```
+
+Why, measured on this machine:
+
+- Official docs: `tab / zoomed / overlay` plugin panes **are normal panes**. A pane-hosted
+  manager is a tab in one of the user's project workspaces — they close it while working
+  across 9 workspaces and it dies.
+- `[[startup]]` fires **once per server lifetime**. Observed: `herdr server` pid 2487 ran
+  14h40m continuously while `AUTO_START` fired exactly once. Nothing can revive the manager
+  after that except a Herdr restart.
+- The failure is **silent**: no error anywhere, tokens just stop being refreshed, and from
+  outside it is indistinguishable from a feature bug. That is why it was reported as a bug
+  three times instead of "the board is dead".
+
+Invariants to preserve:
+
+- **Watchdog and manager check each other.** One direction is not enough: whichever one
+  dies degrades to "no crash recovery", which is the state this design exists to eliminate.
+  `modePane` re-spawns the watchdog every 30s; the watchdog checks every 5s.
+- **The watchdog's heartbeat timer must NOT be `unref()`'d.** `sleep()` in board.mjs unrefs
+  its timer (callers hold the loop open some other way); the watchdog holds nothing, so
+  `for(;;) { await sleep() }` exits immediately after the first tick. Measured: it logged
+  "respawned the manager" once and then vanished, leaving a stale pid file. `modeWatchdog`
+  uses a plain ref'd `setTimeout` for exactly this reason.
+- **Detaching needs no plumbing.** `HERDR_PANE_ID` appears in board.mjs exactly once (a log
+  line); `HERDR_SOCKET_PATH` is a fixed path (`~/.config/herdr/herdr.sock`), not per-instance;
+  `herdrBin()` never hardcodes. `childEnv()` strips the pane-scoped vars so logs don't imply
+  a pane still exists.
+- **Cross-platform by construction.** Only `spawn(detached:true)` + `unref()` + `windowsHide`.
+  No systemd, no launchd, no Windows service — those need per-platform files and macOS
+  already rules systemd out (manifest declares `platforms = ["linux","macos"]`).
+- **The log must land in a file.** `stdio:"ignore"` means nowhere to read logs otherwise, and
+  "sidebar stopped updating with no error" needs a diagnostic. `STATE_DIR/board.log`, one
+  generation of rotation, local-time timestamps.
+
+`[[panes]] id = "board"` is now only a **log viewer**: the detached manager holds the board
+lock, so that process exits immediately. Do not treat it as the resident process, and do not
+assume you can restart the manager by opening a pane — you cannot.
+
+`prefix+shift+o` / the `board` action means **"make sure it's running"**, not "open a window".
+
+## Windows is not supported
+
+`platforms = ["linux", "macos"]` is honest. Two real blockers: `codex.mjs` speaks
+`http.request({socketPath})` (a Unix domain socket; Windows uses a named pipe and the path is
+hardcoded `.sock`), and Claude discovery matches on `foreground_process_group_id` / kills by
+process group, which does not exist on Windows. Everything else is already portable — the
+win32 named-pipe socket path, `ss`-only-on-Linux port discovery, and `herdrBin()` are all
+handled. Pure-OpenCode mode would probably work on Windows but has never been run there.
 
 ## Required manual step: the sidebar template
 
@@ -65,11 +126,12 @@ vanish with no `+N` at all.
 
 ## Keep `AUTO_START` on
 
-`AUTO_START` ships `true`. Turning it off causes **silent failure**: the board stops
-running, so tokens stop being refreshed, so the sidebar quietly freezes at its last
-state — no error anywhere. Users hit this weeks after install, usually right after a
-Herdr restart. The cost of leaving it on is one extra tab. Do not "optimise" it away,
-and do not weaken the startup log message that explains the consequence.
+`AUTO_START` ships `true`. Turning it off causes **silent failure**: nothing starts the
+watchdog, so no manager runs, so tokens stop being refreshed, so the sidebar quietly
+freezes at its last state — no error anywhere. Users hit this weeks after install,
+usually right after a Herdr restart. The cost of leaving it on is now **zero** (no tab
+is opened any more). Do not "optimise" it away, and do not weaken the startup log
+message that explains the consequence.
 
 ## Commands
 
@@ -80,10 +142,10 @@ herdr plugin link /absolute/path/herdr-parallel-sessions-display
 # the real .env lives here (config/.env.example in the repo is only a template)
 herdr plugin config-dir herdr-parallel-sessions-display
 
-# open the board (the resident manager runs in this tab)
-herdr plugin pane open --plugin herdr-parallel-sessions-display --entrypoint board
+# make sure the manager is running (this is the recovery entry point)
+herdr plugin action invoke herdr-parallel-sessions-display.board
 
-# recompute now; starts the manager if it isn't running
+# recompute now
 herdr plugin action invoke herdr-parallel-sessions-display.sync
 
 # clear all mirror rows / panes / fallback workspace
@@ -93,11 +155,18 @@ herdr plugin action invoke herdr-parallel-sessions-display.reap
 node src/board.mjs --mode once
 ```
 
-- Logs are **not** in `herdr plugin log list`. Find the board pane via `herdr pane list --json` (label `Herdr Sessions`) and read it with `herdr pane read <id> --lines 200`.
-- Restart the board tab after editing `.env` or code.
+- **Logs:** `tail -f "$(herdr plugin config-dir herdr-parallel-sessions-display)"/../state/board.log`
+  — or the real path from `HERDR_PLUGIN_STATE_DIR`, shown in the manager's own first log line.
+  Nothing lands in `herdr plugin log list` (that only covers plugin *commands*).
+- Restart the manager after editing `.env` or code: kill the `--mode pane` process and let the
+  watchdog respawn it (`kill $(cat "$STATE_DIR/board.lock")`), or invoke the `board` action.
 - `LOG_LEVEL=debug` prints per-session keep/skip reasons.
+- **Is it alive?** Compare the pid in `board.lock` against reality, and check
+  `board.log`'s mtime — it is rewritten every poll. A stale mtime with a live-looking pid is
+  exactly the silent failure this repo keeps fighting.
 - Sidebar shows no session rows at all → the template step above was skipped; check `[ui.sidebar.agents]` first, it is by far the most common cause.
-- Sidebar froze after a Herdr restart → the board is not running (`ps -ef | grep 'board\.mjs --mode pane'`); `AUTO_START` should make that impossible.
+- Sidebar froze → check `board.lock`/`watchdog.lock` first; both are pid files and
+  `pidAlive()` reclaims stale ones, so a leftover file is harmless.
 
 ## Adding a config key
 

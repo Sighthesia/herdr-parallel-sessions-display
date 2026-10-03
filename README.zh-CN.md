@@ -90,10 +90,10 @@ Herdr Agents 视图
 3) 把插件检出目录里的 config/.env.example 复制到
 `herdr plugin config-dir herdr-parallel-sessions-display` 指向目录下的 .env（留空用默认即可）；
 4) 把 `$oc_sess1..6` 这几行合并进 `~/.config/herdr/config.toml` 的 `[ui.sidebar.agents]`（想加就继续加 `$oc_sessN`，看板自己数），
-不要丢掉已有的行；5) 打开看板
-（`herdr plugin pane open --plugin herdr-parallel-sessions-display --entrypoint board`），
+不要丢掉已有的行；5) 拉起看板
+（`herdr plugin action invoke herdr-parallel-sessions-display.board`），
 执行 sync action，确认 Agents 侧边栏出现会话行。
-失败时用 `herdr pane read` 读看板面板（label 是 "Herdr Sessions"）的日志并修复。
+失败时看 `~/.local/state/herdr/plugins/herdr-parallel-sessions-display/board.log` 并修复。
 不要改其它插件的配置。
 ```
 
@@ -104,14 +104,14 @@ herdr plugin install Sighthesia/herdr-parallel-sessions-display --yes
 herdr plugin config-dir herdr-parallel-sessions-display  # .env 写在这里
 
 # 把插件检出目录里的 config/.env.example 复制成 .env，然后：
-herdr plugin pane open --plugin herdr-parallel-sessions-display --entrypoint board
+herdr plugin action invoke herdr-parallel-sessions-display.board
 ```
 
-`.env` 可以留空，默认值直接能跑。改完 `.env` 需要关掉看板标签页再重开。
+`.env` 可以留空，默认值直接能跑。改完 `.env` 需要重启管理器（见下面的「日志」一节）。
 
-看板跑在一个 `Herdr Sessions` 标签页里。`AUTO_START=true`（默认）会在每次 Herdr
-重启后自动拉起它；关掉的话侧边栏会**静默**停止更新 —— 不报错，行就停在最后一次的状态。
-不建议关。
+看板**不在任何标签页里**，它是一个脱离面板的后台进程，由另一个同样脱离面板的看门狗守着。
+所以关标签页不会再杀掉它。`AUTO_START=true`（默认）会在每次 Herdr 恢复会话时拉起看门狗；
+关掉的话侧边栏会**静默**停止更新 —— 不报错，行就停在最后一次的状态。不建议关。
 
 三个 action（命令面板里按 id 也能调）：
 
@@ -166,16 +166,27 @@ rows = [
 
 ## 故障排查
 
-日志**不在** `herdr plugin log list` 里，看板面板的输出走 pane：
+日志**不在** `herdr plugin log list` 里（那里只有插件*命令*的日志）。管理器的日志写在
+状态目录：
 
 ```bash
-herdr pane list --json | jq -r '.result.panes[]|select(.label=="Herdr Sessions")|.pane_id'
-herdr pane read <看板pane_id> --lines 200
+tail -f ~/.local/state/herdr/plugins/herdr-parallel-sessions-display/board.log
 ```
+
+真实路径会在管理器启动的第一行日志里写出来。文件有两代轮转（`board.log.1`）。
+
+判断是否还活着：看 `board.log` 的修改时间（每轮轮询都会重写），或者
+
+```bash
+cat ~/.local/state/herdr/plugins/herdr-parallel-sessions-display/board.lock     # 管理器 pid
+cat ~/.local/state/herdr/plugins/herdr-parallel-sessions-display/watchdog.lock   # 看门狗 pid
+```
+
+这两个是 pid 文件，死了会被自动回收，所以文件残留本身无害。
 
 常见情况：
 
-- **列表不更新了**：看板标签页被关了或 Herdr 重启过。执行 `sync` action 拉起来；`AUTO_START=true` 可自动拉起。
+- **列表不更新了**：执行 `board` action 拉起来；正常情况下看门狗会自己处理。
 - **侧边栏空了 / `no matching agents`**：全局 `agent.view.set` 筛选把所有行藏了。执行 `sync` 校准，不需要就保持 `INSTALL_AGENT_VIEW=false`。
 - **行比预期少**：日志里搜让出记录，被真实 TUI 占住的会话是故意跳过的。
 - **连不上 server**：检查 `OPENCODE_SERVER_URL`，非默认端口需要装 `ss` / `lsof` 才能自动探测。
@@ -194,8 +205,13 @@ herdr pane read <看板pane_id> --lines 200
 
 ```bash
 herdr plugin link /绝对路径/herdr-parallel-sessions-display
-# 改完代码关掉看板标签页再重开
+# 改完代码：杀掉管理器进程，看门狗会自动用新代码拉起来
+kill "$(cat ~/.local/state/herdr/plugins/herdr-parallel-sessions-display/board.lock)"
 node src/board.mjs --mode once  # 跑一轮就退，管理器没跑时用
 ```
 
 没有测试套件，真机联调验证（开着 Herdr 和各 agent，看侧边栏）。`LOG_LEVEL=debug` 会打出每个会话建行 / 不建行的原因。
+
+进程结构：`--mode startup`（Herdr 启动时跑一次）拉起 `--mode watchdog`（脱离面板），
+看门狗拉起 `--mode pane`（管理器本体，也脱离面板）。两者互相检查存活。
+`[[panes]]` 里那个 board 面板只是日志查看器，不是常驻进程。

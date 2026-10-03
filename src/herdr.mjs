@@ -928,11 +928,11 @@ export async function reportMetadata({ paneId, seq, title, tokens }) {
   return cli(args);
 }
 
-export async function pluginPaneOpen({ plugin, entrypoint, placement }) {
-  const args = ["plugin", "pane", "open", "--plugin", plugin, "--entrypoint", entrypoint, "--no-focus"];
-  if (placement) args.push("--placement", placement);
-  return cli(args);
-}
+// 注意：这里**没有** `pluginPaneOpen` 之类的「开面板」封装。
+// 常驻管理器早先住在 `[[panes]]` 面板里，需要用它把自己拉起来；现在管理器脱离面板
+// 运行（见 board.mjs 顶部关于「为什么不再住在面板里」的说明），已经没有任何地方需要
+// 主动开面板，所以这个封装删掉了 —— 留着会让人以为还能靠开面板来恢复常驻进程，
+// 而那条路现在恰恰是行不通的（面板拿不到管理器锁，会立刻退出）。
 
 /** --message 最终会进 Herdr 的通知文案，留个上限避免异常长文本。 */
 function truncateMessage(text) {

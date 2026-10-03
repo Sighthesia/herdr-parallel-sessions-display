@@ -121,12 +121,56 @@
 
 ### 6.1 常驻管理器
 
-插件 v1 的 `[[startup]]` 钩子是**一次性初始化，不是受监管的守护进程**，因此不能在钩子里后台常驻。管理器以**插件面板**形式常驻：
+管理器**脱离面板运行**，由一个同样脱离面板的看门狗守着：
 
-- 插件声明 `[[panes]] id = "board"`，作为管理/看板面板
+```
+[[startup]]（一次性）─→ 看门狗（脱离面板）─→ 管理器（脱离面板）
+                            ↑                      │
+                            └──── 互相检查存活 ────┘
+```
+
+- 插件声明 `[[panes]] id = "board"`，但它的角色已经变成**日志查看器**：脱离运行的管理器
+  持有 `board.lock`，面板进程拿到锁失败会立刻退出。**不能靠开面板来恢复管理器。**
 - 管理器负责：发现 server → 订阅事件 + 轮询兜底 → 维护 `sessionID ↔ paneID` 映射 → 增删镜像 pane
-- `[[startup]]` 钩子负责在 Herdr 恢复会话后读取 `HERDR_PLUGIN_STATE_DIR` 里的映射并重建上报（与官方文档推荐的「保存声明式视图 + startup 重放」一致）
-- 面板可由用户手动打开；自动拉起为可配置开关
+- `[[startup]]` 钩子负责在 Herdr 恢复会话后读取 `HERDR_PLUGIN_STATE_DIR` 里的映射并重建上报（与官方文档推荐的「保存声明式视图 + startup 重放」一致），然后拉起看门狗
+
+#### 为什么不能住在面板里（实测）
+
+早先的设计把管理器放在 `[[panes]]` 面板里，理由是「`[[startup]]` 是一次性钩子，不是守护
+进程，所以常驻逻辑只能放面板」。**推论成立，结论错误**，代价是频繁静默失效：
+
+- 官方文档写明 `tab / zoomed / overlay` 面板**就是普通面板**。于是管理器变成用户某个项目
+  工作区里的一个普通标签页 —— 本机用户横跨 9 个工作区干活，**随手关掉就杀掉它**。
+- `[[startup]]` **每个 server 生命周期只跑一次**。实测 `herdr server` pid 2487 连续运行
+  14h40m 期间它只触发过一次，所以面板一死就再也不会被拉回来，直到用户自己重启 Herdr。
+- **全程零报错**：token 不再刷新，侧边栏冻在最后一次状态，从外面看和「功能有 bug」无法
+  区分。因此同一个问题被当成功能 bug 报了三次，而不是「看板已经死了」。
+
+#### 三条必须守住的约束
+
+1. **看门狗与管理器互相检查存活。** 单向不够：任何一方死掉都会退化到「没有崩溃自愈」，
+   而那正是这套结构要消灭的状态。看门狗每 5s 查一次，管理器每 30s 反查一次。
+2. **看门狗的心跳定时器不能 `unref()`。** board.mjs 里的 `sleep()` 会 unref 自己的定时器
+   （调用方靠别的东西撑住事件循环），而看门狗除了 sleep **什么都不持有**，于是
+   `for(;;) { await sleep() }` 在第一轮之后就退出。实测：它打了一次「已重新拉起」就消失，
+   pid 文件留在盘上 —— 失效依然是静默的，而且正好发生在最需要它的时候。所以看门狗用
+   **ref 的** `setTimeout` 驱动心跳。
+3. **脱离面板不需要补任何管道。** `HERDR_PANE_ID` 在 board.mjs 里只出现一次（一行启动
+   日志）；`HERDR_SOCKET_PATH` 是固定路径（`~/.config/herdr/herdr.sock`），不随 server
+   实例变；`herdrBin()` 从不硬编码。`childEnv()` 只负责摘掉面板作用域的变量，避免日志里
+   出现一个早已不存在的 pane id 而掩盖「它其实已经脱离面板在跑了」这个事实。
+
+#### 为什么不用 systemd
+
+跨平台。systemd 是 Linux 专属，而 manifest 声明 `platforms = ["linux", "macos"]`，对等物是
+launchd —— 等于每个平台各写一份配置。Windows 还要再写任务计划程序或服务（后者要管理员）。
+
+替代方案只用 Node 自带的 `spawn(detached:true)` + `unref()` + `windowsHide`：底层在
+Linux/macOS 是 `setsid()`、在 Windows 是 `CREATE_NEW_PROCESS_GROUP`，**一份代码走三个
+平台，也不需要管理员权限**。`stdio:"ignore"` 同时避免了「继承了没人读的管道把事件循环卡
+住」这个本仓库已经踩过的坑。代价是没有 journal 日志，用 `board.log` 补。
+
+### 6.2 镜像 pane 与锚点模型
 
 ### 6.2 镜像 pane 与锚点模型
 
@@ -291,7 +335,7 @@ session 自带 `directory`。要找到对应的 herdr workspace，用 `herdr pan
 ```
 herdr-plugin.toml        # 清单：actions / panes / startup / keys
 src/
-  board.mjs              # 管理器：发现 server、订阅 SSE、轮询兜底、增删镜像 pane
+  board.mjs              # 看门狗 + 管理器：发现 server、订阅 SSE、轮询兜底、增删镜像 pane
   mirror.mjs             # 镜像 pane 内的驻留进程
   herdr.mjs              # Herdr CLI / socket 调用封装
   opencode.mjs           # OpenCode server 客户端（health / session / status / SSE）
@@ -319,6 +363,8 @@ README.zh-CN.md      # 中文，与英文同步维护
 8. **同一工作区里跑着多个 session 时，镜像行的 `workspace_id` 等于该目录对应工作区的 id**（落在正确的 `[n] <项目名>` 分组下，而不是全堆在 `Sessions`）。
 9. **镜像标签页的存在不改变用户原有标签页的 pane 数**（实测建镜像标签页前后，用户原有标签页的 `pane_count` 逐个不变）。
 10. **目录下所有镜像 session 都结束后，该目录的镜像标签页被整页关闭**，工作区回到镜像前的样子；没有目录再用兜底时，`Sessions` 兜底工作区也被关掉。
+11. **杀掉管理器进程，看门狗在 5s 内把它拉起来；杀掉看门狗，管理器在 30s 内把它拉起来**（互相自愈，见 6.1）。
+12. **关掉任意标签页不会影响侧边栏更新** —— 管理器不在任何面板里（见 6.1）。
 
 ---
 

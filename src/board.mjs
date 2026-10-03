@@ -1822,7 +1822,7 @@ async function applySessionState({ client, roots, activeStates, polledPermission
     }
   }
 
-  // 1c. 内联模式：把「已在前台查看过」的 session 标记出来，随后不再列它。
+  // 1c. 内联模式：记住「用户已经查看过」的 session，随后不再列它。
   //
   // 判据是**官方集成把这个 session 报成了某个 pane 的当前 session**（claimed），
   // 即用户真的把它切到了前台、看到了结果 —— 这就是用户说的「查看过就可以清除」。
@@ -1830,12 +1830,33 @@ async function applySessionState({ client, roots, activeStates, polledPermission
   // 要连续 claimed 满 IDLE_GRACE_MS 才认：实测官方集成会在两次轮询之间反复改
   // agent_session（同一个 pane 的 session 变过三次），照单全收的话会在切走
   // 的一瞬间把行误删，用户根本没看过。
+  //
+  // ## 「看过」这件事必须活得比「它现在在前台」更久
+  //
+  // 早先写成「不再 claimed 就把 acknowledgedAt 清零」，错得正好砸在唯一要紧的场景
+  // 上：用户查看 A → 切到 B → A 不再是当前 session → 清零 → **A 立刻以 `○` 回到
+  // 列表里**。整个功能等于没做（用户实测报的就是这个：「15 秒以上仍然存在」）。
+  //
+  // 所以 `acknowledgedAt` 的语义收紧成「**当前这一段连续**在前台的起点」：不再
+  // claimed 就重新计（官方集成会抖动，累计时长不能算数），而「确实查看过」这个
+  // 永久结论靠**删掉记录**来表达 —— 记录没了就再也不会从 2c 冒出来，state.json
+  // 也不会随着看过的 session 一直涨。
+  //
+  // 删记录不会让 session 在侧边栏上凭空消失：它还在前台时官方行本来就显示着它
+  // （INLINE_ALWAYS_LIST），而插件不能也不该动 Herdr 自己的行。
+  //
+  // 唯一能让它重新出现的路径是「又开始跑了」—— 有新输出，用户需要重新看到。
+  // 那条由步骤 3 在状态变成非 idle 时清零。
   if (config.mirrorInline) {
     for (const [sessionID, rec] of Object.entries(runtime.state.panes)) {
-      if (claimed.has(sessionID)) {
-        if (!rec.acknowledgedAt) rec.acknowledgedAt = now;
-      } else {
-        rec.acknowledgedAt = 0;
+      if (!claimed.has(sessionID)) {
+        rec.acknowledgedAt = 0; // 断了连续，重新计
+        continue;
+      }
+      if (!rec.acknowledgedAt) rec.acknowledgedAt = now;
+      if (now - rec.acknowledgedAt >= config.idleGraceMs) {
+        delete runtime.state.panes[sessionID];
+        log("debug", `${shortId(sessionID)} 连续在前台满 ${config.idleGraceMs}ms，视为已查看，不再列`);
       }
     }
   }
@@ -2022,6 +2043,9 @@ async function applySessionState({ client, roots, activeStates, polledPermission
       if (!rec.idleSince) rec.idleSince = now;
     } else {
       rec.idleSince = 0;
+      // 又开始跑了 = 有新输出，用户需要重新看到它，抹掉「已查看」。
+      // （这是唯一能让 1c 那个标记失效的地方；切走**不能**抹，理由见 1c。）
+      rec.acknowledgedAt = 0;
     }
 
     // 内联模式不需要自己的 agent 行，只把状态记进 rec 供 token 拼接用

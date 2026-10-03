@@ -15,11 +15,11 @@ Shows running sessions from **OpenCode**, **Codex**, and **Claude Code** in Herd
 Default mode is **inline**: no extra panes or tabs. The session list is attached to the official agent row for that directory and rendered as an ASCII tree.
 
 ```
-[1] afloat
-◐ opencode
-│▸ ● Fix slow shell reload init      ← selected in the TUI
-├─ ● Wallpaper reveal transition     ← still running in background
-└─ ○ Tray hover menu collapse…
+[1] space                            ← workspace group
+◐ opencode                           ← official agent row
+│▸ ● Conversation 1                 ← selected in the TUI
+│  ● Conversation 2                 ← still running in background
+│  ○ Conversation 3                 ← idle session
 ```
 
 ## Why

@@ -18,8 +18,8 @@ Default mode is **inline**: no extra panes or tabs. The session list is attached
 [1] afloat
 ◐ opencode
 │▸ ● Fix slow shell reload init      ← selected in the TUI
-│  ● Wallpaper reveal transition     ← still running in background
-│  ○ Tray hover menu collapse…
+├─ ● Wallpaper reveal transition     ← still running in background
+└─ ○ Tray hover menu collapse…
 ```
 
 ## Why
@@ -102,7 +102,7 @@ Full commented list: [`config/.env.example`](config/.env.example). Most users on
 | `OPENCODE_SERVER_URL` | empty | e.g. `http://127.0.0.1:4096`. Empty = auto-detect |
 | `OPENCODE_SERVER_PASSWORD` | empty | Basic Auth password, if the server has one |
 | `MIRROR_INLINE` | `true` | `false` = legacy one-pane-per-session mode (opencode only) |
-| `PARALLEL_CONNECTOR` | `bar` | `bar` / `tree` / `none` |
+| `PARALLEL_CONNECTOR` | `bar` | `bar` (default): TUI-selected session is the root `│▸`, others are branches `├─`/`└─`. `tree` / `none` also available |
 | `CODEX_ENABLED` / `CLAUDE_ENABLED` | `true` | Set `false` to skip that provider |
 | `CLAUDE_BIN` | empty | Absolute path if the board process can't find `claude` on its `PATH` |
 | `POLL_INTERVAL_MS` / `CLAUDE_POLL_MS` | `5000` / `10000` | Polling cadence |

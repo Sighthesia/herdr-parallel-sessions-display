@@ -2672,19 +2672,24 @@ export function formatParallelSlots(sessions) {
   for (let i = 0; i < shown; i += 1) {
     const lastLine = i === shown - 1 && marked.length <= slots.length;
     const m = marked[i];
-    // 官方 session 是「当前 TUI 里正在用的那个」，用 ▸ 点出它，比状态图标更好认
+    // The session the TUI is currently on gets a `▸` cursor — easier to spot than the
+    // state dot alone.
     let prefix;
     if (connector === "none") {
       prefix = m.official ? `▸ ${m.mark}` : m.mark;
     } else if (connector === "tree") {
-      // trunk 为空时不要留下那个空格（Herdr 反正会 trim，但代码里就别制造）
+      // Don't leave the trunk space behind when it is empty: Herdr trims it anyway,
+      // but there is no reason to manufacture it.
       const stem = trunk ? `${trunk} ` : "";
       const head = m.official ? `▸ ${m.mark}` : m.mark;
       prefix = `${stem}${lastLine ? "└─" : "├─"} ${head}`;
     } else {
-      // bar：竖线 + **固定两格**的标记位。官方行 `▸ `、其余 `  `，补出来的空格是
-      // 中间的空格（不是前导），所以 Herdr 的 trim 不影响 —— 整列才能真对齐。
-      prefix = `│${m.official ? "▸ " : "  "}${m.mark}`;
+      // `bar`: the TUI-selected session is the root and keeps the bare trunk `│` plus
+      // its `▸` cursor; every other session becomes a branch of it (`├─`, last one
+      // `└─`). Both forms are exactly 3 columns before the mark, so titles stay in
+      // one column — the pad is an *interior* space, which Herdr's leading-whitespace
+      // trim does not touch.
+      prefix = m.official ? `│▸ ${m.mark}` : `${lastLine ? "└─" : "├─"} ${m.mark}`;
     }
     out[i] = `${prefix} ${m.title}`;
   }

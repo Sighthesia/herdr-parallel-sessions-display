@@ -18,8 +18,8 @@
 [1] afloat
 ◐ opencode
 │▸ ● 排查 Shell 重载启动卡顿      ← TUI 当前选中的
-│  ● 排查壁纸揭露过渡卡顿          ← 切走但还在跑的
-│  ○ Tray hover 二级菜单收起…
+├─ ● 排查壁纸揭露过渡卡顿          ← 切走但还在跑的
+└─ ○ Tray hover 二级菜单收起…
 ```
 
 ## 为什么需要它
@@ -102,7 +102,7 @@ rows = [
 | `OPENCODE_SERVER_URL` | 空 | 如 `http://127.0.0.1:4096`，留空自动探测 |
 | `OPENCODE_SERVER_PASSWORD` | 空 | server 开了 Basic Auth 时填 |
 | `MIRROR_INLINE` | `true` | `false` = 旧的每个会话一个 pane 模式（只支持 opencode） |
-| `PARALLEL_CONNECTOR` | `bar` | `bar` / `tree` / `none` |
+| `PARALLEL_CONNECTOR` | `bar` | `bar`（默认）：TUI 选中的那个是根 `│▸`，其余是分支 `├─`/`└─`。另有 `tree` / `none` |
 | `CODEX_ENABLED` / `CLAUDE_ENABLED` | `true` | 不需要哪家就设 `false` |
 | `CLAUDE_BIN` | 空 | 看板进程的 `PATH` 里找不到 `claude` 时填绝对路径 |
 | `POLL_INTERVAL_MS` / `CLAUDE_POLL_MS` | `5000` / `10000` | 轮询节奏 |

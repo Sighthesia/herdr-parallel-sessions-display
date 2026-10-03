@@ -61,6 +61,26 @@ No `package.json`, no dependencies, no build step. No `npm install`.
 
 ## Install
 
+### Let an agent install it for you
+
+Copy-paste this to your agent:
+
+```text
+Install and verify herdr-parallel-sessions-display in this machine's Herdr.
+Steps: 1) check herdr >= 0.9.3 and `node --version` works on PATH;
+2) run `herdr plugin install Sighthesia/herdr-parallel-sessions-display --yes`;
+3) copy config/.env.example from the plugin checkout to the .env in
+`herdr plugin config-dir herdr-parallel-sessions-display` (empty defaults are fine);
+4) merge the $oc_sess1..6 rows into [ui.sidebar.agents] in ~/.config/herdr/config.toml
+without dropping existing rows; 5) open the board
+(`herdr plugin pane open --plugin herdr-parallel-sessions-display --entrypoint board`),
+run the sync action, and confirm session rows appear in the Agents sidebar.
+If anything fails, read the board pane (label "Herdr Sessions") with
+`herdr pane read` and fix it. Do not edit other plugins' configs.
+```
+
+### Manual install
+
 ```bash
 herdr plugin install Sighthesia/herdr-parallel-sessions-display --yes
 herdr plugin config-dir herdr-parallel-sessions-display  # .env goes here
@@ -91,24 +111,6 @@ rows = [
   ["$oc_sess1"], ["$oc_sess2"], ["$oc_sess3"],
   ["$oc_sess4"], ["$oc_sess5"], ["$oc_sess6"],
 ]
-```
-
-### Let an agent install it for you
-
-Copy-paste this to your agent:
-
-```text
-Install and verify herdr-parallel-sessions-display in this machine's Herdr.
-Steps: 1) check herdr >= 0.9.3 and `node --version` works on PATH;
-2) run `herdr plugin install Sighthesia/herdr-parallel-sessions-display --yes`;
-3) copy config/.env.example from the plugin checkout to the .env in
-`herdr plugin config-dir herdr-parallel-sessions-display` (empty defaults are fine);
-4) merge the $oc_sess1..6 rows into [ui.sidebar.agents] in ~/.config/herdr/config.toml
-without dropping existing rows; 5) open the board
-(`herdr plugin pane open --plugin herdr-parallel-sessions-display --entrypoint board`),
-run the sync action, and confirm session rows appear in the Agents sidebar.
-If anything fails, read the board pane (label "Herdr Sessions") with
-`herdr pane read` and fix it. Do not edit other plugins' configs.
 ```
 
 ## Configuration

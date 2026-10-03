@@ -93,6 +93,24 @@ rows = [
 ]
 ```
 
+### Let an agent install it for you
+
+Copy-paste this to your agent:
+
+```text
+Install and verify herdr-parallel-sessions-display in this machine's Herdr.
+Steps: 1) check herdr >= 0.9.3 and `node --version` works on PATH;
+2) run `herdr plugin install Sighthesia/herdr-parallel-sessions-display --yes`;
+3) copy config/.env.example from the plugin checkout to the .env in
+`herdr plugin config-dir herdr-parallel-sessions-display` (empty defaults are fine);
+4) merge the $oc_sess1..6 rows into [ui.sidebar.agents] in ~/.config/herdr/config.toml
+without dropping existing rows; 5) open the board
+(`herdr plugin pane open --plugin herdr-parallel-sessions-display --entrypoint board`),
+run the sync action, and confirm session rows appear in the Agents sidebar.
+If anything fails, read the board pane (label "Herdr Sessions") with
+`herdr pane read` and fix it. Do not edit other plugins' configs.
+```
+
 ## Configuration
 
 Full commented list: [`config/.env.example`](config/.env.example). Most users only need these:

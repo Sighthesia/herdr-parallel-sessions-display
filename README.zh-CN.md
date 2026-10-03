@@ -93,6 +93,24 @@ rows = [
 ]
 ```
 
+### 让 agent 帮你装
+
+把下面这段直接发给你的 agent：
+
+```text
+在这台机器的 Herdr 里安装并验证 herdr-parallel-sessions-display。
+步骤：1) 确认 herdr >= 0.9.3、`node --version` 在 PATH 上可用；
+2) 执行 `herdr plugin install Sighthesia/herdr-parallel-sessions-display --yes`；
+3) 把插件检出目录里的 config/.env.example 复制到
+`herdr plugin config-dir herdr-parallel-sessions-display` 指向目录下的 .env（留空用默认即可）；
+4) 把 $oc_sess1..6 这几行合并进 ~/.config/herdr/config.toml 的 [ui.sidebar.agents]，
+不要丢掉已有的行；5) 打开看板
+（`herdr plugin pane open --plugin herdr-parallel-sessions-display --entrypoint board`），
+执行 sync action，确认 Agents 侧边栏出现会话行。
+失败时用 `herdr pane read` 读看板面板（label 是 "Herdr Sessions"）的日志并修复。
+不要改其它插件的配置。
+```
+
 ## 配置
 
 完整带注释版本见 [`config/.env.example`](config/.env.example)，常用只有这些：

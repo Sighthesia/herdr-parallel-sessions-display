@@ -4,6 +4,32 @@
 
 Shows running sessions from **OpenCode**, **Codex**, and **Claude Code** in Herdr's Agents view, grouped by working directory.
 
+## What it looks like
+
+Four opencode sessions running in the same project directory, only one of them selected in a TUI.
+
+**Without the plugin (Herdr's built-in integration)**
+
+```
+[1] afloat
+  └ opencode  Tray hover二级菜单点击收起…     ← only the one that pane's TUI has selected
+```
+
+The other three are genuinely running on the same server, but the sidebar has no place for them. To confirm they're still alive you have to click through panes one by one.
+
+**With the plugin**
+
+```
+[1] afloat
+  └ ◐ opencode                               ← the official agent row for this directory
+      │▸ ● Tray hover二级菜单点击收起…       ← selected in the TUI
+      │  ● MIDI绘制乐理辅助功能              ← switched away, still running
+      │  ● 实现 Hover 菜单式…                 ← switched away, still running
+      │  ○ 使用 DAPLink 识别 H750            ← finished, still listed
+```
+
+One tree per workspace, one row per session, live state. You see how many sessions a directory has running and which one just finished, without clicking through any pane.
+
 ## Supported agents
 
 | Agent | Session source | Requirement |

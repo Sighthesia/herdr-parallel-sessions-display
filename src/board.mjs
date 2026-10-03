@@ -611,7 +611,7 @@ async function modeStartup() {
     log(
       "warn",
       "AUTO_START=false：不自动拉起常驻管理器。Herdr 下次重启后侧边栏会停止更新" +
-        "且不报错，需要手动打开看板（prefix+shift+o，或插件 action「并行会话看板」）。" +
+        "且不报错，需要手动打开看板（prefix+shift+o，或插件 action「Open Sessions Board」）。" +
         "不建议关。",
     );
   }

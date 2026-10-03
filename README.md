@@ -4,6 +4,14 @@
 
 Shows running sessions from **OpenCode**, **Codex**, and **Claude Code** in Herdr's Agents view, grouped by working directory.
 
+## Supported agents
+
+| Agent | Session source | Requirement |
+| --- | --- | --- |
+| OpenCode | Server HTTP API + SSE | Any running opencode TUI (provides the server) |
+| Codex | Shared app-server daemon | `herdr integration install codex`, plus Codex running in a Herdr pane |
+| Claude Code | `claude agents --json` | Claude running in a Herdr pane |
+
 Default mode is **inline**: no extra panes or tabs. The session list is attached to the official agent row for that directory and rendered as an ASCII tree.
 
 ```

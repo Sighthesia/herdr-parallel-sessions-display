@@ -405,9 +405,12 @@ export function normalizeState(raw) {
       if (!id || !entry || typeof entry !== "object") continue;
       base.paneFocus[id] = {
         unfocusedAt: Number.isFinite(entry.unfocusedAt) ? entry.unfocusedAt : 0,
-        // 只有见过它在前台的 pane 才允许被「切出后就消失」这条规则清空行。缺这个标记时
-        // 按「没在前台待过」处理（保守），冷启动就不会把一批早就 idle 的行一次性清掉。
+        // 只有见过它在前台的 pane 才允许被「切出后就消失」这条规则动。缺这个标记时按
+        // 「没在前台待过」处理（保守），冷启动就不会把一批早就 idle 的行一次性清掉。
         wasFocused: entry.wasFocused === true,
+        // 「这个 pane 上的 agent 是从什么时候开始闲着的」。Herdr 的 agent_status 是不带
+        // 时间戳的快照，所以这个戳只能我们自己锁；一变非 idle 就清零。
+        idleSince: Number.isFinite(entry.idleSince) ? entry.idleSince : 0,
       };
     }
   }

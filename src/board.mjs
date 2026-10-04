@@ -275,6 +275,14 @@ const PANE_SCOPED_ENV = [
 /** 看门狗自己跑起来必须有这些，否则子进程一定连不上 Herdr。缺了就明确报错退出。 */
 const REQUIRED_ENV = ["HERDR_PLUGIN_ID", "HERDR_SOCKET_PATH"];
 
+/**
+ * 官方那一行（`▸`）在「你看着它 idle 然后切走了」之后显示的标题。
+ *
+ * 不用现成会话标题是因为那一行的内容是终端标题 + Herdr 的 `agent_status`，**没有会话
+ * id**，而终端标题在这种情况下恰恰是最不该继续展示的东西 —— 它还停在「跑之前」。
+ */
+const SEEN_PLACEHOLDER_TITLE = "已看过";
+
 /** 镜像 pane 名上限。侧边栏一行放不下更多，留点余量给状态符号。 */
 const MIRROR_LABEL_MAX = 40;
 
@@ -2744,6 +2752,15 @@ function applyForegroundLeaveRule(providers, index, now) {
       const paneId = foregroundPaneIdFor(s, rec, index);
       const left = paneId ? Number(runtime.state.paneFocus?.[paneId]?.unfocusedAt) || 0 : 0;
       if (!seenAfterLeavingForeground(idleMark, left, now, grace)) {
+        // 逐条打出来：这条判据有四个独立的失败点（没解析出 pane / pane 没被激活过 /
+        // 没有 idle 戳 / 离开得比 idle 早），不打出来就只能靠猜。
+        log(
+          "debug",
+          `留 ${p.agent} ${shortId(id)}：pane=${paneId || "(解析不出)"}` +
+            `激活=${paneId ? Boolean(runtime.state.paneFocus?.[paneId]?.wasFocused) : false}` +
+            ` idle=${idleMark || "(无)"} 离开=${left || "(无)"}` +
+            ` 距今=${left ? now - left : "-"}${left && now - left < grace ? `(未满${grace}ms去抖)` : ""}`,
+        );
         kept.push(s);
         continue;
       }
@@ -2756,6 +2773,19 @@ function applyForegroundLeaveRule(providers, index, now) {
     }
     if (dropped > 0) p.wanted = kept;
   }
+  // 状态分布。`○` 出现在侧边栏上但这里一个 idle 都没有，是本插件最容易被误判的地方 ——
+  // 记一行分布，下一次「为什么没清」就不用再猜是判据错了还是状态没进来。
+  const dist = new Map();
+  for (const p of providers || []) {
+    const states = p?.statesById instanceof Map ? p.statesById : new Map();
+    const tally = {};
+    for (const s of p?.wanted || []) {
+      const st = str(states.get(str(s?.id))) || "(空)";
+      tally[st] = (tally[st] || 0) + 1;
+    }
+    dist.set(p?.agent || "?", `${(p?.wanted || []).length} 条 ${JSON.stringify(tally)}`);
+  }
+  log("debug", `切出判据输入：${[...dist].map(([a, b]) => `${a}=${b}`).join("  ")}`);
   return dropped;
 }
 
@@ -2913,16 +2943,32 @@ async function publishInlineSessions(providers) {
      *
      * 官方 session 优先用会话自己的名字（id 精确匹配时），退回终端标题 ——
      * opencode 侧走的就是后一条，因为它的会话在进 `wanted` 之前就被 claimed 剔掉了。
+     *
+     * ## 「已看过」占位：为什么不是把整行撤掉
+     *
+     * 这一行的内容是**终端标题 + Herdr 的 `agent_status`**，没有任何会话 id 可用（实测
+     * 0.9.3 会把第三方来源的 `agent_session` 剥掉），所以「用户看过没有」只能在 pane
+     * 这一层判。
+     *
+     * 但撤掉这一行不是好选择：模板是 `[["workspace"], ["state_icon","agent"],
+     * ["$oc_sess1"], ...]`，token 一撤这行就只剩状态图标和 agent 名 —— **会话标题和状态
+     * 全丢**，而「这个 pane 上有个跑完的 agent」这个信息恰恰有用。所以改成把标题换成占位：
+     * 行还在，只是不再拿一个过时标题冒充现状。
      */
-    const officialOnly = (row, slot) => [
-      slot
-        ? { title: slot.title, state: slot.state, official: true }
-        : {
-            title: stripAgentPrefix(row.terminal_title_stripped || row.title || row.pane_id),
-            state: row.agent_status,
-            official: true,
-          },
-    ];
+    const officialOnly = (row, slot) => {
+      if (paneLeftWhileIdle(str(row?.pane_id), Date.now(), config.idleGraceMs, runtime.state.paneFocus)) {
+        return [{ title: SEEN_PLACEHOLDER_TITLE, state: str(row?.agent_status) || "idle", official: true }];
+      }
+      return [
+        slot
+          ? { title: slot.title, state: slot.state, official: true }
+          : {
+              title: stripAgentPrefix(row.terminal_title_stripped || row.title || row.pane_id),
+              state: row.agent_status,
+              official: true,
+            },
+      ];
+    };
 
     const desired = new Map();
     // **遍历这个 agent 所有有官方行的工作区**，而不是只遍历有并行 session 的那些。
@@ -3330,12 +3376,52 @@ export function updatePaneFocusState(panes, store, now) {
   const list = Array.isArray(panes) ? panes : [];
   const at = Number(now) || 0;
   const focused = new Set();
+  const present = new Set();
   for (const p of list) {
-    if (p?.focused === true && str(p?.pane_id)) focused.add(str(p.pane_id));
+    const id = str(p?.pane_id);
+    if (!id) continue;
+    present.add(id);
+    if (p?.focused === true) focused.add(id);
   }
-  if (focused.size === 0) return { changed: 0, tracked: Object.keys(focus).length };
 
   let changed = 0;
+
+  // --- idle 锁存 -------------------------------------------------------------
+  // Herdr 的 `agent_status` 是**不带时间戳的快照**（「现在是 idle」），所以「它什么时候
+  // 停下来的」只能我们自己锁：进入 idle 的那一刻打戳，一变非 idle 就清零。
+  //
+  // 这一段**不受「没有聚焦」保护**的限制：idle 锁存不会给谁打上「刚刚离开」，不存在
+  // 那种误清风险，而且漏掉它会让「pane 空焦点期间停下来的会话」永远判不出看过。
+  for (const p of list) {
+    const id = str(p?.pane_id);
+    if (!id) continue;
+    const prev = focus[id] || { unfocusedAt: 0, wasFocused: false };
+    const isIdle = str(p?.agent_status) === "idle";
+    if (isIdle) {
+      if (!prev.idleSince) {
+        focus[id] = { ...prev, idleSince: at };
+        changed += 1;
+      }
+    } else if (prev.idleSince) {
+      focus[id] = { ...prev, idleSince: 0 };
+      changed += 1;
+    }
+  }
+
+  // pane 关掉后它的焦点历史没有意义，留着只会让 state.json 一直涨。
+  // **列表为空时一律不剪** —— 那和「没有聚焦」是同一类瞬时状态（调用失败 / 切换瞬间），
+  // 按「全部 pane 都关掉了」处理会把整个 store 抹光，比不剪坏得多。
+  if (list.length > 0) {
+    for (const id of Object.keys(focus)) {
+      if (!present.has(id)) {
+        delete focus[id];
+        changed += 1;
+      }
+    }
+  }
+
+  if (focused.size === 0) return { changed, tracked: Object.keys(focus).length };
+
   for (const p of list) {
     const id = str(p?.pane_id);
     if (!id) continue;
@@ -3343,14 +3429,14 @@ export function updatePaneFocusState(panes, store, now) {
     if (focused.has(id)) {
       // 重新聚焦：清掉离开时刻，但记住「它到过前台」。
       if (prev.unfocusedAt !== 0 || !prev.wasFocused) {
-        focus[id] = { unfocusedAt: 0, wasFocused: true };
+        focus[id] = { ...prev, unfocusedAt: 0, wasFocused: true };
         changed += 1;
       }
       continue;
     }
     // 没见过它在前台 → 不记。任何理由都不能替代这个前提。
     if (!prev.wasFocused) {
-      if (!focus[id]) focus[id] = { unfocusedAt: 0, wasFocused: false };
+      if (!focus[id]) focus[id] = { ...prev, unfocusedAt: 0, wasFocused: false };
       continue;
     }
     // 只在「从聚焦变成不聚焦」的那一刻打时间戳，之后每轮都沿用同一个值 ——
@@ -3360,11 +3446,30 @@ export function updatePaneFocusState(panes, store, now) {
     // 早就建好了 `{unfocusedAt: 0}` 这条记录，用「记录不存在」判断的话它**永远不会**
     // 被记上离开时刻，整条规则对这个 pane 就是死的。离线测试当场抓到了这个。
     if (!prev.unfocusedAt) {
-      focus[id] = { unfocusedAt: at, wasFocused: true };
+      focus[id] = { ...prev, unfocusedAt: at, wasFocused: true };
       changed += 1;
     }
   }
   return { changed, tracked: Object.keys(focus).length };
+}
+
+/**
+ * 这个 pane 上的 agent 停在 idle、而你在此之后把焦点移走了吗？
+ *
+ * 与 {@link seenAfterLeavingForeground} 是同一条判据，只是 idle 标尺从「会话的时间戳」
+ * 换成「pane 级的 idle 锁存」。用在官方那一行（`▸`）上：那一行的内容是终端标题 +
+ * Herdr 的 `agent_status`，**没有任何会话 id**，所以只能在 pane 这一层判。
+ *
+ * @param {string} paneId
+ * @param {number} now
+ * @param {number} graceMs
+ * @param {Record<string,{unfocusedAt?:number, wasFocused?:boolean, idleSince?:number}>} [store]
+ * @returns {boolean}
+ */
+export function paneLeftWhileIdle(paneId, now, graceMs, store) {
+  const entry = (store || runtime.state.paneFocus)?.[str(paneId)];
+  if (!entry?.wasFocused) return false;
+  return seenAfterLeavingForeground(entry.idleSince, entry.unfocusedAt, now, graceMs);
 }
 
 /**

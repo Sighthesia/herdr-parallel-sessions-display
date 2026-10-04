@@ -48,7 +48,11 @@ This plugin lists every other root session under the same directory, with live s
 Scope:
 
 - Only root sessions. Child/sub-agents are not listed separately.
-- **Finished sessions don't vanish into thin air**: once one stops it stays in the list as `○`, so you can tell "finished" from "lost". The newest `IDLE_KEEP` per directory are kept. A `○` is cleared once you have **looked at it**: either you open that session inside the TUI, or you leave that pane while it sits idle. Both rules work for every agent — opencode, Codex and Claude alike.
+- **Finished sessions don't vanish into thin air**: once one stops it stays in the list as `○`, so you can tell "finished" from "lost". The newest `IDLE_KEEP` per directory are kept. A `○` stops pretending to be current once you have **looked at it**:
+  - **The pane's own row** (the one starting with `▸`): leave that pane while it sits `○` and the title becomes `已看过` (seen). The row stays — removing it would leave a bare agent name and lose the fact that this pane has a finished agent.
+  - **Parallel session rows**: cleared outright once you open that session in the TUI, or leave that pane while it sits idle.
+
+  Both rules read only Herdr's pane focus, so they work for every agent — opencode, Codex and Claude alike.
 - Read-only. To interact, switch back to the real TUI pane.
 - No duplicates. The session your TUI has selected is yielded to the official row.
 
@@ -153,7 +157,7 @@ Full commented list: [`config/.env.example`](config/.env.example). Most users on
 | `PARALLEL_CONNECTOR` | `bar` | `bar` (default): TUI-selected session is the root `│▸`, others are branches `├─`/`└─`. `tree` / `none` also available |
 | `CODEX_ENABLED` / `CLAUDE_ENABLED` | `true` | Set `false` to skip that provider |
 | `CLAUDE_BIN` | empty | Absolute path if the board process can't find `claude` on its `PATH` |
-| `IDLE_KEEP` | `3` | Inline mode: how many finished-but-unreviewed sessions to keep **per directory**. They stay visible as `○` so you can tell "finished" from "lost". A `○` is cleared once you have looked at it — you opened that session in the TUI, **or** you left that pane while it sat idle (after `IDLE_GRACE_MS`, which keeps focus flicker from clearing the row you are reading). `0` restores the old behaviour (they vanish) |
+| `IDLE_KEEP` | `3` | Inline mode: how many finished-but-unreviewed sessions to keep **per directory**. They stay visible as `○` so you can tell "finished" from "lost". A parallel `○` row is cleared once you have looked at it — you opened that session in the TUI, **or** you left that pane while it sat idle (after `IDLE_GRACE_MS`, which keeps focus flicker from clearing the row you are reading). A pane's own `▸` row instead switches its title to `已看过`. `0` restores the old behaviour (they vanish) |
 | `SESSION_ROWS` | auto | How many sessions one agent row can show. **Empty = auto**: the board reads how many `$oc_sess*` your sidebar template's `ui.sidebar.agents.rows` references, so add `["$oc_sess7"]` there and you get a seventh row — no plugin config to touch. Set it only to cap things yourself (max 16) |
 | `POLL_INTERVAL_MS` / `CLAUDE_POLL_MS` | `5000` / `10000` | Polling cadence |
 | `LOG_LEVEL` | `info` | Use `debug` for troubleshooting |

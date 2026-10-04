@@ -2156,6 +2156,18 @@ async function applySessionState({ client, roots, activeStates, polledPermission
   if (config.mirrorInline) {
     for (const [sessionID, rec] of Object.entries(runtime.state.panes)) {
       if (activeStates.has(sessionID) || pending.has(sessionID)) continue;
+      // **必须挡掉正在跑的。** opencode 的 `time.idle` 在会话恢复运行时既不前进也不清零
+      // （实测 `state.json` 里三条 working 记录的 idleAt 全部等于 viewedAt），所以
+      // `hasBeenViewedSinceIdle` 对一条正在跑的记录同样返回 true —— 它答的是「曾经打开过」。
+      //
+      // 只靠 `activeStates` 不够：用户按下回车到 opencode 把它标成 running 之间有窗口，
+      // 这个窗口里记录会被删掉，而 2a 只遍历 activeStates（不会重建）、2c 依赖记录存在
+      // → 这一行整条从侧边栏消失，下一轮才回来。症状是「刚发完指令、等结果的那一瞬间，
+      // 那一行闪一下」。
+      //
+      // 残留竞态：`rec.state` 是上一轮写的，用户刚发指令时它还停在 idle。这个窗口靠 SSE
+      // 的 `session.updated` 立即重算来收窄（实测重算由事件驱动，秒级），不是靠轮询的 5s。
+      if (rec?.state && rec.state !== "idle") continue;
       if (!hasBeenViewedSinceIdle(rec)) continue;
       delete runtime.state.panes[sessionID];
       log("debug", `${shortId(sessionID)} 跑完后已被打开看过，不再列`);
@@ -2723,10 +2735,22 @@ function foregroundPaneIdFor(session, rec, index) {
 function applyForegroundLeaveRule(providers, index, now) {
   const grace = Math.max(0, Number(config.idleGraceMs) || 0);
   let dropped = 0;
+  const dist = new Map();
   for (const p of providers || []) {
     const wanted = p?.wanted;
     if (!Array.isArray(wanted) || wanted.length === 0) continue;
     const states = p.statesById instanceof Map ? p.statesById : new Map();
+
+    // 状态分布必须在**过滤之前**快照。这行日志存在的理由就是诊断「侧边栏有 ○ 但这里
+    // 一个 idle 都没有」，而过滤之后再统计就永远看不到被摘掉的那些行 —— 正好是它要诊断
+    // 的那一类现象。
+    const tally = {};
+    for (const s of wanted) {
+      const st = str(states.get(str(s?.id))) || "(空)";
+      tally[st] = (tally[st] || 0) + 1;
+    }
+    dist.set(str(p.agent), `${wanted.length} 条 ${JSON.stringify(tally)}`);
+
     const kept = [];
     for (const s of wanted) {
       const id = str(s?.id);
@@ -2765,19 +2789,7 @@ function applyForegroundLeaveRule(providers, index, now) {
     }
     if (dropped > 0) p.wanted = kept;
   }
-  // 状态分布。`○` 出现在侧边栏上但这里一个 idle 都没有，是本插件最容易被误判的地方 ——
-  // 记一行分布，下一次「为什么没清」就不用再猜是判据错了还是状态没进来。
-  const dist = new Map();
-  for (const p of providers || []) {
-    const states = p?.statesById instanceof Map ? p.statesById : new Map();
-    const tally = {};
-    for (const s of p?.wanted || []) {
-      const st = str(states.get(str(s?.id))) || "(空)";
-      tally[st] = (tally[st] || 0) + 1;
-    }
-    dist.set(p?.agent || "?", `${(p?.wanted || []).length} 条 ${JSON.stringify(tally)}`);
-  }
-  log("debug", `切出判据输入：${[...dist].map(([a, b]) => `${a}=${b}`).join("  ")}`);
+  log("debug", `切出判据输入：${[...dist].map(([a, b]) => `${a}=${b}`).join("  ") || "(无)"}`);
   return dropped;
 }
 

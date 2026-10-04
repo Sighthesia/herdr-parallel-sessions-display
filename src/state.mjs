@@ -323,6 +323,13 @@ export function emptyState() {
     // 持久化是为了**跨重启也稳定**：按状态重挑会让同一工作区里两个 opencode 窗口
     // 的会话树每隔几秒互换位置，看着像 bug。
     inlineHosts: {},
+    // pane_id → { unfocusedAt }。「这个 pane 从什么时候开始没有焦点」。
+    //
+    // 这是「切出后就消失」那条规则的唯一状态：用户在一个 pane 上、它 idle 的时候把焦点
+    // 移走，就说明看过了。**必须持久化** —— 插件随时可能被重启（改代码、看门狗拉起），
+    // 而「idle 发生在你离开之前还是之后」这个先后关系一旦丢了，重启后的第一轮就会把
+    // 还没看过的行误清掉，或者反过来：该清的清不掉。
+    paneFocus: {},
     agentView: null,
   };
 }
@@ -389,6 +396,18 @@ export function normalizeState(raw) {
         lastState: str(rec.lastState),
         lastStateMessage: str(rec.lastStateMessage),
         lastResume: str(rec.lastResume),
+      };
+    }
+  }
+  if (raw.paneFocus && typeof raw.paneFocus === "object") {
+    for (const [paneId, entry] of Object.entries(raw.paneFocus)) {
+      const id = str(paneId);
+      if (!id || !entry || typeof entry !== "object") continue;
+      base.paneFocus[id] = {
+        unfocusedAt: Number.isFinite(entry.unfocusedAt) ? entry.unfocusedAt : 0,
+        // 只有见过它在前台的 pane 才允许被「切出后就消失」这条规则清空行。缺这个标记时
+        // 按「没在前台待过」处理（保守），冷启动就不会把一批早就 idle 的行一次性清掉。
+        wasFocused: entry.wasFocused === true,
       };
     }
   }

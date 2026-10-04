@@ -2382,7 +2382,14 @@ async function applySessionState({ client, roots, activeStates, polledPermission
     // claude 没有连接要断（每轮都是自洽的短命 spawn），所以没有 disabled 分支的清理动作。
     if (claude.ok) await adoptClaudeSessions(claude.wanted, claude.rows);
 
-    const attached = await publishInlineSessions([
+    // 「切出后就消失」：先刷新每个 pane 的焦点时间戳，再把「在前台被看着 idle、
+    // 然后你把焦点移走」的会话从本轮渲染里摘掉。放在三个 provider 全部采完之后、
+    // 渲染之前 —— codex/claude 的空闲会话每轮都会被重新采集到，永远是「活的」，
+    // 压根进不了 selectRetainedIdle，只有这道关口能覆盖它们。
+    const focusIndex = await paneIndex({ force: true });
+    updatePaneFocusState(focusIndex.panes, runtime.state.paneFocus, Date.now());
+
+    const providers = [
       { agent: "opencode", wanted, statesById: parallelStates },
       {
         agent: "codex",
@@ -2404,7 +2411,10 @@ async function applySessionState({ client, roots, activeStates, polledPermission
         // 所以默认那句「去装官方集成」对它是错的路。覆盖文案。
         missingHint: CLAUDE_MISSING_ROWS_HINT,
       },
-    ]);
+    ];
+    applyForegroundLeaveRule(providers, focusIndex, Date.now());
+
+    const attached = await publishInlineSessions(providers);
     runtime.lastAttachSeq = nextSeq();
     // 有行在转就起 ticker，没有就停 —— 空闲期零开销。
     if (runtime.busyRows.size > 0) startBusySpinner();
@@ -2586,6 +2596,22 @@ function stopFocusRedirect() {
 }
 
 /**
+ * provider 报的 `updatedAt` 归一到**毫秒**。
+ *
+ * 单位不一致是实测出来的：opencode 的 `time.updated` 是毫秒，codex thread 的 `updatedAt`
+ * 是**秒**。两者混进同一处比较会静默错 1000 倍 —— 而错出来的结果是「几乎从不满足」
+ * 或「几乎总是满足」这种看起来像业务逻辑不对、实际是单位错的 bug。
+ *
+ * 判据：`1e11` 毫秒是 1973 年，`1e11` **秒**是 5138 年。所以真实时间戳里，小于
+ * `1e11` 的一定是秒。
+ */
+export function asMillis(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return 0;
+  return n < 1e11 ? Math.round(n * 1000) : Math.round(n);
+}
+
+/**
  * 内联模式：把「这个目录还有哪些 session 在跑」挂到该目录**官方 agent 行**上。
  *
  * ## 为什么不建 pane
@@ -2650,6 +2676,89 @@ function stopFocusRedirect() {
  * @param {Array<{agent:string, wanted:{id:string,title:string,directory:string}[], statesById:Map<string,string>, failed?:boolean, failedReason?:string, disabled?:boolean, missingHint?:string}>} providers
  * @returns {Promise<number>} 实际写入/清除的行数
  */
+
+/**
+ * 某个会话「在前台的那个 pane」是哪个。
+ *
+ * 内联模式下会话本身不占 pane：同一工作区的所有会话行都挂在 `inlineHosts[workspaceId]`
+ * 指定的那一个 pane 上。所以链路是 会话目录 → workspace → host pane。非内联模式下会话有
+ * 自己的镜像 pane，直接用 `rec.paneId`。
+ *
+ * 查不到就返回 "" —— 调用方据此**放弃这条判据**（保留行），绝不猜。
+ *
+ * @returns {string}
+ */
+function foregroundPaneIdFor(session, rec, index) {
+  const own = str(rec?.paneId);
+  if (own) return own;
+  const dir = normalizeDir(session?.directory || rec?.directory);
+  if (!dir || !index) return "";
+  let wsId = "";
+  try {
+    wsId = str(resolveWorkspaceForDirectory(dir, index)?.workspaceId);
+  } catch {
+    return "";
+  }
+  return wsId ? str(runtime.state.inlineHosts?.[wsId]) : "";
+}
+
+/**
+ * 「切出后就消失」：把「在前台被看着 idle、然后用户把焦点移走」的会话从本轮渲染里摘掉。
+ *
+ * ## 为什么必须加在这里，而不是加在保留逻辑里
+ *
+ * `selectRetainedIdle` 只处理**已经不在活跃集合里**的会话。而 codex / claude 的空闲会话
+ * 每轮都会被重新采集到，一直是「活的」，压根进不了那条路径 —— 实测侧边栏里剩下的两条 `○`
+ * 就是 codex 会话，它们连 `state.panes` 记录都没有。所以规则必须落在三个 provider 全部
+ * 会话汇合、渲染之前的这个关口，否则对它们无效。
+ *
+ * opencode 也从这里过：它的 `time.viewed` 判据（{@link hasBeenViewedSinceIdle}）在更早的
+ * 保留逻辑里已经生效，会话能走到这里的都是 `viewed < idle` 的，两条判据是互补的。
+ *
+ * @param {Array<{agent:string, wanted:object[], statesById:Map<string,string>}>} providers 会就地修改
+ * @param {{panes?:object[]}} index
+ * @param {number} now
+ * @returns {number} 被摘掉的会话数
+ */
+function applyForegroundLeaveRule(providers, index, now) {
+  const grace = Math.max(0, Number(config.idleGraceMs) || 0);
+  let dropped = 0;
+  for (const p of providers || []) {
+    const wanted = p?.wanted;
+    if (!Array.isArray(wanted) || wanted.length === 0) continue;
+    const states = p.statesById instanceof Map ? p.statesById : new Map();
+    const kept = [];
+    for (const s of wanted) {
+      const id = str(s?.id);
+      const state = str(states.get(id));
+      if (state !== "idle") {
+        kept.push(s);
+        continue;
+      }
+      const rec = runtime.state.panes[id];
+      // idle 标尺：opencode 有服务端时间戳；**codex / claude 连记录都没有**（它们的空闲
+      // 会话每轮都被重新采集，从来没进过保留逻辑），所以退到 provider 自己报的
+      // `updatedAt` —— 对一个停下来的会话，它就是「最后一次动的时间」，正是我们要的。
+      // 单位必须先归一（codex 是秒）。
+      const idleMark = Number(rec?.idleAt) || Number(rec?.idleSince) || asMillis(s?.updatedAt);
+      const paneId = foregroundPaneIdFor(s, rec, index);
+      const left = paneId ? Number(runtime.state.paneFocus?.[paneId]?.unfocusedAt) || 0 : 0;
+      if (!seenAfterLeavingForeground(idleMark, left, now, grace)) {
+        kept.push(s);
+        continue;
+      }
+      dropped += 1;
+      const name = normalizeDir(s?.directory).split("/").filter(Boolean).pop() || "?";
+      log(
+        "debug",
+        `${p.agent} ${shortId(id)}（${s?.title || name}）：停在 ${paneId} 上时你把焦点移走了，当看过，清掉`,
+      );
+    }
+    if (dropped > 0) p.wanted = kept;
+  }
+  return dropped;
+}
+
 async function publishInlineSessions(providers) {
   const agents = await herdr.agentList();
 
@@ -3140,6 +3249,122 @@ export function hasBeenViewedSinceIdle(rec) {
   if (idleAt <= 0) return false;
   // 必须取等。理由见上：`viewed` 是以 idle 为标尺的水位线，「看过」就等于「等于 idle」。
   return viewedAt >= idleAt;
+}
+
+/**
+ * 「切出后就消失」：判断一个会话是不是**用户在前台看着它idle、然后把焦点移走**了。
+ *
+ * ## 为什么需要它
+ *
+ * {@link hasBeenViewedSinceIdle} 依赖 opencode 的 `time.viewed`，而**只有 opencode 有这个
+ * 字段**：`normalizeThread`（codex）不返回 `idleAt` / `viewedAt`，claude 同理。所以那条判据
+ * 在 codex/claude 上永远为假。
+ *
+ * 但 codex/claude 的会话压根不需要那个字段也能判：「用户正在看这个 pane、它 idle 了、然后
+ * 用户把焦点移走了」—— 走掉本身就说明看过了。这三件事全部来自 Herdr 自己的
+ * `pane list`（每 pane 带 `focused`），**与 agent 无关**，所以对三个 provider 一视同仁。
+ *
+ * ## 为什么必须比时间戳多一道 `graceMs`
+ *
+ * 焦点是会抖的：点一下别的 pane 再点回来、`layout` 重排、终端自己抢焦点。如果只要观察到
+ * 一次「没焦点」就动手，这些都会把用户**正在看**的行清掉。所以要求焦点**持续**离开
+ * `graceMs` 才算数（复用 `IDLE_GRACE_MS`，它在 12.14 之前就是干这个的）。
+ *
+ * ## 关键：离开时间必须**晚于** idle 时刻
+ *
+ * `unfocusedAt` 是持久的：一个一直没人看的 pane，它的 `unfocusedAt` 可能比会话 idle 早几个
+ * 小时。所以判据不是「这个 pane 没焦点」，而是「它是在会话 idle **之后**才被移走的」。
+ * 这一条先后关系正是区分「路过」和「看完走开」的全部信息。
+ *
+ * ## 去抖只决定「什么时候动手」，不参与「是否晚于 idle」的判断
+ *
+ * 这两件事必须分开。`graceMs` 回答的是「这次失去焦点是真的吗」（抖动 vs 切出），
+ * `left > idle` 回答的是「你是在它跑完之后走的吗」。把 grace 加进后者会得出
+ * 「你在它跑完前 13 秒离开也算看过」这种荒谬结论 —— 这条断言在离线测试里当场抓到过。
+ *
+ * @param {number} idleMark 会话进入 idle 的时刻（opencode 用 `time.idle`，其余用插件自己
+ *   记的 `idleSince`）
+ * @param {number} unfocusedAt 该 pane 从什么时候开始没有焦点（0 = 正聚焦着）
+ * @param {number} now
+ * @param {number} graceMs 焦点需要持续离开多久才算数
+ * @returns {boolean}
+ */
+export function seenAfterLeavingForeground(idleMark, unfocusedAt, now, graceMs) {
+  const idle = Number(idleMark) || 0;
+  const left = Number(unfocusedAt) || 0;
+  if (idle <= 0 || left <= 0) return false;
+  const at = Number(now) || 0;
+  // 还没观察到焦点离开，或数据来自未来（时钟跳变 / 状态来自别的机器）：都不动它。
+  if (left > at) return false;
+  // 焦点持续离开还不够久 —— 抖动不算「切出」。
+  if (at - left < Math.max(0, Number(graceMs) || 0)) return false;
+  return left > idle;
+}
+
+/**
+ * 每轮刷新 `state.paneFocus`：谁聚焦着（清零），谁不聚焦（记下第一次观察到的时间）。
+ *
+ * ## 「一个 pane 都没聚焦」时什么都不做
+ *
+ * `pane list` 偶尔会返回空（比如窗口最小化、切换瞬间）。如果那一刻当成「所有 pane 都没
+ * 焦点」，就会给**每一个** pane 都记上 `unfocusedAt = now`，下一轮这些 pane 里所有刚
+ * idle 的会话都会被误清。所以空状态一律保持原样 —— 宁可晚一轮判定，也不能误清。
+ *
+ * ## 只给「我们确实见过它被聚焦过」的 pane 记离开时刻
+ *
+ * 否则冷启动就会误清一批：插件第一次跑起来时，会给**所有非聚焦 pane** 打上「刚刚离开」，
+ * 而它们上面的会话早就 idle 了 —— 于是「你离开的时刻晚于它跑完的时刻」成立，一批行
+ * 被一次性清空。用户看到的是「刚装上就少了一堆行」。
+ *
+ * 所以 `wasFocused` 是硬前提：没被我们盯到过在前台的 pane，这条判据对它不成立
+ * （`unfocusedAt` 保持 0）。代价是「装好之后你还没点进去过的 pane」永远不会被这条规则
+ * 清除 —— 这是保守方向，符合产品语义：只有你真的在前台看过才清除。
+ *
+ * @param {Array<{pane_id?:string, focused?:boolean}>} panes
+ * @param {Record<string,{unfocusedAt:number, wasFocused?:boolean}>} store 会就地修改
+ * @param {number} now
+ * @returns {{changed:number, tracked:number}}
+ */
+export function updatePaneFocusState(panes, store, now) {
+  const focus = store || {};
+  const list = Array.isArray(panes) ? panes : [];
+  const at = Number(now) || 0;
+  const focused = new Set();
+  for (const p of list) {
+    if (p?.focused === true && str(p?.pane_id)) focused.add(str(p.pane_id));
+  }
+  if (focused.size === 0) return { changed: 0, tracked: Object.keys(focus).length };
+
+  let changed = 0;
+  for (const p of list) {
+    const id = str(p?.pane_id);
+    if (!id) continue;
+    const prev = focus[id] || { unfocusedAt: 0, wasFocused: false };
+    if (focused.has(id)) {
+      // 重新聚焦：清掉离开时刻，但记住「它到过前台」。
+      if (prev.unfocusedAt !== 0 || !prev.wasFocused) {
+        focus[id] = { unfocusedAt: 0, wasFocused: true };
+        changed += 1;
+      }
+      continue;
+    }
+    // 没见过它在前台 → 不记。任何理由都不能替代这个前提。
+    if (!prev.wasFocused) {
+      if (!focus[id]) focus[id] = { unfocusedAt: 0, wasFocused: false };
+      continue;
+    }
+    // 只在「从聚焦变成不聚焦」的那一刻打时间戳，之后每轮都沿用同一个值 ——
+    // 否则去抖窗口每轮都在往后延，永远等不满。
+    //
+    // 判据是 `unfocusedAt === 0` 而不是「记录不存在」：一个之前正聚焦着的 pane
+    // 早就建好了 `{unfocusedAt: 0}` 这条记录，用「记录不存在」判断的话它**永远不会**
+    // 被记上离开时刻，整条规则对这个 pane 就是死的。离线测试当场抓到了这个。
+    if (!prev.unfocusedAt) {
+      focus[id] = { unfocusedAt: at, wasFocused: true };
+      changed += 1;
+    }
+  }
+  return { changed, tracked: Object.keys(focus).length };
 }
 
 /**

@@ -318,7 +318,7 @@ session 自带 `directory`。要找到对应的 herdr workspace，用 `herdr pan
 | `AUTO_START` | `false` | Herdr 恢复后自动拉起管理器 |
 | `INSTALL_AGENT_VIEW` | `false` | 是否安装全局 Agents 视图投影 |
 | `POLL_INTERVAL_MS` | `5000` | 轮询兜底间隔 |
-| `IDLE_GRACE_MS` | `15000` | 状态变化的防抖时间。非内联模式：非活跃后回收镜像行的宽限期。内联模式不再用它判断「用户是否看过」—— 那件事改用 opencode 的 `time.viewed`（见 12.14） |
+| `IDLE_GRACE_MS` | `15000` | 防抖宽限。① 内联模式：焦点必须持续离开这么久，「切出后就消失」才算数（防抖动误清正在看的行）；② 非内联模式：回收镜像行的宽限期。**opencode 的 `time.viewed` 判据不用它**——那是时间戳比较（见 12.14） |
 | `IDLE_KEEP` | `3` | 内联模式：每个目录最多留几条「已完成、尚未查看过」的 session（见 12.14） |
 | `SESSION_ROWS` | 空=自动 | 一个 agent 行最多显示几个 session；留空则读侧边栏模板（见 12.15） |
 | `AGENT_VIEW_SCOPE` | `mirror` | `mirror` 只显示镜像行；`sort-only` 只装排序、保留官方集成的行 |
@@ -696,19 +696,57 @@ TUI 还会把两个戳重新抹平成同一个值（实测某个会话的 idle/v
 一起挪到 19:35:10）。后果是**这个功能从落地起一次都没生效过**，而且失效方式完全静默 ——
 用户看到的只是「切回前台一次仍然常驻」。
 
-#### 这个判据只覆盖 opencode；codex / claude 结构上做不到
+#### 这个判据只覆盖 opencode；codex / claude 用另一条判据
 
 `normalizeThread`（codex）返回 `updatedAt` 但**不返回 `idleAt` / `viewedAt`** —— app-server
 的 thread 对象里没有对应字段。于是 codex 会话的 `idleAt` 恒为 0，`hasBeenViewedSinceIdle`
 第一行就返回 false，**在 codex 上永远不可能清除**。实测侧边栏里剩下的两条 `○` 就是 codex
 会话（`agent_status=idle`，不在 opencode 的 session 列表里）。
 
-想在 codex 上也支持，需要另找一个「用户看过」的信号（候选：herdr 的 pane `focused` 标记，
-实测 `herdr pane list` 每个 pane 都带 `focused`，但内联模式下同 pane 有 N 个会话，
-`focused` 无法区分是哪一个）。**这是尚未实现的功能，不是 bug** —— 别把它当回归去「修」。
+更根本的是：codex / claude 的空闲会话**每轮都被重新采集到**，一直是「活的」，压根进不了
+`selectRetainedIdle`（它们连 `state.panes` 记录都没有）。所以「切出后就消失」这条规则
+**不能**加在保留逻辑里，必须加在三个 provider 全部会话汇合、渲染之前的那个关口
+（`applyForegroundLeaveRule`，就挂在 `publishInlineSessions` 调用前）。
 
-顺带记一个单位陷阱：codex 的 `updatedAt` 是**秒**，opencode 的是**毫秒**。任何把两者放进
-同一处比较的代码都会静默错 1000 倍。
+#### 判据二：「在前台看着它 idle，然后你把焦点移走」
+
+> 用户在一个 pane 上、它 idle 的时候把焦点移走 → 当作看过，清掉。
+
+这条判据**只用 Herdr 自己的 `pane list`**（每个 pane 带 `focused`），与 agent 无关，所以对
+opencode / codex / claude 一视同仁 —— 这正是 opencode 的时间戳判据做不到的事。
+
+判据成立要同时满足三件事：
+
+1. 会话是 idle 的；
+2. **它是在 idle 之后才被移走焦点的**。`unfocusedAt` 是持久的：一个一直没人看的 pane，
+   它的 `unfocusedAt` 可能比会话 idle 早几小时。所以判据不是「这个 pane 没焦点」，而是
+   「离开的时刻晚于它跑完的时刻」。**这一条先后关系就是区分「路过」和「看完走开」的全部
+   信息。**
+3. 焦点**持续**离开了 `IDLE_GRACE_MS`。焦点是会抖的（点一下别的 pane 再点回来、layout
+   重排、终端自己抢焦点），只要观察到一次「没焦点」就动手，会把用户**正在看**的行清掉。
+
+两个必须守住的前提，都写进了离线断言：
+
+- **只给「我们确实见过它在前台」的 pane 记离开时刻**（`paneFocus[].wasFocused`）。否则冷启动
+  就会误清一批：插件第一次跑起来时会给所有非聚焦 pane 打上「刚刚离开」，而它们上面的会话
+  早就 idle 了 —— 用户看到的是「刚装上就少了一堆行」。代价是「装好之后你还没点进去过的
+  pane」永远不会被这条规则清除，这是保守方向，符合产品语义。
+- **「一个 pane 都没聚焦」时什么都不做**。`pane list` 偶尔返回空（窗口最小化、切换瞬间）。
+  那一刻如果当成「所有 pane 都没焦点」，就会给每个 pane 都记上 `unfocusedAt = now`，下一轮
+  这些 pane 里所有刚 idle 的会话会被全部误清。
+
+**去抖只决定「什么时候动手」，不参与「是否晚于 idle」的判断。** 把 `graceMs` 加进后者会
+得出「你在它跑完前 13 秒离开也算看过」这种荒谬结论 —— 这条在离线测试里当场抓到过。
+
+#### idle 标尺：没有记录就退到 `updatedAt`，并且必须归一单位
+
+codex / claude 的会话没有 state 记录，所以取不到 `idleAt` / `idleSince`。这时退到 provider
+自己报的 `updatedAt` —— 对一个停下来的会话，它就是「最后一次动的时间」，正是我们要的。
+
+**单位必须先归一**（`asMillis`）：opencode 的 `time.updated` 是毫秒，codex thread 的
+`updatedAt` 是**秒**。混进同一处比较会静默错 1000 倍，而错出来的结果是「几乎从不满足」或
+「几乎总是满足」这种看起来像业务逻辑不对、实际是单位错的 bug。判据是 `1e11`：那对应的
+毫秒是 1973 年、秒是 5138 年，所以真实时间戳里小于 `1e11` 的一定是秒。
 
 其余三条边界都不能省：
 

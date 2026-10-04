@@ -275,14 +275,6 @@ const PANE_SCOPED_ENV = [
 /** 看门狗自己跑起来必须有这些，否则子进程一定连不上 Herdr。缺了就明确报错退出。 */
 const REQUIRED_ENV = ["HERDR_PLUGIN_ID", "HERDR_SOCKET_PATH"];
 
-/**
- * 官方那一行（`▸`）在「你看着它 idle 然后切走了」之后显示的标题。
- *
- * 不用现成会话标题是因为那一行的内容是终端标题 + Herdr 的 `agent_status`，**没有会话
- * id**，而终端标题在这种情况下恰恰是最不该继续展示的东西 —— 它还停在「跑之前」。
- */
-const SEEN_PLACEHOLDER_TITLE = "已看过";
-
 /** 镜像 pane 名上限。侧边栏一行放不下更多，留点余量给状态符号。 */
 const MIRROR_LABEL_MAX = 40;
 
@@ -2944,31 +2936,31 @@ async function publishInlineSessions(providers) {
      * 官方 session 优先用会话自己的名字（id 精确匹配时），退回终端标题 ——
      * opencode 侧走的就是后一条，因为它的会话在进 `wanted` 之前就被 claimed 剔掉了。
      *
-     * ## 「已看过」占位：为什么不是把整行撤掉
+     * ## 这一行**永不**因「看过没有」而改变
      *
-     * 这一行的内容是**终端标题 + Herdr 的 `agent_status`**，没有任何会话 id 可用（实测
-     * 0.9.3 会把第三方来源的 `agent_session` 剥掉），所以「用户看过没有」只能在 pane
-     * 这一层判。
+     * 它的内容是终端标题 + Herdr 的 `agent_status`，没有会话 id（0.9.3 会把第三方来源的
+     * `agent_session` 剥掉，实测所有 pane 上这个 token 都是空的），所以「用户看过没有」
+     * 只能拿到一个结论性的布尔值 —— 而这里能改的只有标题和状态图标两个位置：
      *
-     * 但撤掉这一行不是好选择：模板是 `[["workspace"], ["state_icon","agent"],
-     * ["$oc_sess1"], ...]`，token 一撤这行就只剩状态图标和 agent 名 —— **会话标题和状态
-     * 全丢**，而「这个 pane 上有个跑完的 agent」这个信息恰恰有用。所以改成把标题换成占位：
-     * 行还在，只是不再拿一个过时标题冒充现状。
+     * - 改标题 = 抹掉「这是哪个会话」。实测这行的标题本来就常常只是终端标题（w1D:p1 那行
+     *   显示的就是字面的 `OpenCode`），换成任何通用占位只会更糟。**用户明确否掉了这个做法。**
+     * - 改状态图标 = 那一行就不再告诉你 agent 现在在干嘛。而 idle / working 恰恰是这一行
+     *   唯一实时、有用的信息。
+     *
+     * 撤掉整行同理：模板里 token 一撤就只剩 `state_icon + agent` 名。
+     *
+     * 所以官方行就是「这个 pane 上的 agent」，不是「一条待办提醒」。**「看过才清除」只作用
+     * 于并行会话行**（{@link applyForegroundLeaveRule}）。
      */
-    const officialOnly = (row, slot) => {
-      if (paneLeftWhileIdle(str(row?.pane_id), Date.now(), config.idleGraceMs, runtime.state.paneFocus)) {
-        return [{ title: SEEN_PLACEHOLDER_TITLE, state: str(row?.agent_status) || "idle", official: true }];
-      }
-      return [
-        slot
-          ? { title: slot.title, state: slot.state, official: true }
-          : {
-              title: stripAgentPrefix(row.terminal_title_stripped || row.title || row.pane_id),
-              state: row.agent_status,
-              official: true,
-            },
-      ];
-    };
+    const officialOnly = (row, slot) => [
+      slot
+        ? { title: slot.title, state: slot.state, official: true }
+        : {
+            title: stripAgentPrefix(row.terminal_title_stripped || row.title || row.pane_id),
+            state: row.agent_status,
+            official: true,
+          },
+    ];
 
     const desired = new Map();
     // **遍历这个 agent 所有有官方行的工作区**，而不是只遍历有并行 session 的那些。
@@ -3386,28 +3378,6 @@ export function updatePaneFocusState(panes, store, now) {
 
   let changed = 0;
 
-  // --- idle 锁存 -------------------------------------------------------------
-  // Herdr 的 `agent_status` 是**不带时间戳的快照**（「现在是 idle」），所以「它什么时候
-  // 停下来的」只能我们自己锁：进入 idle 的那一刻打戳，一变非 idle 就清零。
-  //
-  // 这一段**不受「没有聚焦」保护**的限制：idle 锁存不会给谁打上「刚刚离开」，不存在
-  // 那种误清风险，而且漏掉它会让「pane 空焦点期间停下来的会话」永远判不出看过。
-  for (const p of list) {
-    const id = str(p?.pane_id);
-    if (!id) continue;
-    const prev = focus[id] || { unfocusedAt: 0, wasFocused: false };
-    const isIdle = str(p?.agent_status) === "idle";
-    if (isIdle) {
-      if (!prev.idleSince) {
-        focus[id] = { ...prev, idleSince: at };
-        changed += 1;
-      }
-    } else if (prev.idleSince) {
-      focus[id] = { ...prev, idleSince: 0 };
-      changed += 1;
-    }
-  }
-
   // pane 关掉后它的焦点历史没有意义，留着只会让 state.json 一直涨。
   // **列表为空时一律不剪** —— 那和「没有聚焦」是同一类瞬时状态（调用失败 / 切换瞬间），
   // 按「全部 pane 都关掉了」处理会把整个 store 抹光，比不剪坏得多。
@@ -3451,25 +3421,6 @@ export function updatePaneFocusState(panes, store, now) {
     }
   }
   return { changed, tracked: Object.keys(focus).length };
-}
-
-/**
- * 这个 pane 上的 agent 停在 idle、而你在此之后把焦点移走了吗？
- *
- * 与 {@link seenAfterLeavingForeground} 是同一条判据，只是 idle 标尺从「会话的时间戳」
- * 换成「pane 级的 idle 锁存」。用在官方那一行（`▸`）上：那一行的内容是终端标题 +
- * Herdr 的 `agent_status`，**没有任何会话 id**，所以只能在 pane 这一层判。
- *
- * @param {string} paneId
- * @param {number} now
- * @param {number} graceMs
- * @param {Record<string,{unfocusedAt?:number, wasFocused?:boolean, idleSince?:number}>} [store]
- * @returns {boolean}
- */
-export function paneLeftWhileIdle(paneId, now, graceMs, store) {
-  const entry = (store || runtime.state.paneFocus)?.[str(paneId)];
-  if (!entry?.wasFocused) return false;
-  return seenAfterLeavingForeground(entry.idleSince, entry.unfocusedAt, now, graceMs);
 }
 
 /**

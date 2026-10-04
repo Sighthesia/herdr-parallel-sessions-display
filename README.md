@@ -48,11 +48,9 @@ This plugin lists every other root session under the same directory, with live s
 Scope:
 
 - Only root sessions. Child/sub-agents are not listed separately.
-- **Finished sessions don't vanish into thin air**: once one stops it stays in the list as `○`, so you can tell "finished" from "lost". The newest `IDLE_KEEP` per directory are kept. A `○` stops pretending to be current once you have **looked at it**:
-  - **The pane's own row** (the one starting with `▸`): leave that pane while it sits `○` and the title becomes `已看过` (seen). The row stays — removing it would leave a bare agent name and lose the fact that this pane has a finished agent.
-  - **Parallel session rows**: cleared outright once you open that session in the TUI, or leave that pane while it sits idle.
+- **Finished sessions don't vanish into thin air**: once one stops it stays in the list as `○`, so you can tell "finished" from "lost". The newest `IDLE_KEEP` per directory are kept. A **parallel** `○` row is cleared once you have looked at it: open that session in the TUI, or leave that pane while it sits idle. Both rules read only Herdr's pane focus, so they work for every agent — opencode, Codex and Claude alike.
 
-  Both rules read only Herdr's pane focus, so they work for every agent — opencode, Codex and Claude alike.
+The pane's own row (the one starting with `▸`) stands for "the agent on this pane", not for a to-do reminder, so it takes no part in this: its title and its `○`/`●` state are never rewritten.
 - Read-only. To interact, switch back to the real TUI pane.
 - No duplicates. The session your TUI has selected is yielded to the official row.
 

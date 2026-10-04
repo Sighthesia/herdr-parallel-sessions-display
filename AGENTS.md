@@ -162,8 +162,11 @@ node src/board.mjs --mode once
   watchdog respawn it (`kill $(cat "$STATE_DIR/board.lock")`), or invoke the `board` action.
 - `LOG_LEVEL=debug` prints per-session keep/skip reasons.
 - **Is it alive?** Compare the pid in `board.lock` against reality, and check
-  `board.log`'s mtime — it is rewritten every poll. A stale mtime with a live-looking pid is
-  exactly the silent failure this repo keeps fighting.
+  **`state.json`'s mtime** — the manager rewrites it every poll (5s), so >30s stale means
+  wedged. Do **not** use `board.log`'s mtime: it is only written when there is something to
+  say, so a quiet board is indistinguishable from a dead one. Measured: `state.json`
+  advancing every 5s while `board.log` sat untouched for three minutes. A stale heartbeat
+  with a live-looking pid is exactly the silent failure this repo keeps fighting.
 - Sidebar shows no session rows at all → the template step above was skipped; check `[ui.sidebar.agents]` first, it is by far the most common cause.
 - Sidebar froze → check `board.lock`/`watchdog.lock` first; both are pid files and
   `pidAlive()` reclaims stale ones, so a leftover file is harmless.

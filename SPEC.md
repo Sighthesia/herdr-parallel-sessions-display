@@ -670,11 +670,45 @@ opencode 有专门的 `session.viewed` 事件，并在 session 上留两个时�
 | 字段 | 含义 |
 | --- | --- |
 | `time.idle` | 最后一次停下来干活的时刻 |
-| `time.viewed` | 最后一次在 TUI 里被打开的时刻 |
+| `time.viewed` | **「你已经看到哪一步了」的水位线，以 `idle` 为标尺**（不是「打开时刻」，见下） |
 
-判据就是 **`viewed > idle`**（`hasBeenViewedSinceIdle`）：跑完之后又被打开过。**不需要
+判据就是 **`viewed >= idle`**（`hasBeenViewedSinceIdle`）：跑完之后又被打开过。**不需要
 任何防抖** —— 这是时间戳比较，不是状态猜测。`idle` 缺失（从没停过）时不参与判据，否则
-`viewed > 0` 会把所有还没跑完的当成「看过」。
+`viewed >= 0` 会把所有还没跑完的当成「看过」。
+
+#### `viewed` 的真实语义是水位线，所以判据必须**取等**
+
+这一点是实测逼出来的，而且踩错的方式极其隐蔽。直觉上 `viewed` 是「用户最后一次打开它的
+时刻」；**实测不是**。每 2s 拉一次 `/api/session/<id>`，然后让用户切到那个已经停下的会话，
+抓到的是：
+
+```
+19:38:32  idle=18:13:39  viewed=10-02 11:04:01
+19:40:04  idle=18:13:39  viewed=18:13:39      ← 用户切过去的瞬间
+```
+
+`viewed` 跳到了**和 `idle` 完全相等**，而不是「当前时间」。也就是说 opencode 把 `viewed`
+当成水位线：打开一个已停下的会话 = 「它停下来之前的输出我都看过了」→ `viewed := idle`。
+
+于是写成 `viewed > idle` 时，判据在真实数据上**数学上不可达**：13 个带 idle 戳的根 session
+实测，`viewed == idle` 的 12 个、`viewed < idle` 的 1 个、`viewed > idle` 的 **0 个**。开关
+TUI 还会把两个戳重新抹平成同一个值（实测某个会话的 idle/viewed 在两次观察之间从 19:24:32
+一起挪到 19:35:10）。后果是**这个功能从落地起一次都没生效过**，而且失效方式完全静默 ——
+用户看到的只是「切回前台一次仍然常驻」。
+
+#### 这个判据只覆盖 opencode；codex / claude 结构上做不到
+
+`normalizeThread`（codex）返回 `updatedAt` 但**不返回 `idleAt` / `viewedAt`** —— app-server
+的 thread 对象里没有对应字段。于是 codex 会话的 `idleAt` 恒为 0，`hasBeenViewedSinceIdle`
+第一行就返回 false，**在 codex 上永远不可能清除**。实测侧边栏里剩下的两条 `○` 就是 codex
+会话（`agent_status=idle`，不在 opencode 的 session 列表里）。
+
+想在 codex 上也支持，需要另找一个「用户看过」的信号（候选：herdr 的 pane `focused` 标记，
+实测 `herdr pane list` 每个 pane 都带 `focused`，但内联模式下同 pane 有 N 个会话，
+`focused` 无法区分是哪一个）。**这是尚未实现的功能，不是 bug** —— 别把它当回归去「修」。
+
+顺带记一个单位陷阱：codex 的 `updatedAt` 是**秒**，opencode 的是**毫秒**。任何把两者放进
+同一处比较的代码都会静默错 1000 倍。
 
 其余三条边界都不能省：
 

@@ -175,7 +175,10 @@ tail -f ~/.local/state/herdr/plugins/herdr-parallel-sessions-display/board.log
 
 真实路径会在管理器启动的第一行日志里写出来。文件有两代轮转（`board.log.1`）。
 
-判断是否还活着：看 `board.log` 的修改时间（每轮轮询都会重写），或者
+判断是否还活着：看 **`state.json` 的修改时间** —— 管理器每轮（默认 5s）都会重写它，
+超过约 30s 没变就是卡住了。**不要**用 `board.log` 的修改时间：日志只在有话可说时才写，
+所以「安静很久的看板」和「死掉的看板」在它眼里一模一样（实测 `state.json` 每 5s 都在动，
+而 `board.log` 整整三分钟没被碰过）。或者看 pid 文件：
 
 ```bash
 cat ~/.local/state/herdr/plugins/herdr-parallel-sessions-display/board.lock     # 管理器 pid

@@ -3088,24 +3088,48 @@ export function resolveInlineHostWorkspace(directory, index, official) {
  *
  * ## 判据是 opencode 自己的两个时间戳
  *
- * `time.idle` = 它最后一次停下来干活的时刻，`time.viewed` = 用户最后一次在 TUI 里看到
- * 它的时刻。**`viewed > idle` 就是「跑完之后又被打开过」** —— 结果你看过了。
+ * ## `viewed` 的真实语义：是水位线，不是「查看时刻」
+ *
+ * 直觉上 `viewed` 应该是「用户最后一次打开它的时刻」。**实测不是。** 盯着一个 idle 会话
+ * 每 2s 拉一次 `/api/session/<id>`，然后让用户切过去，抓到的是：
+ *
+ * ```
+ * 19:38:32  idle=18:13:39  viewed=10-02 11:04:01
+ * 19:40:04  idle=18:13:39  viewed=18:13:39      ← 用户切过去的瞬间
+ * ```
+ *
+ * `viewed` 跳到了 **和 `idle` 完全相等**，而不是「当前时间」。也就是说 opencode 把
+ * `viewed` 当成「你已经看到哪一步了」，并**以 idle 水位线为标尺**：打开一个已经跑完的
+ * 会话 = 「它停下来之前的输出我都看过了」→ `viewed := idle`。
+ *
+ * 所以「跑完之后被看过」的正确判据是 **`viewed >= idle`**（取等），不是 `viewed > idle`。
+ *
+ * ## 这个取等边界不是小事：写成 `>` 时这功能从未生效过
+ *
+ * 13 个带 idle 戳的根 session 实测：`viewed == idle` 的 12 个，`viewed < idle` 的 1 个，
+ * **`viewed > idle` 的 0 个**。而且开关 TUI 会把两个戳重新抹平成同一个值（实测 w18 那个
+ * pane 上的会话 idle/viewed 在两次观察之间从 19:24:32 一起挪到了 19:35:10）。所以 `>` 判据
+ * 在真实数据上**数学上不可达**，不是罕见 —— 用户报「切回前台一次仍常驻」就是这个原因，
+ * 而且它从落地起就一次没成功过。
  *
  * ## 为什么不能拿 herdr 的 `agent_session` 当判据
  *
  * 实测 herdr 的 opencode 集成 hook 只处理 `session.created / updated / status /
  * compacted / error / idle / deleted`，**没有 `session.viewed`**。而「切到一个跑完的
- * session 看看结果」只产生 `session.viewed` 这一个事件，hook 不理，于是 `agent_session`
- * 一直停在几百小时前的那个 session（实测 w18:p14 报的是 `自动化测试弹窗`，而该 session
- * 的 `viewed` 已经是八小时前）。拿它当「用户看过」的信号，功能等于从来没生效过 ——
- * 这正是用户报的「15 秒以上仍然存在」。
+ * session 看看结果」在 hook 这边不留痕，于是 `agent_session` 一直停在几百小时前的那个
+ * session（实测 w18:p14 报的是 `自动化测试弹窗`，而该 session 的 `viewed` 已经是八小时前）。
+ * 拿它当「用户看过」的信号，功能等于从来没生效过 —— 这正是用户报的「15 秒以上仍然存在」。
+ *
+ * 实测 0.9.3 还会把第三方来源的 `agent_session` 直接剥掉：所有 pane（含 focused 的那个）
+ * 这个 token 全是空的。所以内联模式下「用户在同pane 的 N 个会话里看的是哪一个」无法从
+ * herdr 侧观测 —— 幸好 `time.viewed` 自己就够用。
  *
  * ## 两个边界
  *
  * - `idleAt` 必须有值。没停过的 session（`time.idle` 缺失）不参与这个判据，否则
- *   `viewed > 0` 会把所有还没跑完的当成「看过」。
+ *   `viewed >= 0` 会把所有还没跑完的当成「看过」。
  * - 边看边跑（一边读一边继续干活）不算：那种情况 `idle` 会跟着往后推，`viewed`
- *   落在 `idle` 前面。
+ *   落在 `idle` 前面，取等也判不出来。
  *
  * @param {{idleAt?:number, viewedAt?:number}} rec
  * @returns {boolean}
@@ -3114,7 +3138,8 @@ export function hasBeenViewedSinceIdle(rec) {
   const idleAt = Number(rec?.idleAt) || 0;
   const viewedAt = Number(rec?.viewedAt) || 0;
   if (idleAt <= 0) return false;
-  return viewedAt > idleAt;
+  // 必须取等。理由见上：`viewed` 是以 idle 为标尺的水位线，「看过」就等于「等于 idle」。
+  return viewedAt >= idleAt;
 }
 
 /**

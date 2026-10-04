@@ -179,7 +179,11 @@ tail -f ~/.local/state/herdr/plugins/herdr-parallel-sessions-display/board.log
 The real path is printed in the manager's first log line. Two generations are kept
 (`board.log.1`).
 
-To check whether it is alive, look at `board.log`'s mtime (every poll rewrites it), or:
+To check whether it is alive, look at **`state.json`'s mtime** — the manager rewrites it on
+every poll (5s by default), so a mtime older than ~30s means it is wedged. Do **not** use
+`board.log`'s mtime: the log only gets written when there is something to say, so a
+long-quiet board looks identical to a dead one (measured: `state.json` advancing every 5s
+while `board.log` sat untouched for three minutes). Or check the pid files:
 
 ```bash
 cat ~/.local/state/herdr/plugins/herdr-parallel-sessions-display/board.lock     # manager pid

@@ -588,6 +588,22 @@ const runtime = {
    * debug 了，于是「没装集成 → 一行都不显示」这个最该被说清楚的事，在日志里完全隐形。
    */
   missingRowsHinted: new Map(),
+  /**
+   * 「所在目录没有对应工作区」的告警，每个 session 只说过一次。
+   *
+   * **和 `missingRowsHinted` 是两类东西，不能合并。** 那条是「整批会话都挂不上」的
+   * 一次性前置条件问题；这条是**每个 session 各自**的，而且只要那个 session 还有子
+   * agent 在跑，它每轮都会被重新算成活跃 —— 于是每 5 秒重复一次。
+   *
+   * 实测代价：`afloat-control-center` 没有对应工作区，它下面一个会话的子 agent 一直
+   * 在跑，`board.log` 里 11825 行是同一条消息（占 99.9%），实测 20 秒涨 3684 字节
+   * ≈ 15MB/天。日志只轮转一代（4MB），所以真正有用的记录几小时就被冲没了 ——
+   * 一个不影响功能的问题，持续破坏「排查别的问题」这个唯一的诊断入口。
+   *
+   * 按 session id 记，而不是按目录：同一目录下可能有好几个 session 各自孤儿，
+   * 合并成一条会丢掉「是哪几个 session」的排查线索。
+   */
+  orphanWarned: new Set(),
   timers: [],
   /** 一轮重算里已经重平衡过没有。回收一批行时不必每个都重算一次布局。 */
   balancedThisPass: false,
@@ -2708,6 +2724,10 @@ async function publishInlineSessions(providers) {
   let cleared = 0;
   /** 本轮有意处理过（含「有意保留」）的 pane，兜底清扫时跳过。 */
   const handled = new Set();
+  /** 本轮仍然孤儿着的 session key，用来给 {@link runtime.orphanWarned} 裁剪。 */
+  const orphanKeysNow = new Set();
+  /** 本轮没能判定孤儿状态的 agent（采集失败 / 被关掉），裁剪时整类跳过。 */
+  const skippedAgents = new Set();
 
   for (const provider of providers || []) {
     const agentName = str(provider?.agent);
@@ -2716,6 +2736,8 @@ async function publishInlineSessions(providers) {
 
     if (rows.length === 0) {
       if (wanted.length > 0) noteMissingRows(agentName, wanted.length, provider.missingHint);
+      // 一条官方行都没有 → 挂载点无从谈起，孤儿与否根本没判过（由 noteMissingRows 交代）。
+      skippedAgents.add(agentName);
       continue;
     }
 
@@ -2732,6 +2754,7 @@ async function publishInlineSessions(providers) {
       );
       // 标记成「本轮有意保留」，别被后面的兜底清扫当成孤儿清掉。
       for (const a of rows) handled.add(str(a.pane_id));
+      skippedAgents.add(agentName);
       continue;
     }
     if (provider.disabled) {
@@ -2768,14 +2791,7 @@ async function publishInlineSessions(providers) {
       if (!byWorkspace.has(hit.workspaceId)) byWorkspace.set(hit.workspaceId, []);
       byWorkspace.get(hit.workspaceId).push(info);
     }
-    for (const o of orphans) {
-      log(
-        "info",
-        `[${agentName}] ${shortId(o.id)}「${(o.title || "").slice(0, 24)}」所在目录没有对应的 Herdr 工作区` +
-          `（或那个工作区里没有 ${agentName} 的 agent 行），内联模式下无处显示。` +
-          `把 MIRROR_INLINE 设成 false 可回到建 pane 模式。`,
-      );
-    }
+    for (const o of orphans) noteOrphanSession(agentName, o, orphanKeysNow);
 
     /**
      * 工作区里挑一个官方行作为挂载点。
@@ -3015,6 +3031,16 @@ async function publishInlineSessions(providers) {
     }
   }
 
+  // 孤儿告警的去重记录裁剪：只保留本轮**确实判过**仍然孤儿着的那些。
+  //
+  // `provider.failed` 那条路径会提前 `continue`，它名下 session 的孤儿状态是**未知**
+  // 而不是「已恢复」—— 守护进程抖一下如果把这些 key 也清掉，恢复后的第一轮就会重新
+  // 打一次 info，正好把刚去掉的刷屏又请回来。所以失败/被关掉的 agent 整类跳过。
+  for (const key of [...runtime.orphanWarned]) {
+    if (orphanKeysNow.has(key) || skippedAgents.has(key.split("\u0000")[0])) continue;
+    runtime.orphanWarned.delete(key);
+  }
+
   if (official.length === 0) {
     log("debug", "内联模式：当前没有官方 agent 行，无处挂载 session 列表");
   }
@@ -3052,6 +3078,50 @@ function noteMissingRows(agentName, count, hint) {
   if (!runtime.missingRowsHinted.has(agentName)) {
     log("info", msg);
     runtime.missingRowsHinted.set(agentName, true);
+    return;
+  }
+  log("debug", msg);
+}
+
+/**
+ * 「这个 session 所在目录没有对应工作区，内联模式下无处显示」的提示，**每个 session 只说一次**。
+ *
+ * ## 为什么必须去重
+ *
+ * 这条信息和 {@link noteMissingRows} 是同一类（缺前置条件 → 挂不上去），但触发频率差了一个量级。
+ * `noteMissingRows` 的条件是「这个 agent 一条官方行都没有」，那是一次性的、装好集成就消失的状态；
+ * 而这里的条件是**每轮重算独立判定**的，只要那个 session 还在候选集合里就会重新命中。
+ *
+ * 实测踩到的形态：`afloat-control-center` 没有对应工作区，它下面那个会话有个子 agent 一直在跑，
+ * 于是每 5 秒一条，20 秒涨 3684 字节 ≈ 15MB/天。而 `board.log` 只轮转一代（4MB），所以
+ * **几小时内真正有用的记录就被这条消息冲没了** —— 一个不影响功能的问题，持续破坏
+ * 「排查别的问题」这个唯一的诊断入口（AGENTS.md 里日志存在的理由就是它）。
+ *
+ * ## 按 session 记，不按目录
+ *
+ * 同一目录下可能同时有好几个 session 各自孤儿，合并成一条会丢掉「是哪几个」的排查线索。
+ * 反过来也不能只按目录记：那正是本例的形态（一个目录长期孤儿），去重必须落在 session 上。
+ *
+ * ## 状态会被清掉，所以恢复后能重新提示
+ *
+ * 单纯「说过一次就永远沉默」在另一种场景下会变成新的静默失效：用户给那个目录开了工作区
+ * （问题解决），又把它关掉（问题回来）—— 此时集合里还留着旧的记录，于是**再也不会提示**。
+ * 所以每轮结束时把本轮没再孤儿掉的 session 从集合里移除，恢复后的第一次仍会 info。
+ *
+ * @param {string} agentName
+ * @param {{id:string, title?:string, directory?:string}} info
+ * @param {Set<string>} [seen] 本轮孤儿集合，调用方在末尾据此裁剪已恢复的记录
+ */
+function noteOrphanSession(agentName, info, seen) {
+  const key = `${agentName}\u0000${str(info?.id)}`;
+  if (seen) seen.add(key);
+  const msg =
+    `[${agentName}] ${shortId(info?.id)}「${(info?.title || "").slice(0, 24)}」所在目录没有对应的 Herdr 工作区` +
+    `（或那个工作区里没有 ${agentName} 的 agent 行），内联模式下无处显示。` +
+    `把 MIRROR_INLINE 设成 false 可回到建 pane 模式。`;
+  if (!runtime.orphanWarned.has(key)) {
+    log("info", msg);
+    runtime.orphanWarned.add(key);
     return;
   }
   log("debug", msg);
